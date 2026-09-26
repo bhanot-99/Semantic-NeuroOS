@@ -1,1 +1,28 @@
 // health endpoint request/response types
+syntax = "proto3";
+package neuroos.v1;
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_DEGRADED = 2;
+  STATUS_DOWN = 3;
+}
+
+message LatencyHistogram {
+  repeated uint64 bucket_upper_bound_ns = 1;
+  repeated uint64 bucket_counts = 2;
+  uint64 count = 3;
+  uint64 sum_ns = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  Status status = 1;
+  uint64 rss_bytes = 2;
+  uint64 uptime_s = 3;
+  map<string, LatencyHistogram> latency_histograms = 4;
+  map<string, uint64> error_counters = 5;
+  string build_info = 6;
+}

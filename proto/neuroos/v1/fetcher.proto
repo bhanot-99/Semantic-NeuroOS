@@ -1,1 +1,13 @@
 // C7 external fetcher types
+syntax = "proto3";
+package neuroos.v1;
+
+// first-cut; full SSRF-guard fetch set lands in Phase 8
+message FetchRequest {
+  string url = 1;
+}
+
+message FetchResponse {
+  bool success = 1;
+  string spool_path = 2;
+}

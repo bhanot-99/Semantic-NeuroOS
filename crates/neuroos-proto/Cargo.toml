@@ -1,4 +1,4 @@
-# prost-generated types re-export
+# neuroos-proto crate manifest
 [package]
 name = "neuroos-proto"
 version.workspace = true
@@ -9,3 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"

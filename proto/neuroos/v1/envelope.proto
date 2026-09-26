@@ -1,1 +1,55 @@
 // IPC envelope contract shared by all components
+syntax = "proto3";
+package neuroos.v1;
+
+import "neuroos/v1/common.proto";
+import "neuroos/v1/health.proto";
+import "neuroos/v1/telemetry.proto";
+import "neuroos/v1/voice.proto";
+import "neuroos/v1/storage.proto";
+import "neuroos/v1/inference.proto";
+import "neuroos/v1/knowledge.proto";
+import "neuroos/v1/kernel.proto";
+import "neuroos/v1/fetcher.proto";
+
+message Envelope {
+  uint32 schema_version = 1;   // always 1 for package v1
+  string trace_id       = 2;   // 128-bit hex, propagated end to end
+  uint64 request_id     = 3;   // correlation id; 0 for push events
+  uint64 sent_at_ns     = 4;   // UTC epoch nanoseconds
+
+  // field-number ranges per component (Architecture.md §5.3):
+  // 10-19 common, 20-29 C1, 30-39 C2, 40-59 C3, 60-69 C4, 70-89 C5,
+  // 90-109 C6, 110-119 C7, 120-129 healthd
+  oneof body {
+    Error                error           = 10;
+    HealthRequest        health_request  = 11;
+    HealthResponse       health_response = 12;
+
+    RawTelemetryEvent    telemetry       = 20;
+
+    VoiceCommand         voice_command   = 30;
+    PreambleRequest      preamble        = 31;
+
+    IngestRequest        ingest_request  = 40;
+    IngestResponse       ingest_response = 41;
+
+    InferRequest         infer_request   = 60;
+    InferResponse        infer_response  = 61;
+
+    AskRequest           ask_request     = 70;
+    AskResponse          ask_response    = 71;
+
+    ActionRequest        action_request  = 90;
+    ActionResponse       action_response = 91;
+
+    FetchRequest          fetch_request  = 110;
+    FetchResponse         fetch_response = 111;
+  }
+}
+
+message Error {
+  ErrorCode code      = 1;
+  string    message   = 2;   // never contains user content
+  bool      retryable = 3;
+}
