@@ -32,7 +32,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security test-shm
+test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -46,6 +46,11 @@ test-contract: build-rust build-cpp build-py
 # SC (phases.md §3.3): PrivateNetwork-style isolation blocks curl/DNS/TCP, UDS still works.
 test-security:
     bash scripts/check-egress.sh
+
+# Phase 0 exit criterion (phases.md §3.4): a real systemd --user unit with
+# PrivateNetwork=true proves no network / UDS works / peer UID enforced, together.
+test-sandboxed-echo: build-rust
+    bash tests/contract/sandboxed_echo.sh
 
 # P0-S07 spike S-02: memfd seqlock ring, default scale + cross-language interop.
 # The 10M-message and ThreadSanitizer runs are spike evidence, not routine CI

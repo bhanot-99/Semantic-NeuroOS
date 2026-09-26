@@ -322,8 +322,10 @@ version = "0.1.0"
 name = "neuroos-testkit"
 version = "0.1.0"
 dependencies = [
+ "neuroos-ipc",
  "neuroos-proto",
  "prost",
+ "tokio",
 ]
 
 [[package]]
