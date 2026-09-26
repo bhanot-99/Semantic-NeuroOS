@@ -1,6 +1,8 @@
 // monitor entry point
 use std::path::PathBuf;
 
+mod sensors;
+
 fn runtime_socket_dir() -> PathBuf {
     // Architecture.md §5.2: $XDG_RUNTIME_DIR/neuroos/ = /run/user/$UID/neuroos/
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -21,7 +23,17 @@ async fn main() {
         vec![healthd_uid],
     ));
 
-    // TODO(Phase 3): sensors, monitor.sock server.
+    // Spike S-03 (P0-S08) proof, run at startup for now; Phase 3 replaces
+    // this one-shot snapshot with a push-event subscription feeding
+    // monitor.sock.
+    match sensors::wayland_cosmic::list_toplevels() {
+        Ok(toplevels) => {
+            for t in &toplevels {
+                tracing::debug!(app_id = ?t.app_id, title = ?t.title, activated = t.is_activated(), "toplevel");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "zcosmic_toplevel_info_v1 unavailable"),
+    }
 }
 
 /// # Safety
