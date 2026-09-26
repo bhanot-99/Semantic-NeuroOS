@@ -45,7 +45,8 @@ impl SharedMap {
                 0,
             )
         }?;
-        let ptr = NonNull::new(ptr as *mut u8).expect("mmap returned null on success");
+        let ptr = NonNull::new(ptr as *mut u8)
+            .ok_or_else(|| io::Error::other("mmap returned a null pointer on success"))?;
         Ok(Self { ptr, len })
     }
 

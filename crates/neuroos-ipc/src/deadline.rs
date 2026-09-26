@@ -36,6 +36,7 @@ pub async fn read_envelope_deadline<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
     #[tokio::test]

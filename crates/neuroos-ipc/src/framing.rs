@@ -68,9 +68,7 @@ pub async fn write_envelope<W: AsyncWrite + Unpin>(
     env: &neuroos_proto::v1::Envelope,
     max_frame: u32,
 ) -> Result<(), FramingError> {
-    let mut buf = Vec::with_capacity(env.encoded_len());
-    env.encode(&mut buf)
-        .expect("Vec<u8> buffer never runs out of capacity");
+    let buf = env.encode_to_vec();
     write_frame(w, &buf, max_frame).await
 }
 
@@ -88,6 +86,7 @@ pub async fn read_envelope<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
     #[tokio::test]

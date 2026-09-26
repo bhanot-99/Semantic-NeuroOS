@@ -1,3 +1,7 @@
+// rules.md §5 exempts these lints for one-off diagnostic tools: crashing loudly
+// on unexpected input IS the correct behavior for a spike/interop CLI tool,
+// unlike a long-running service.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // Phase 0 exit criterion (phases.md §3.4): "a sandboxed echo unit proves:
 // no network, UDS works, peer UID enforced." Meant to run inside a real
 // systemd unit with PrivateNetwork=true (see tests/contract/sandboxed_echo.sh

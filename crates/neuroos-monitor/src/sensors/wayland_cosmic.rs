@@ -157,7 +157,8 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppSt
             zcosmic_toplevel_handle_v1::Event::State { state: raw } => {
                 tracked.info.states = raw
                     .chunks_exact(4)
-                    .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                    .filter_map(|c| <[u8; 4]>::try_from(c).ok())
+                    .map(u32::from_ne_bytes)
                     .filter_map(|v| ToplevelState::try_from(v).ok())
                     .collect();
             }
@@ -168,6 +169,7 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppSt
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
     #[test]

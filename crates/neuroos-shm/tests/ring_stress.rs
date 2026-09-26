@@ -1,3 +1,6 @@
+// integration test: rules.md §5's no-unwrap rule is scoped to non-test code;
+// clippy's restriction lints don't auto-exempt files under tests/, so this is explicit.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! P0-S07 spike S-02: proves the seqlock ring race-free under sustained
 //! concurrent single-writer/single-reader access, in-process (two OS
 //! threads sharing one `Ring`, same memory-safety guarantees a real

@@ -1,3 +1,7 @@
+// rules.md §5 exempts these lints for one-off diagnostic tools: crashing loudly
+// on unexpected input IS the correct behavior for a spike/interop CLI tool,
+// unlike a long-running service.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // P0-S07 cross-language interop tool: opens a ring by path (a /proc/<pid>/fd/<n>
 // magic symlink announced by the writer), reads `count` messages, verifies
 // each is the expected "token-N" content in order, prints OK/FAIL.

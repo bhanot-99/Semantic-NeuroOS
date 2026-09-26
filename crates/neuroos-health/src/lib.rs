@@ -12,8 +12,14 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// See `histogram::lock`'s doc comment: recovers rather than panics on a
+/// poisoned mutex (rules.md §5).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub use histogram::Histogram;
 pub use rss::rss_bytes;
@@ -45,20 +51,14 @@ impl HealthServer {
     }
 
     pub fn incr_error(&self, name: &str) {
-        *self
-            .error_counters
-            .lock()
-            .unwrap()
+        *lock(&self.error_counters)
             .entry(name.to_string())
             .or_insert(0) += 1;
     }
 
     /// Records `duration` under a named latency histogram, creating it on first use.
     pub fn record_latency(&self, name: &str, duration: Duration) {
-        let hist = self
-            .histograms
-            .lock()
-            .unwrap()
+        let hist = lock(&self.histograms)
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(Histogram::new()))
             .clone();
@@ -66,14 +66,11 @@ impl HealthServer {
     }
 
     pub fn snapshot(&self) -> HealthResponse {
-        let latency_histograms = self
-            .histograms
-            .lock()
-            .unwrap()
+        let latency_histograms = lock(&self.histograms)
             .iter()
             .map(|(k, v)| (k.clone(), v.to_proto()))
             .collect();
-        let error_counters = self.error_counters.lock().unwrap().clone();
+        let error_counters = lock(&self.error_counters).clone();
         HealthResponse {
             status: self.status.load(Ordering::Relaxed),
             rss_bytes: rss_bytes().unwrap_or(0),
@@ -136,6 +133,7 @@ fn now_ns() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
     use neuroos_ipc::connect;
     use neuroos_proto::v1::HealthRequest;
