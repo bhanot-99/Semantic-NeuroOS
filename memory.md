@@ -45,6 +45,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | P0-S06 | Spike S-01 (unit mode, risk R-01) run for real on the reference machine: `systemd-run --user -p PrivateNetwork=yes` (no sudo) and, with the owner's help, `sudo systemd-run --uid=... -p PrivateNetwork=yes` (system-scope). Both work; user units need no manual env wiring and correctly report `SO_PEERCRED`. Wrote ADR-0001 (meta), ADR-0002 (unit mode, reverses Architecture.md §8.1's stated preference — see D-11), ADR-0003 (IPC transport, documents D-04), ADR-0004 (build order, documents D-02/D-03). | `docs/adr/0001-*.md` … `0004-*.md` |
 | 2026-09-26 | P0-S05 | Filled in all `deploy/systemd/*` unit templates (hardening baseline, per-component `MemoryMax`/`BindPaths` from PRD §6.2 / Architecture §8.2), `sysusers.d`, `tmpfiles.d`. Wrote `docs/threat-model.md` v0 (STRIDE per trust boundary). Implemented `scripts/check-egress.sh` for real using unprivileged `unshare --net --mount` (no sudo needed). **Found a real gap**: `PrivateNetwork=true` alone doesn't block DNS (systemd-resolved's NSS module uses a local socket); fixed with `InaccessiblePaths=-/run/systemd/resolve` on every unit except the fetcher, documented as an Architecture.md §8.1 addendum. Added `just lint-systemd` (systemd-analyze verify) and `just test-security`. | commit on `p0/s01-just-ci-green`; `Architecture.md` §8.1 amended |
 | 2026-09-26 | P0-S04 | `neuroos-health`: latency histogram (log-scale ns buckets, matches `LatencyHistogram` proto), `/proc/self/status` RSS reader, `HealthServer` serving `HealthRequest`→`HealthResponse` over UDS (built on neuroos-ipc). Wired into `neuroos-monitor` main.rs as the "one line" proof: `tokio::spawn(health.serve(path, uids))`. 94.4% line coverage. | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S03 | `neuroos-ipc`: framing (u32-LE length prefix), UDS server/client, `SO_PEERCRED` allowlist check, connect/read/write deadlines, reconnect-with-backoff (10s budget). 16 tests (unit, proptest, 2 real-UDS integration: echo + reconnect-after-restart). 87.5% line / 88% region coverage. Branch coverage needs nightly rustc (cargo-llvm-cov `--branch`) — deferred, see §8 tech debt. | commit on `p0/s01-just-ci-green` |
@@ -67,7 +68,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Done |
 | P0-S04 | `neuroos-health` endpoint + histograms | 3 | Done |
 | P0-S05 | systemd templates with hardening baseline | 3 | Done |
-| P0-S06 | Spike S-01 unit mode → ADR-0002 | 5 | Ready |
+| P0-S06 | Spike S-01 unit mode → ADR-0002 | 5 | Done |
 | P0-S07 | Spike S-02 memfd seqlock ring | 5 | Backlog (Sprint 0b) |
 | P0-S08 | Spikes S-03 (COSMIC) + S-04 (bitnet.cpp) | 5 | Backlog (Sprint 0b) |
 | P0-S09 | Model manifest + fetch script | 3 | Backlog (Sprint 0b) |
@@ -103,10 +104,11 @@ Short record of decisions. Anything architectural also gets an ADR in `docs/adr/
 
 | Date | ID | Decision | Rationale | ADR |
 | :--- | :--- | :--- | :--- | :--- |
-| 2026-09-26 | D-01 | V3.2 blueprint is primary; conflicts resolved per Architecture.md §13. | V3.2 is the newer, more detailed specification. | ADR-0001 (to write in P0) |
-| 2026-09-26 | D-02 | healthd is a standalone binary, built first. | Out-of-process resilience (V3.2). | — |
-| 2026-09-26 | D-03 | Build C1 (monitor) before C3 (storage). | The Phase 4 soak-replay gate needs real captured telemetry dumps. | ADR-0004 (to write in P0) |
-| 2026-09-26 | D-04 | IPC = filesystem UDS + u32-LE length-prefixed protobuf; memfd + SCM_RIGHTS for the token ring. | Works under PrivateNetwork/PrivateDevices; one contract for 3 languages. | ADR-0003 (to write in P0) |
+| 2026-09-26 | D-01 | V3.2 blueprint is primary; conflicts resolved per Architecture.md §13. | V3.2 is the newer, more detailed specification. | ADR-0001 |
+| 2026-09-26 | D-02 | healthd is a standalone binary, built first. | Out-of-process resilience (V3.2). | ADR-0004 |
+| 2026-09-26 | D-03 | Build C1 (monitor) before C3 (storage). | The Phase 4 soak-replay gate needs real captured telemetry dumps. | ADR-0004 |
+| 2026-09-26 | D-04 | IPC = filesystem UDS + u32-LE length-prefixed protobuf; memfd + SCM_RIGHTS for the token ring. | Works under PrivateNetwork/PrivateDevices; one contract for 3 languages. | ADR-0003 |
+| 2026-09-26 | D-11 | **Reverses Architecture.md §8.1's stated preference:** use **user-scope systemd units** (`systemctl --user`), not system template units with `User=%i`, for every Zone 2/3 component. | Spike S-01 (P0-S06): on the reference machine, `PrivateNetwork=true` works fine in a user unit (contradicts the assumed Ubuntu 24.04 restriction); user units auto-inherit `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` correctly, system units don't (no reliable way to discover `WAYLAND_DISPLAY`); `SO_PEERCRED` reports the real UID either way. | ADR-0002 |
 | 2026-09-26 | D-05 | Fetcher → storage notification via inotify on the spool dir. | Fetcher UID cannot reach the user runtime dir. | — |
 | 2026-09-26 | D-06 | Token ring carries token_id + detokenized UTF-8 piece. | C2 has no tokenizer. | — |
 | 2026-09-26 | D-07 | Rust edition 2024 (toolchain 1.97.x). | Current stable toolchain on the reference machine. | — |
@@ -136,13 +138,14 @@ Mirror of [PRD.md](PRD.md) §12. Close here and in the PRD at the same time.
 
 | Date | Type | Item | Owner | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| 2026-09-26 | Risk | R-01: `PrivateNetwork=true` in systemd user units vs Ubuntu 24.04 userns restriction and `SO_PEERCRED` under `PrivateUsers`. Resolve with spike S-01 in Phase 0. | Architect | Watching |
+| 2026-09-26 | Risk | R-01: `PrivateNetwork=true` in systemd user units vs Ubuntu 24.04 userns restriction and `SO_PEERCRED` under `PrivateUsers`. | Architect | **Resolved** — spike S-01 (P0-S06, ADR-0002): premise didn't hold on the reference machine; user units work and are now the recommended mode (D-11). |
 | 2026-09-26 | Risk | R-02: BitNet decode speed on Zen 3 unverified. First signal from spike S-04, full answer in Phase 2. | Architect | Watching |
 
 Tech debt register (add as it appears):
 
 | Date | Item | Introduced in | Plan to repay |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | `deploy/systemd/*.service` (Zone 2/3 components) are still system templates (`User=%i`) from P0-S05; ADR-0002 (P0-S06) recommends reworking them to user-scope units instead. Mechanical rework (drop `User=`/`Group=`/`neuroos@%i.target` plumbing, retarget `WantedBy=`), not new design. | P0-S05, superseded by P0-S06/ADR-0002 | next session touching `deploy/systemd/` |
 | 2026-09-26 | `deny.toml` empty stub; `cargo deny check` not wired into `just ci` (license/bans policy undefined, only `just deny` exists standalone). | P0-S01 | P0-S10 |
 | 2026-09-26 | System has `clang-format-18`/`clang-tidy` (no unversioned `clang-format` alias); justfile calls `clang-format-18` explicitly. `cargo-nextest` and `shellcheck` installed manually this session (were missing from env, see memory.md §10). | P0-S01 | none needed — document only |
 | 2026-09-26 | `neuroos-ipc` branch coverage not measured: `cargo llvm-cov --branch` needs `-Z coverage-options=branch`, nightly-only. Line/region coverage (87.5%/88%) already exceeds the 80% bar. | P0-S03 | install/pin a nightly toolchain for coverage only, or accept line coverage as the working proxy — owner to decide |
