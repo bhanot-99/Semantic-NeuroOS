@@ -9,5 +9,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-neuroos-proto = { path = "../neuroos-proto" }
+neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 prost = "0.13"

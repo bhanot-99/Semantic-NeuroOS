@@ -122,7 +122,7 @@ lint-systemd:
 
 # --- aggregate ---------------------------------------------------------------
 
-ci: fmt-check lint build test
+ci: fmt-check lint build test deny
 
 bench:
     cargo bench --workspace

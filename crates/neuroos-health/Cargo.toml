@@ -10,8 +10,8 @@ workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
-neuroos-ipc = { path = "../neuroos-ipc" }
-neuroos-proto = { path = "../neuroos-proto" }
+neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
+neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 prost = "0.13"
 tracing = "0.1"
 

@@ -16,11 +16,11 @@
 | Field | Value |
 | :--- | :--- |
 | Last updated | 2026-09-26 |
-| Project stage | Phase 0 in progress |
-| Current phase | **Phase 0 — Foundation, Contracts & Spikes** (in progress) |
+| Project stage | Phase 0 — all 10 stories done, exit criteria check + phase report pending |
+| Current phase | **Phase 0 — Foundation, Contracts & Spikes** (stories done, gate pending) |
 | Current sprint | Sprint 0 (started 2026-09-26) |
-| Current story | — (next: P0-S02) |
-| Overall progress | 0 / 11 phases complete (1 / 10 Sprint-0 stories done) |
+| Current story | — (all P0-S01…S10 done; next: verify exit criteria §3.4, write `reports/phase-00-foundation.md`, gate to Phase 1) |
+| Overall progress | 0 / 11 phases complete (10 / 10 Sprint-0 stories done, all on branch `p0/s01-just-ci-green`, not yet merged to `main`) |
 | Health | 🟢 On track |
 | Next milestone | M0 Foundation |
 
@@ -30,12 +30,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Story | P0-S02 (Proto v1 contracts + codegen for Rust/C++/Python) |
+| Story | — (all P0-S01…S10 done) |
 | File(s) being edited | — |
-| Branch | `p0/s01-just-ci-green` (merge to `main`, then branch `p0/s02-...` for next story) |
+| Branch | `p0/s01-just-ci-green` (all of P0-S01…S10 built here per owner's direction; not yet merged to `main`) |
 | Started | — |
 | Goal of this session | — |
-| Next concrete step | Merge/PR `p0/s01-just-ci-green` to `main`, then start P0-S02: define proto/neuroos/v1/*.proto messages, wire prost (Rust), protoc (C++), python codegen, cross-language round-trip test. Blueprints still need moving to `docs/blueprints/` (was deferred, not part of S01 scope). |
+| Next concrete step | Verify Phase 0 exit criteria (phases.md §3.4) one by one, write `reports/phase-00-foundation.md`, decide whether to merge `p0/s01-just-ci-green` to `main` before or as part of the phase gate. Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
 
 ---
 
@@ -45,6 +45,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | P0-S10 | Real `deny.toml`: license allowlist (rules.md §4), network-crate ban (`reqwest`/`hyper`/`ureq`/`curl`/`hickory-resolver`/etc., `wrappers = ["neuroos-fetcher"]` — only the fetcher may ever depend on these) wired into `just ci` for the first time. **Found two real issues wiring it for real**: `cosmic-protocols` (P0-S08's COSMIC dependency) is GPL-3.0-only (new exception, ADR-0007); internal workspace path deps needed explicit `version = "0.1.0"` to satisfy the wildcard-dependency check. Proved the ban actually fires: added `reqwest` to a non-fetcher crate as a throwaway test → real `error[banned]` for both `reqwest` and its transitive `hyper-util`, reverted. | `docs/adr/0007-cosmic-protocols-gpl-exception.md` |
 | 2026-09-26 | P0-S09 | `models/manifest.toml`: all 10 real models Architecture.md §7.1 names (BitNet, whisper-tiny.en-q5_1, Silero VAD, 3× openWakeWord, Kokoro int8 + one voice, bge-small-en-v1.5 + tokenizer), with real URLs and real sha256 hashes computed from actual downloads. `scripts/fetch-models.sh` (Python-in-bash, stdlib `tomllib`) downloads, verifies, is idempotent (skips already-correct files), and **proven to reject bad data**: tested both a corrupted cached file (silently re-fetched and fixed) and a deliberately-wrong manifest hash (fetch aborted, no file installed, non-zero exit). Wired as `just fetch-models` (not in `just ci` — several GB) and `just lint-manifest` (schema check, no network, in `just ci`). | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S08 | Spike S-03: `zcosmic_toplevel_info_v1` proven live against this machine's real COSMIC session (5 real windows correctly listed: app_id/title/Activated state). Ported into `crates/neuroos-monitor/src/sensors/wayland_cosmic.rs` as real code (`list_toplevels()`), not a stub — 2 unit tests + 1 `#[ignore]`d live-session integration test (passed for real). Spike S-04: added `microsoft/BitNet` as a pinned git submodule (`cpp/third_party/bitnet.cpp`, nested `3rdparty/llama.cpp` pinned too), downloaded the real `BitNet-b1.58-2B-4T-gguf` i2_s model (~1.1 GiB), built with AVX2 confirmed active (`-march=native` → `__AVX2__`). Real throughput: 17.89 t/s decode / 17.07 t/s prefill, 8 threads (R-02 first signal). Also fixed `justfile`'s cpp find/lint/fmt recipes to exclude `cpp/third_party` (were sweeping the vendored submodule source). | `docs/adr/0006-cosmic-toplevel-and-bitnet-spikes.md` |
 | 2026-09-26 | P0-S07 | Spike S-02: memfd seqlock ring in Rust (`crates/neuroos-shm`) and C++ (`cpp/libneuroos/.../shm_ring.hpp`), matching layouts. Found and fixed two real bugs via testing (see ADR-0005, D-12): (1) seqlock alone doesn't prove slot identity — added an explicit `seq` field to the slot; (2) plain non-atomic field access is UB under the memory model even though the seqlock makes it hardware-safe — every field now goes through `Relaxed` atomics. Proven: 10M messages zero-corruption (release), zero ThreadSanitizer races on both Rust (nightly) and C++ (`tsan` CMake preset) after the fix, cross-language interop both directions (`tests/contract/shm_interop.sh`, in `just ci` via `just test-shm`). | `docs/adr/0005-shm-ring-race-freedom.md`; commit on `p0/s01-just-ci-green` |
@@ -62,7 +63,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 ## 4. Current Sprint Board
 
-**Sprint 0 goal:** repository, toolchains, contracts and shared IPC libraries in place; spikes S-01 and S-02 started.
+**Sprint 0 goal:** repository, toolchains, contracts and shared IPC libraries in place; spikes S-01 and S-02 started. **All 10 stories done as of 2026-09-26** — the "Sprint 0 / Sprint 0b" split in earlier revisions of this table was this file's own internal organization, not a phases.md split; phases.md §3.2 lists all 10 as one set and all 10 are now complete.
 
 | Story | Title | Pts | Status |
 | :--- | :--- | :--- | :--- |
@@ -75,7 +76,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | P0-S07 | Spike S-02 memfd seqlock ring | 5 | Done |
 | P0-S08 | Spikes S-03 (COSMIC) + S-04 (bitnet.cpp) | 5 | Done |
 | P0-S09 | Model manifest + fetch script | 3 | Done |
-| P0-S10 | cargo-deny network-crate ban | 2 | Backlog (Sprint 0b) |
+| P0-S10 | cargo-deny network-crate ban | 2 | Done |
 
 Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 
@@ -111,6 +112,7 @@ Short record of decisions. Anything architectural also gets an ADR in `docs/adr/
 | 2026-09-26 | D-02 | healthd is a standalone binary, built first. | Out-of-process resilience (V3.2). | ADR-0004 |
 | 2026-09-26 | D-03 | Build C1 (monitor) before C3 (storage). | The Phase 4 soak-replay gate needs real captured telemetry dumps. | ADR-0004 |
 | 2026-09-26 | D-04 | IPC = filesystem UDS + u32-LE length-prefixed protobuf; memfd + SCM_RIGHTS for the token ring. | Works under PrivateNetwork/PrivateDevices; one contract for 3 languages. | ADR-0003 |
+| 2026-09-26 | D-13 | `cosmic-protocols` gets a `deny.toml` license exception for GPL-3.0-only. | It's the only binding for `zcosmic_toplevel_info_v1`; no non-GPL alternative exists. Fine for a personal, undistributed install (OQ-06); revisit if distribution posture changes. | ADR-0007 |
 | 2026-09-26 | D-12 | memfd ring slot layout extends Architecture.md §5.5 with an explicit `seq: u64` field; every slot field (including payload bytes) accessed via `Relaxed` atomics, not plain reads/writes. `slot_size` must be a multiple of 8. | Both found as real bugs via testing (stress test + ThreadSanitizer) during spike S-02 (P0-S07) — see ADR-0005 for the full story. | ADR-0005 |
 | 2026-09-26 | D-11 | **Reverses Architecture.md §8.1's stated preference:** use **user-scope systemd units** (`systemctl --user`), not system template units with `User=%i`, for every Zone 2/3 component. | Spike S-01 (P0-S06): on the reference machine, `PrivateNetwork=true` works fine in a user unit (contradicts the assumed Ubuntu 24.04 restriction); user units auto-inherit `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` correctly, system units don't (no reliable way to discover `WAYLAND_DISPLAY`); `SO_PEERCRED` reports the real UID either way. | ADR-0002 |
 | 2026-09-26 | D-05 | Fetcher → storage notification via inotify on the spool dir. | Fetcher UID cannot reach the user runtime dir. | — |
@@ -188,6 +190,7 @@ Newest first. One entry per work session.
 
 | Date | Session summary | Stories touched | Next step |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | Built all of P0-S02 through P0-S10 on `p0/s01-just-ci-green`, one story per commit, per owner's direction ("build all from S02 to S10 in this branch"). Real work throughout, not stubs: proto codegen + cross-language round-trip (S02); `neuroos-ipc` framing/UDS/SO_PEERCRED/deadlines/reconnect, 16 tests (S03); `neuroos-health` (S04); systemd hardening baseline + found/fixed a real `PrivateNetwork`-doesn't-block-DNS gap (S05); spike S-01 run for real, reverses the unit-mode preference (S06, ADR-0002); memfd seqlock ring in Rust+C++, found/fixed 2 real concurrency bugs via stress-testing and ThreadSanitizer (S07, ADR-0005); COSMIC toplevel spike against the live desktop + real bitnet.cpp submodule build with a downloaded model and a real tokens/s figure (S08, ADR-0006); model manifest + fetch script proven against 10 real downloaded/verified models (S09); `cargo-deny` wired for real, found `cosmic-protocols` is GPL-3.0 (S10, ADR-0007). `just ci` green after every story. | P0-S02 … P0-S10 | Verify Phase 0 exit criteria, write the phase report, decide on merging to `main`. |
 | 2026-09-26 | Scaffolded full repo tree per Architecture.md §14 (empty stubs); committed + pushed to `main` (`981a4ba`). Created branch `p0/s01-just-ci-green`; wired Rust workspace, cpp CMake build, python uv project; installed missing toolchains (clang-format-18, shellcheck, cargo-nextest) with owner's help; `just ci`/`build`/`test`/`bench` all green; committed `c48b5fc`. | P0-S01 | Merge `p0/s01-just-ci-green` to `main` (owner to confirm PR vs direct merge), then start P0-S02. |
 | 2026-09-26 | Read both blueprints; reconciled conflicts; produced PRD, Architecture, rules, phases, design, memory and the reports folder. | Planning | Owner reviews the documents and answers any open questions they can; then start P0-S01. |
 
