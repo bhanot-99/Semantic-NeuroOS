@@ -1,0 +1,1 @@
+// SafetyGate kernel entry point

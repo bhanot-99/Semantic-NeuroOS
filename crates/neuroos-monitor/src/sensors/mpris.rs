@@ -1,0 +1,1 @@
+// MPRIS media session sensor

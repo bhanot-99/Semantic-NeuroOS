@@ -1,0 +1,9 @@
+# build artefacts and local files excluded from version control
+.obsidian/
+target/
+__pycache__/
+*.pyc
+
+# reference media, not project assets
+*.mp4
+semantic_matrix_handdrawn_*.png
