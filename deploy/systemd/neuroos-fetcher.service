@@ -1,1 +1,46 @@
 # systemd unit for neuroos-fetcher [C7], separate UID, no template
+[Unit]
+Description=NeuroOS external fetcher (C7)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neuroos-fetcher
+Group=neuroos-fetcher
+ExecStart=/opt/neuroos/bin/neuroos-fetcher
+RuntimeDirectory=neuroos-fetcher
+RuntimeDirectoryMode=0750
+
+# --- hardening baseline (Architecture.md §8.1); C7 is the one component
+# exempt from PrivateNetwork=true, per §8.1. Egress is instead constrained by
+# Landlock ABI v4 net rules (§8.2: connect TCP 443, 80 if enabled, only). ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+MemoryMax=32M
+Restart=on-failure
+RestartSec=2s
+
+# CA bundle read-only; spool dir + own runtime dir read-write (Architecture.md §8.2, §7.1)
+BindReadOnlyPaths=/etc/ssl/certs
+BindPaths=/var/spool/neuroos-fetcher
+
+[Install]
+WantedBy=multi-user.target

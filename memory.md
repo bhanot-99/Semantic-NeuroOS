@@ -45,6 +45,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | P0-S05 | Filled in all `deploy/systemd/*` unit templates (hardening baseline, per-component `MemoryMax`/`BindPaths` from PRD §6.2 / Architecture §8.2), `sysusers.d`, `tmpfiles.d`. Wrote `docs/threat-model.md` v0 (STRIDE per trust boundary). Implemented `scripts/check-egress.sh` for real using unprivileged `unshare --net --mount` (no sudo needed). **Found a real gap**: `PrivateNetwork=true` alone doesn't block DNS (systemd-resolved's NSS module uses a local socket); fixed with `InaccessiblePaths=-/run/systemd/resolve` on every unit except the fetcher, documented as an Architecture.md §8.1 addendum. Added `just lint-systemd` (systemd-analyze verify) and `just test-security`. | commit on `p0/s01-just-ci-green`; `Architecture.md` §8.1 amended |
 | 2026-09-26 | P0-S04 | `neuroos-health`: latency histogram (log-scale ns buckets, matches `LatencyHistogram` proto), `/proc/self/status` RSS reader, `HealthServer` serving `HealthRequest`→`HealthResponse` over UDS (built on neuroos-ipc). Wired into `neuroos-monitor` main.rs as the "one line" proof: `tokio::spawn(health.serve(path, uids))`. 94.4% line coverage. | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S03 | `neuroos-ipc`: framing (u32-LE length prefix), UDS server/client, `SO_PEERCRED` allowlist check, connect/read/write deadlines, reconnect-with-backoff (10s budget). 16 tests (unit, proptest, 2 real-UDS integration: echo + reconnect-after-restart). 87.5% line / 88% region coverage. Branch coverage needs nightly rustc (cargo-llvm-cov `--branch`) — deferred, see §8 tech debt. | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S02 | proto v1 contracts (envelope, common, health, first-cut per-component messages) + codegen for Rust (prost)/C++ (protoc+CMake)/Python (protoc). Cross-language round-trip test (`tests/contract/roundtrip.sh`) proves Rust→C++→Python→Rust byte-identical encoding. | commit `402f312` on `p0/s01-just-ci-green` |
@@ -65,7 +66,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | P0-S02 | Proto v1 contracts + codegen for Rust/C++/Python | 5 | Done |
 | P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Done |
 | P0-S04 | `neuroos-health` endpoint + histograms | 3 | Done |
-| P0-S05 | systemd templates with hardening baseline | 3 | Ready |
+| P0-S05 | systemd templates with hardening baseline | 3 | Done |
 | P0-S06 | Spike S-01 unit mode → ADR-0002 | 5 | Ready |
 | P0-S07 | Spike S-02 memfd seqlock ring | 5 | Backlog (Sprint 0b) |
 | P0-S08 | Spikes S-03 (COSMIC) + S-04 (bitnet.cpp) | 5 | Backlog (Sprint 0b) |
@@ -110,6 +111,7 @@ Short record of decisions. Anything architectural also gets an ADR in `docs/adr/
 | 2026-09-26 | D-06 | Token ring carries token_id + detokenized UTF-8 piece. | C2 has no tokenizer. | — |
 | 2026-09-26 | D-07 | Rust edition 2024 (toolchain 1.97.x). | Current stable toolchain on the reference machine. | — |
 | 2026-09-26 | D-08 | 1-week sprints, 11 phases (0–10), ≈ 22 sprints to v1.0. | AI-assisted pace, component-by-component delivery. | — |
+| 2026-09-26 | D-10 | Every hardened unit (except `neuroos-fetcher.service`) adds `InaccessiblePaths=-/run/systemd/resolve` to its baseline, beyond the Architecture.md §8.1 block as originally written. | `PrivateNetwork=true` alone does not block DNS; `resolve` NSS module bypasses the netns via a local socket. Found empirically, verified fix with `unshare`. | — |
 | 2026-09-26 | D-09 | Remove Piper. One Kokoro-82M voice for all speech; preambles and status lines are pre-rendered Kokoro clips cached in memory; 8 s follow-up conversation window. Voice RSS 485 → 405 MiB, total 2,420 → 2,340 MiB. | Owner wants one consistent, human-quality voice; noticed tone differences between engines. | — |
 
 ---

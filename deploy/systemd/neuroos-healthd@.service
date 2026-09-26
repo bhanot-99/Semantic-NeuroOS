@@ -1,1 +1,45 @@
-# systemd template unit for neuroos-healthd [D]
+# systemd template unit for healthd [D]
+[Unit]
+Description=NeuroOS healthd [D]
+After=neuroos@%i.target
+PartOf=neuroos@%i.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+ExecStart=/opt/neuroos/bin/neuroos-healthd
+Environment=XDG_RUNTIME_DIR=/run/user/%i
+Environment=NEUROOS_RUNTIME_DIR=/run/user/%i/neuroos
+
+# --- hardening baseline (Architecture.md §8.1); unit mode (User=%i template vs
+# a user unit) is confirmed empirically by spike S-01 / ADR-0002 (P0-S06) ---
+PrivateNetwork=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+InaccessiblePaths=-/run/systemd/resolve
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+MemoryMax=32M
+Restart=on-failure
+RestartSec=2s
+BindReadOnlyPaths=/sys/fs/cgroup
+BindPaths=%h/.local/share/neuroos/soak
+
+[Install]
+WantedBy=neuroos@%i.target

@@ -32,7 +32,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract
+test: test-rust test-py test-contract test-security
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -42,6 +42,10 @@ test-py: proto-py
 
 test-contract: build-rust build-cpp build-py
     bash tests/contract/roundtrip.sh
+
+# SC (phases.md §3.3): PrivateNetwork-style isolation blocks curl/DNS/TCP, UDS still works.
+test-security:
+    bash scripts/check-egress.sh
 
 # --- format ----------------------------------------------------------------
 
@@ -57,7 +61,7 @@ fmt-check:
 
 # --- lint --------------------------------------------------------------------
 
-lint: lint-rust lint-cpp lint-py lint-sh
+lint: lint-rust lint-cpp lint-py lint-sh lint-systemd
 
 lint-rust:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -71,6 +75,21 @@ lint-py: proto-py
 
 lint-sh:
     shellcheck scripts/*.sh tests/contract/*.sh
+
+# ExecStart binaries aren't installed on a dev checkout, so that one warning is expected
+# and filtered out; anything else systemd-analyze reports fails the recipe.
+lint-systemd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail=0
+    for f in deploy/systemd/*; do
+        out="$(systemd-analyze verify --man=false "$f" 2>&1 | grep -v "not executable: No such file or directory" | grep -v "^/usr/lib/systemd/system/.*Invalid environment assignment" || true)"
+        if [ -n "$out" ]; then
+            echo "$out"
+            fail=1
+        fi
+    done
+    exit "$fail"
 
 # --- aggregate ---------------------------------------------------------------
 
