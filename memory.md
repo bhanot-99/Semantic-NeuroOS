@@ -86,7 +86,7 @@ Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 
 | Phase | Name | Status | Started | Finished | Report |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| 0 | Foundation, Contracts & Spikes | ⬜ Not started | — | — | `reports/phase-00-foundation.md` |
+| 0 | Foundation, Contracts & Spikes | 🟨 In gate review (all 10 stories done; 2 exit criteria items pending owner sign-off — report §3/§2.7) | 2026-09-26 | — | `reports/phase-00-foundation.md` |
 | 1 | Health Aggregator (healthd) | ⬜ Not started | — | — | `reports/phase-01-healthd.md` |
 | 2 | Neural Inference Engine (C4) | ⬜ Not started | — | — | `reports/phase-02-inference.md` |
 | 3 | Desktop Telemetry Monitor (C1) | ⬜ Not started | — | — | `reports/phase-03-monitor.md` |
