@@ -16,3 +16,6 @@ semantic_matrix_handdrawn_*.png
 build/
 build-*/
 compile_commands.json
+
+# local dev scratch (downloaded models, etc.) — never tracked, always inside repo root
+.dev-cache/
