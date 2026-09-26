@@ -32,7 +32,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security
+test: test-rust test-py test-contract test-security test-shm
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -46,6 +46,16 @@ test-contract: build-rust build-cpp build-py
 # SC (phases.md §3.3): PrivateNetwork-style isolation blocks curl/DNS/TCP, UDS still works.
 test-security:
     bash scripts/check-egress.sh
+
+# P0-S07 spike S-02: memfd seqlock ring, default scale + cross-language interop.
+# The 10M-message and ThreadSanitizer runs are spike evidence, not routine CI
+# (TSan on the Rust side needs a nightly toolchain and takes minutes; see
+# memory.md tech debt and docs/adr/0005-shm-ring-race-freedom.md for how to
+# run them and what they found).
+test-shm: build-rust build-cpp
+    cargo test -p neuroos-shm --release
+    ./cpp/build/shm-stress-cpp 200000
+    bash tests/contract/shm_interop.sh
 
 # --- format ----------------------------------------------------------------
 

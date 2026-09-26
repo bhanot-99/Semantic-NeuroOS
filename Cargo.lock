@@ -263,6 +263,11 @@ version = "0.1.0"
 [[package]]
 name = "neuroos-shm"
 version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "neuroos-storage"

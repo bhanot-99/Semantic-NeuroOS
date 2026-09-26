@@ -14,4 +14,5 @@ __pycache__/
 *.mp4
 semantic_matrix_handdrawn_*.png
 build/
+build-*/
 compile_commands.json

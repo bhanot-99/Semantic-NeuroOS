@@ -12,6 +12,7 @@ endif()
 
 # neuroos.v1 proto bindings, generated at configure/build time into the build dir
 find_package(Protobuf REQUIRED)
+find_package(Threads REQUIRED)
 
 set(NEUROOS_PROTO_DIR ${CMAKE_SOURCE_DIR}/../proto)
 file(GLOB NEUROOS_PROTO_FILES ${NEUROOS_PROTO_DIR}/neuroos/v1/*.proto)
@@ -48,3 +49,13 @@ add_subdirectory(neuroos-voice)
 # tests/contract/: cross-language proto round-trip helper (P0-S02)
 add_executable(contract-codec-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_codec.cpp)
 target_link_libraries(contract-codec-cpp PRIVATE neuroos-proto-cpp)
+
+# tests/contract/: cross-language memfd ring interop tools (P0-S07)
+add_executable(shm-writer-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_writer.cpp)
+target_link_libraries(shm-writer-cpp PRIVATE libneuroos)
+
+add_executable(shm-reader-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_reader.cpp)
+target_link_libraries(shm-reader-cpp PRIVATE libneuroos)
+
+add_executable(shm-stress-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_stress.cpp)
+target_link_libraries(shm-stress-cpp PRIVATE libneuroos Threads::Threads)
