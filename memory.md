@@ -16,11 +16,11 @@
 | Field | Value |
 | :--- | :--- |
 | Last updated | 2026-09-26 |
-| Project stage | Planning complete — foundation documents baselined |
-| Current phase | **Phase 0 — Foundation, Contracts & Spikes** (not started) |
-| Current sprint | Sprint 0 (planned start 2026-09-28) |
-| Current story | — (next: P0-S01) |
-| Overall progress | 0 / 11 phases complete |
+| Project stage | Phase 0 in progress |
+| Current phase | **Phase 0 — Foundation, Contracts & Spikes** (in progress) |
+| Current sprint | Sprint 0 (started 2026-09-26) |
+| Current story | — (next: P0-S02) |
+| Overall progress | 0 / 11 phases complete (1 / 10 Sprint-0 stories done) |
 | Health | 🟢 On track |
 | Next milestone | M0 Foundation |
 
@@ -30,12 +30,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Story | — |
+| Story | P0-S02 (Proto v1 contracts + codegen for Rust/C++/Python) |
 | File(s) being edited | — |
-| Branch | — (repository not yet initialised; `git init` is part of P0-S01) |
+| Branch | `p0/s01-just-ci-green` (merge to `main`, then branch `p0/s02-...` for next story) |
 | Started | — |
 | Goal of this session | — |
-| Next concrete step | Start P0-S01: `git init`, scaffold folder tree per Architecture.md §14, move blueprints to `docs/blueprints/`. |
+| Next concrete step | Merge/PR `p0/s01-just-ci-green` to `main`, then start P0-S02: define proto/neuroos/v1/*.proto messages, wire prost (Rust), protoc (C++), python codegen, cross-language round-trip test. Blueprints still need moving to `docs/blueprints/` (was deferred, not part of S01 scope). |
 
 ---
 
@@ -45,6 +45,8 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | P0-S01 | `just ci` (fmt-check, lint, build, test across Rust/C++/Python) green on clean checkout; `just build`/`just test`/`just bench` also pass. Rust workspace (16 crates, toolchain 1.97.1 pinned), cpp CMake build (libneuroos, neuroos-inference exe, neuroos-voice lib), python uv project all wired. cargo-deny deferred to P0-S10 (kept as separate `just deny` recipe, not in `ci`). | commit `c48b5fc` on branch `p0/s01-just-ci-green` |
+| 2026-09-26 | Phase 0 | Full repo folder/file tree scaffolded per Architecture.md §14 (empty stubs, one-line comments); `.obsidian/`, reference mp4/pngs gitignored. | commit `981a4ba` on `main` |
 | 2026-09-26 | Planning | Voice redesign: single Kokoro voice, Piper removed, conversation mode added (PRD FR-VOI-05/06/09–12, Architecture §13 #16, design §9.2, phases P6). | PRD.md, Architecture.md, design.md, phases.md |
 | 2026-09-26 | Planning | Created the 6 foundation documents (PRD, Architecture, rules, phases, design, memory) from blueprints V3.2 + V2.7, and the `reports/` folder with README and template. | `PRD.md`, `Architecture.md`, `rules.md`, `phases.md`, `design.md`, `memory.md`, `reports/` |
 
@@ -56,7 +58,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Story | Title | Pts | Status |
 | :--- | :--- | :--- | :--- |
-| P0-S01 | `just ci` green on clean checkout (scaffold, toolchains, justfile) | 5 | Ready |
+| P0-S01 | `just ci` green on clean checkout (scaffold, toolchains, justfile) | 5 | Done |
 | P0-S02 | Proto v1 contracts + codegen for Rust/C++/Python | 5 | Ready |
 | P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Ready |
 | P0-S04 | `neuroos-health` endpoint + histograms | 3 | Ready |
@@ -136,7 +138,9 @@ Tech debt register (add as it appears):
 
 | Date | Item | Introduced in | Plan to repay |
 | :--- | :--- | :--- | :--- |
-| — | — | — | — |
+| 2026-09-26 | `deny.toml` empty stub; `cargo deny check` not wired into `just ci` (license/bans policy undefined, only `just deny` exists standalone). | P0-S01 | P0-S10 |
+| 2026-09-26 | System has `clang-format-18`/`clang-tidy` (no unversioned `clang-format` alias); justfile calls `clang-format-18` explicitly. `cargo-nextest` and `shellcheck` installed manually this session (were missing from env, see memory.md §10). | P0-S01 | none needed — document only |
+| 2026-09-26 | No C++ tests/executable entry point yet for `neuroos-voice` (only a static lib; Architecture.md §14 lists no `main.cpp` for it). `neuroos-inference` has a stub `main.cpp` returning 0. | P0-S01 | Phase 6 (voice), Phase 2 (inference) |
 
 ---
 
@@ -155,9 +159,9 @@ Tech debt register (add as it appears):
 | CPU | AMD Ryzen 7 5800H, 8C/16T, AVX2 |
 | RAM | 15 GiB |
 | OS | Pop!_OS 24.04 LTS, COSMIC on Wayland |
-| Toolchains | rustc/cargo 1.97.1, CMake 3.28.3, GCC 13.3.0, Python 3.12.3, uv 0.12.1 |
+| Toolchains | rustc/cargo 1.97.1, CMake 3.28.3, GCC 13.3.0, clang-tidy 18.1.3, clang-format-18 18.1.3, Python 3.12.3, uv 0.12.1, just 1.42.4, protoc 3.21.12 (libprotoc), cargo-deny 0.20.2, cargo-nextest, shellcheck 0.9.0 (all verified 2026-09-26, P0-S01) |
 | Audio | PipeWire present |
-| Not yet installed / checked | `just`, `protoc`, `clang-tidy`, `cargo-nextest`, `cargo-deny`, `cargo-llvm-cov`, ONNX Runtime, `libpipewire-0.3-dev`, `espeak-ng` |
+| Not yet installed / checked | `cargo-llvm-cov`, ONNX Runtime, `libpipewire-0.3-dev`, `espeak-ng` |
 
 ---
 
@@ -167,6 +171,7 @@ Newest first. One entry per work session.
 
 | Date | Session summary | Stories touched | Next step |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | Scaffolded full repo tree per Architecture.md §14 (empty stubs); committed + pushed to `main` (`981a4ba`). Created branch `p0/s01-just-ci-green`; wired Rust workspace, cpp CMake build, python uv project; installed missing toolchains (clang-format-18, shellcheck, cargo-nextest) with owner's help; `just ci`/`build`/`test`/`bench` all green; committed `c48b5fc`. | P0-S01 | Merge `p0/s01-just-ci-green` to `main` (owner to confirm PR vs direct merge), then start P0-S02. |
 | 2026-09-26 | Read both blueprints; reconciled conflicts; produced PRD, Architecture, rules, phases, design, memory and the reports folder. | Planning | Owner reviews the documents and answers any open questions they can; then start P0-S01. |
 
 ---
