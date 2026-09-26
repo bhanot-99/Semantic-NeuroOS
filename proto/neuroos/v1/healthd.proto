@@ -1,0 +1,24 @@
+// healthd aggregate status types (Phase 1)
+syntax = "proto3";
+package neuroos.v1;
+
+import "neuroos/v1/health.proto";
+
+message ComponentStatus {
+  string name = 1;
+  Status status = 2;
+  uint64 rss_bytes = 3;
+  uint64 budget_bytes = 4;
+  uint64 uptime_s = 5;
+  map<string, LatencyHistogram> latency_histograms = 6;
+  map<string, uint64> error_counters = 7;
+  uint64 last_error_at_ns = 8; // 0 if no error has ever been recorded
+  string build_info = 9;
+}
+
+message AggregateStatusRequest {}
+
+message AggregateStatusResponse {
+  repeated ComponentStatus components = 1;
+  uint64 generated_at_ns = 2;
+}

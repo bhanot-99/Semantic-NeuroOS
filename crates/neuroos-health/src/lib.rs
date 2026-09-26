@@ -6,6 +6,7 @@
 //! tokio::spawn(health.clone().serve(socket_path, vec![healthd_uid]));
 //! ```
 mod histogram;
+mod percentile;
 mod rss;
 
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub use histogram::Histogram;
+pub use percentile::{p50_ns, p99_ns, percentile_ns};
 pub use rss::rss_bytes;
 
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};

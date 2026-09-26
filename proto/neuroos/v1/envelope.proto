@@ -11,6 +11,7 @@ import "neuroos/v1/inference.proto";
 import "neuroos/v1/knowledge.proto";
 import "neuroos/v1/kernel.proto";
 import "neuroos/v1/fetcher.proto";
+import "neuroos/v1/healthd.proto";
 
 message Envelope {
   uint32 schema_version = 1;   // always 1 for package v1
@@ -45,6 +46,9 @@ message Envelope {
 
     FetchRequest          fetch_request  = 110;
     FetchResponse         fetch_response = 111;
+
+    AggregateStatusRequest  aggregate_status_request  = 120;
+    AggregateStatusResponse aggregate_status_response = 121;
   }
 }
 
