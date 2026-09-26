@@ -71,7 +71,7 @@ fmt-check:
 
 # --- lint --------------------------------------------------------------------
 
-lint: lint-rust lint-cpp lint-py lint-sh lint-systemd
+lint: lint-rust lint-cpp lint-py lint-sh lint-systemd lint-manifest
 
 lint-rust:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -85,6 +85,25 @@ lint-py: proto-py
 
 lint-sh:
     shellcheck scripts/*.sh tests/contract/*.sh
+
+# P0-S09: manifest schema/field check, no network. Real fetch+verify against
+# all 10 models is `just fetch-models` (several GB, not routine CI).
+lint-manifest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 - <<'PY'
+    import sys, tomllib
+    with open("models/manifest.toml", "rb") as f:
+        manifest = tomllib.load(f)
+    required = {"name", "component", "url", "dest", "sha256", "license"}
+    for m in manifest["model"]:
+        missing = required - m.keys()
+        if missing:
+            sys.exit(f"models/manifest.toml: {m.get('name', '?')} missing fields: {missing}")
+        if len(m["sha256"]) != 64 and m["sha256"] != "PLACEHOLDER":
+            sys.exit(f"models/manifest.toml: {m['name']} sha256 is not 64 hex chars")
+    print(f"OK: {len(manifest['model'])} manifest entries well-formed")
+    PY
 
 # ExecStart binaries aren't installed on a dev checkout, so that one warning is expected
 # and filtered out; anything else systemd-analyze reports fails the recipe.
@@ -110,3 +129,9 @@ bench:
 
 deny:
     cargo deny check
+
+# P0-S09: downloads + sha256-verifies every model in models/manifest.toml.
+# Several GB; not part of `just ci`. Set NEUROOS_MODELS_DIR to override the
+# /opt/neuroos/models default (e.g. for a non-root local test).
+fetch-models:
+    bash scripts/fetch-models.sh
