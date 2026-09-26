@@ -1,4 +1,4 @@
-# framing, UDS server/client, SO_PEERCRED, reconnect
+# framing, UDS server/client, SO_PEERCRED, deadlines, reconnect
 [package]
 name = "neuroos-ipc"
 version.workspace = true
@@ -9,3 +9,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+prost = "0.13"
+neuroos-proto = { path = "../neuroos-proto" }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "test-util"] }
+proptest = "1"
+tempfile = "3"

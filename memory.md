@@ -45,6 +45,8 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | P0-S03 | `neuroos-ipc`: framing (u32-LE length prefix), UDS server/client, `SO_PEERCRED` allowlist check, connect/read/write deadlines, reconnect-with-backoff (10s budget). 16 tests (unit, proptest, 2 real-UDS integration: echo + reconnect-after-restart). 87.5% line / 88% region coverage. Branch coverage needs nightly rustc (cargo-llvm-cov `--branch`) — deferred, see §8 tech debt. | commit on `p0/s01-just-ci-green` |
+| 2026-09-26 | P0-S02 | proto v1 contracts (envelope, common, health, first-cut per-component messages) + codegen for Rust (prost)/C++ (protoc+CMake)/Python (protoc). Cross-language round-trip test (`tests/contract/roundtrip.sh`) proves Rust→C++→Python→Rust byte-identical encoding. | commit `402f312` on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S01 | `just ci` (fmt-check, lint, build, test across Rust/C++/Python) green on clean checkout; `just build`/`just test`/`just bench` also pass. Rust workspace (16 crates, toolchain 1.97.1 pinned), cpp CMake build (libneuroos, neuroos-inference exe, neuroos-voice lib), python uv project all wired. cargo-deny deferred to P0-S10 (kept as separate `just deny` recipe, not in `ci`). | commit `c48b5fc` on branch `p0/s01-just-ci-green` |
 | 2026-09-26 | Phase 0 | Full repo folder/file tree scaffolded per Architecture.md §14 (empty stubs, one-line comments); `.obsidian/`, reference mp4/pngs gitignored. | commit `981a4ba` on `main` |
 | 2026-09-26 | Planning | Voice redesign: single Kokoro voice, Piper removed, conversation mode added (PRD FR-VOI-05/06/09–12, Architecture §13 #16, design §9.2, phases P6). | PRD.md, Architecture.md, design.md, phases.md |
@@ -59,8 +61,8 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | Story | Title | Pts | Status |
 | :--- | :--- | :--- | :--- |
 | P0-S01 | `just ci` green on clean checkout (scaffold, toolchains, justfile) | 5 | Done |
-| P0-S02 | Proto v1 contracts + codegen for Rust/C++/Python | 5 | Ready |
-| P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Ready |
+| P0-S02 | Proto v1 contracts + codegen for Rust/C++/Python | 5 | Done |
+| P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Done |
 | P0-S04 | `neuroos-health` endpoint + histograms | 3 | Ready |
 | P0-S05 | systemd templates with hardening baseline | 3 | Ready |
 | P0-S06 | Spike S-01 unit mode → ADR-0002 | 5 | Ready |
@@ -140,6 +142,8 @@ Tech debt register (add as it appears):
 | :--- | :--- | :--- | :--- |
 | 2026-09-26 | `deny.toml` empty stub; `cargo deny check` not wired into `just ci` (license/bans policy undefined, only `just deny` exists standalone). | P0-S01 | P0-S10 |
 | 2026-09-26 | System has `clang-format-18`/`clang-tidy` (no unversioned `clang-format` alias); justfile calls `clang-format-18` explicitly. `cargo-nextest` and `shellcheck` installed manually this session (were missing from env, see memory.md §10). | P0-S01 | none needed — document only |
+| 2026-09-26 | `neuroos-ipc` branch coverage not measured: `cargo llvm-cov --branch` needs `-Z coverage-options=branch`, nightly-only. Line/region coverage (87.5%/88%) already exceeds the 80% bar. | P0-S03 | install/pin a nightly toolchain for coverage only, or accept line coverage as the working proxy — owner to decide |
+| 2026-09-26 | Real cross-UID `SO_PEERCRED` rejection (IT: `sudo -u nobody` or second local user) not exercised — sandbox has no second UID/root. `peercred::is_allowed` decision function is unit-tested directly instead. | P0-S03 | exercise for real during Phase 0 hardening pass, if a suitable CI runner is available |
 | 2026-09-26 | No C++ tests/executable entry point yet for `neuroos-voice` (only a static lib; Architecture.md §14 lists no `main.cpp` for it). `neuroos-inference` has a stub `main.cpp` returning 0. | P0-S01 | Phase 6 (voice), Phase 2 (inference) |
 
 ---
