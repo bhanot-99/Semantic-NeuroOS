@@ -45,6 +45,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-26 | P0-S04 | `neuroos-health`: latency histogram (log-scale ns buckets, matches `LatencyHistogram` proto), `/proc/self/status` RSS reader, `HealthServer` serving `HealthRequest`→`HealthResponse` over UDS (built on neuroos-ipc). Wired into `neuroos-monitor` main.rs as the "one line" proof: `tokio::spawn(health.serve(path, uids))`. 94.4% line coverage. | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S03 | `neuroos-ipc`: framing (u32-LE length prefix), UDS server/client, `SO_PEERCRED` allowlist check, connect/read/write deadlines, reconnect-with-backoff (10s budget). 16 tests (unit, proptest, 2 real-UDS integration: echo + reconnect-after-restart). 87.5% line / 88% region coverage. Branch coverage needs nightly rustc (cargo-llvm-cov `--branch`) — deferred, see §8 tech debt. | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S02 | proto v1 contracts (envelope, common, health, first-cut per-component messages) + codegen for Rust (prost)/C++ (protoc+CMake)/Python (protoc). Cross-language round-trip test (`tests/contract/roundtrip.sh`) proves Rust→C++→Python→Rust byte-identical encoding. | commit `402f312` on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S01 | `just ci` (fmt-check, lint, build, test across Rust/C++/Python) green on clean checkout; `just build`/`just test`/`just bench` also pass. Rust workspace (16 crates, toolchain 1.97.1 pinned), cpp CMake build (libneuroos, neuroos-inference exe, neuroos-voice lib), python uv project all wired. cargo-deny deferred to P0-S10 (kept as separate `just deny` recipe, not in `ci`). | commit `c48b5fc` on branch `p0/s01-just-ci-green` |
@@ -63,7 +64,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | P0-S01 | `just ci` green on clean checkout (scaffold, toolchains, justfile) | 5 | Done |
 | P0-S02 | Proto v1 contracts + codegen for Rust/C++/Python | 5 | Done |
 | P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Done |
-| P0-S04 | `neuroos-health` endpoint + histograms | 3 | Ready |
+| P0-S04 | `neuroos-health` endpoint + histograms | 3 | Done |
 | P0-S05 | systemd templates with hardening baseline | 3 | Ready |
 | P0-S06 | Spike S-01 unit mode → ADR-0002 | 5 | Ready |
 | P0-S07 | Spike S-02 memfd seqlock ring | 5 | Backlog (Sprint 0b) |

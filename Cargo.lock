@@ -206,6 +206,14 @@ version = "0.1.0"
 [[package]]
 name = "neuroos-health"
 version = "0.1.0"
+dependencies = [
+ "neuroos-ipc",
+ "neuroos-proto",
+ "prost",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "neuroos-healthd"
@@ -235,6 +243,10 @@ version = "0.1.0"
 [[package]]
 name = "neuroos-monitor"
 version = "0.1.0"
+dependencies = [
+ "neuroos-health",
+ "tokio",
+]
 
 [[package]]
 name = "neuroos-proto"

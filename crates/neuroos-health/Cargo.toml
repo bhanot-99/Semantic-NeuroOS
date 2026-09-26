@@ -9,3 +9,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+neuroos-ipc = { path = "../neuroos-ipc" }
+neuroos-proto = { path = "../neuroos-proto" }
+prost = "0.13"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

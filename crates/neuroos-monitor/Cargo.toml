@@ -9,3 +9,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+neuroos-health = { path = "../neuroos-health" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
