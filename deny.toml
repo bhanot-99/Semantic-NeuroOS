@@ -1,1 +1,66 @@
 # cargo-deny: licences, bans (HTTP crates outside fetcher)
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+ignore = []
+
+[licenses]
+# rules.md §4 licence allowlist. GPL/LGPL/AGPL and non-commercial licences
+# need an ADR (known non-cargo exceptions: espeak-ng GPL-3.0, openWakeWord
+# models CC-BY-NC-SA-4.0 — neither is a Rust crate, so neither appears here).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # GPL-3.0-only: the official COSMIC Wayland protocol bindings, the only
+    # way to reach zcosmic_toplevel_info_v1 (Architecture.md FR-MON-01,
+    # spike S-03, P0-S08). Found by wiring cargo-deny for real (P0-S10);
+    # see docs/adr/0007-cosmic-protocols-gpl-exception.md.
+    { crate = "cosmic-protocols", allow = ["GPL-3.0-only"] },
+]
+
+[licenses.private]
+# our own workspace crates: publish = false, no license field needed.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = true
+
+# R0-1 / NFR-SEC-03 (P0-S10): only neuroos-fetcher (Architecture.md §12.2,
+# "HTTP (C7 only)") may depend on an HTTP-capable or DNS-resolving crate.
+# Every other component runs under PrivateNetwork=true and Landlock; linking
+# any of these anywhere else is a build failure, not a code review catch.
+deny = [
+    { crate = "reqwest", wrappers = ["neuroos-fetcher"] },
+    { crate = "hyper", wrappers = ["neuroos-fetcher"] },
+    { crate = "hyper-util", wrappers = ["neuroos-fetcher"] },
+    { crate = "ureq", wrappers = ["neuroos-fetcher"] },
+    { crate = "isahc", wrappers = ["neuroos-fetcher"] },
+    { crate = "surf", wrappers = ["neuroos-fetcher"] },
+    { crate = "attohttpc", wrappers = ["neuroos-fetcher"] },
+    { crate = "curl", wrappers = ["neuroos-fetcher"] },
+    { crate = "curl-sys", wrappers = ["neuroos-fetcher"] },
+    { crate = "hickory-resolver", wrappers = ["neuroos-fetcher"] },
+    { crate = "trust-dns-resolver", wrappers = ["neuroos-fetcher"] },
+    { crate = "hickory-proto", wrappers = ["neuroos-fetcher"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,1 +1,11 @@
-# neuroos-confirm [C6] crate manifest
+# neuroos-confirm [C6] GTK4 confirmation dialog
+[package]
+name = "neuroos-confirm"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

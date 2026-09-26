@@ -1,1 +1,9 @@
 # systemd target grouping all neuroos-<c>@ instances
+[Unit]
+Description=NeuroOS (instance %i)
+# Enabled explicitly per installed user (systemctl enable neuroos@<uid>.target);
+# not pulled in automatically until Phase 9/10 deployment tuning decides how
+# it should hook into the graphical session.
+
+[Install]
+WantedBy=multi-user.target

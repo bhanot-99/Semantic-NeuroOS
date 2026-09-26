@@ -423,6 +423,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true    # C4/C2 exempt if ONNX/ggml JIT paths need it (verify in Phase 2/6)
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+InaccessiblePaths=-/run/systemd/resolve   # PrivateNetwork alone does not block DNS; see note below
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
@@ -432,6 +433,8 @@ RestartSec=2s
 ```
 
 > **Unit mode (spike S-01, risk R-01):** the preferred deployment is **system template units** `neuroos-<component>@<user>.service` with `User=%i`, because `PrivateNetwork=true` in *user* units needs user namespaces (restricted on Ubuntu 24.04) and `PrivateUsers=` remaps UIDs, which breaks `SO_PEERCRED` checks. S-01 confirms the choice and records ADR-0002.
+
+> **`PrivateNetwork=true` does not block DNS by itself (found empirically in P0-S05, `scripts/check-egress.sh`):** glibc's `resolve` NSS module (`/etc/nsswitch.conf`) talks to `systemd-resolved` over a local socket at `/run/systemd/resolve/`, which an isolated network namespace does not affect — `getent hosts` still succeeds. `InaccessiblePaths=-/run/systemd/resolve` closes this; `scripts/check-egress.sh` proves both the leak and the fix. Omitted on `neuroos-fetcher.service`, the one component that legitimately needs DNS (it is also the one exempt from `PrivateNetwork=true`).
 
 ### 8.2 Landlock rulesets (applied at process start, after config load)
 

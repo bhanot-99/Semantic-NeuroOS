@@ -1,1 +1,10 @@
 // C1 monitor telemetry ingest types
+syntax = "proto3";
+package neuroos.v1;
+
+// first-cut envelope for sensor events; per-sensor payload schemas land in Phase 3
+message RawTelemetryEvent {
+  uint64 observed_at_ns = 1;
+  string source = 2;   // "wayland_cosmic" | "wayland_wlr" | "idle" | "mpris" | "proc" | "folders"
+  bytes payload = 3;
+}

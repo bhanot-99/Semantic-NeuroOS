@@ -1,1 +1,11 @@
-# neuroos-storage [C3] crate manifest
+# neuroos-storage [C3]
+[package]
+name = "neuroos-storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

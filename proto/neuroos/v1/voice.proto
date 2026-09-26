@@ -1,1 +1,13 @@
 // C2 voice pipeline types
+syntax = "proto3";
+package neuroos.v1;
+
+// first-cut; full voice request/response set lands in Phase 6
+message VoiceCommand {
+  string transcript = 1;
+  uint64 spoken_at_ns = 2;
+}
+
+message PreambleRequest {
+  string clip_id = 1;
+}

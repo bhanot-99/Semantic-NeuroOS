@@ -1,0 +1,10 @@
+# triggers the 6-hourly C3 backup job (Architecture.md §7.5)
+[Unit]
+Description=NeuroOS storage backup (every 6h, instance %i)
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

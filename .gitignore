@@ -3,7 +3,19 @@
 target/
 __pycache__/
 *.pyc
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*_pb2.py
+*_pb2.pyi
 
 # reference media, not project assets
 *.mp4
 semantic_matrix_handdrawn_*.png
+build/
+build-*/
+compile_commands.json
+
+# local dev scratch (downloaded models, etc.) — never tracked, always inside repo root
+.dev-cache/

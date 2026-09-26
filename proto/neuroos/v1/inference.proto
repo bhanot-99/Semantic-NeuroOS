@@ -1,1 +1,14 @@
 // C4 inference engine types
+syntax = "proto3";
+package neuroos.v1;
+
+// first-cut; full grammar/lane control set lands in Phase 2. Token stream itself
+// travels over the memfd seqlock ring (Architecture.md §5.5), not this socket.
+message InferRequest {
+  string prompt = 1;
+  uint32 max_tokens = 2;
+}
+
+message InferResponse {
+  string ring_shm_name = 1;   // informational; fd passed via SCM_RIGHTS out of band
+}

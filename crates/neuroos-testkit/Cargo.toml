@@ -1,1 +1,15 @@
-# neuroos-testkit crate manifest
+# mock servers, fixture loaders, replay tooling
+[package]
+name = "neuroos-testkit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
+neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }

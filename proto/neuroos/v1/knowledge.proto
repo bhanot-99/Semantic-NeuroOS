@@ -1,1 +1,12 @@
 // C5 knowledge engine types
+syntax = "proto3";
+package neuroos.v1;
+
+// first-cut; full deictic/evidence/graph-view set lands in Phase 5
+message AskRequest {
+  string question = 1;
+}
+
+message AskResponse {
+  string answer = 1;
+}

@@ -1,1 +1,13 @@
 // C3 storage engine types
+syntax = "proto3";
+package neuroos.v1;
+
+// first-cut; full ingest/query/adapter set lands in Phase 4
+message IngestRequest {
+  string source = 1;
+  bytes payload = 2;
+}
+
+message IngestResponse {
+  bool accepted = 1;
+}

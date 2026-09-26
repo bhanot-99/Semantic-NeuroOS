@@ -1,1 +1,11 @@
-# neuroos-knowledge-query [C5a] crate manifest
+# neuroos-knowledge-query [C5a]
+[package]
+name = "neuroos-knowledge-query"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

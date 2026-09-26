@@ -1,1 +1,44 @@
 # systemd template unit for neuroos-monitor [C1]
+[Unit]
+Description=NeuroOS neuroos-monitor [C1]
+After=neuroos@%i.target
+PartOf=neuroos@%i.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+ExecStart=/opt/neuroos/bin/neuroos-monitor
+Environment=XDG_RUNTIME_DIR=/run/user/%i
+Environment=NEUROOS_RUNTIME_DIR=/run/user/%i/neuroos
+
+# --- hardening baseline (Architecture.md §8.1); unit mode (User=%i template vs
+# a user unit) is confirmed empirically by spike S-01 / ADR-0002 (P0-S06) ---
+PrivateNetwork=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+InaccessiblePaths=-/run/systemd/resolve
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+MemoryMax=40M
+Restart=on-failure
+RestartSec=2s
+BindReadOnlyPaths=/proc %t/wayland-0 %t/bus %h/.config/neuroos/config.toml
+
+[Install]
+WantedBy=neuroos@%i.target

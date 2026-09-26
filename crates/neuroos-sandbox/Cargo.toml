@@ -1,1 +1,11 @@
-# neuroos-sandbox crate manifest
+# Landlock + seccomp helpers
+[package]
+name = "neuroos-sandbox"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

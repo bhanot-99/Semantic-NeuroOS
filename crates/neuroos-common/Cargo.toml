@@ -1,1 +1,11 @@
-# neuroos-common crate manifest
+# config, paths, time (UTC ns), logging init, errors
+[package]
+name = "neuroos-common"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
