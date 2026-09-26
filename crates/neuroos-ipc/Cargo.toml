@@ -1,1 +1,11 @@
-# neuroos-ipc crate manifest
+# framing, UDS server/client, SO_PEERCRED, reconnect
+[package]
+name = "neuroos-ipc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

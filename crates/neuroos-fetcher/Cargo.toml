@@ -1,1 +1,11 @@
-# neuroos-fetcher [C7] crate manifest
+# neuroos-fetcher [C7]
+[package]
+name = "neuroos-fetcher"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

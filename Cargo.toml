@@ -1,1 +1,32 @@
 # Rust workspace root
+[workspace]
+resolver = "2"
+members = [
+    "crates/neuroos-common",
+    "crates/neuroos-proto",
+    "crates/neuroos-ipc",
+    "crates/neuroos-shm",
+    "crates/neuroos-taint",
+    "crates/neuroos-health",
+    "crates/neuroos-sandbox",
+    "crates/neuroos-testkit",
+    "crates/neuroos-healthd",
+    "crates/neuroos-monitor",
+    "crates/neuroos-storage",
+    "crates/neuroos-knowledge-query",
+    "crates/neuroos-kernel",
+    "crates/neuroos-confirm",
+    "crates/neuroos-fetcher",
+    "crates/neuroosctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[profile.release]
+lto = "thin"

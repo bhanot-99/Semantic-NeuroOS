@@ -1,1 +1,11 @@
-# neuroos-testkit crate manifest
+# mock servers, fixture loaders, replay tooling
+[package]
+name = "neuroos-testkit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,1 +1,11 @@
 # C++ static analysis rules
+Checks: >
+  bugprone-*,
+  cert-*,
+  cppcoreguidelines-*,
+  performance-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/(cpp)/.*'
+FormatStyle: file

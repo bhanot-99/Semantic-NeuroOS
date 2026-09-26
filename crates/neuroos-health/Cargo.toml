@@ -1,1 +1,11 @@
-# neuroos-health crate manifest
+# health endpoint server + latency histograms
+[package]
+name = "neuroos-health"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

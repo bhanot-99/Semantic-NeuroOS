@@ -1,1 +1,11 @@
-# neuroos-healthd [D] crate manifest
+# neuroos-healthd [D]
+[package]
+name = "neuroos-healthd"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

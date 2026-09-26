@@ -1,1 +1,11 @@
-# neuroos-kernel [C6] crate manifest
+# neuroos-kernel [C6]
+[package]
+name = "neuroos-kernel"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

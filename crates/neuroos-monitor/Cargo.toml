@@ -1,1 +1,11 @@
-# neuroos-monitor [C1] crate manifest
+# neuroos-monitor [C1]
+[package]
+name = "neuroos-monitor"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

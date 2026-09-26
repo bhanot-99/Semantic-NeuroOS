@@ -1,1 +1,4 @@
-# pins Rust toolchain version for reproducible builds
+# pins Rust toolchain version for reproducible builds (D-07)
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

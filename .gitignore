@@ -3,7 +3,13 @@
 target/
 __pycache__/
 *.pyc
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 
 # reference media, not project assets
 *.mp4
 semantic_matrix_handdrawn_*.png
+build/
+compile_commands.json
