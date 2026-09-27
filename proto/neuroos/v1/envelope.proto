@@ -35,6 +35,7 @@ message Envelope {
 
     VoiceCommand         voice_command   = 30;
     PreambleRequest      preamble        = 31;
+    PreambleResponse     preamble_response = 32;
 
     IngestRequest        ingest_request  = 40;
     IngestResponse       ingest_response = 41;
