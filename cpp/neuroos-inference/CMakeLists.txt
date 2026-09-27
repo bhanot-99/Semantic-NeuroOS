@@ -34,6 +34,7 @@ find_package(toml11 REQUIRED)
 
 add_executable(neuroos-inference
     src/main.cpp
+    src/bench.cpp
     src/config.cpp
     src/engine.cpp
     src/grammar.cpp

@@ -3,8 +3,10 @@
 #include <unistd.h>
 
 #include <csignal>
+#include <string>
 #include <thread>
 
+#include "bench.hpp"
 #include "config.hpp"
 #include "engine.hpp"
 #include "lanes.hpp"
@@ -22,13 +24,18 @@ void on_signal(int) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] neuroos-inference: %v");
+
+    auto config = neuroos::inference::load_config();
+
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        return neuroos::inference::run_benchmark(config);
+    }
 
     std::signal(SIGTERM, on_signal);
     std::signal(SIGINT, on_signal);
 
-    auto config = neuroos::inference::load_config();
     std::string model_path = neuroos::inference::resolve_model_path(config);
     spdlog::info("loading model {} (threads={}, max_context_tokens={})", model_path, config.threads,
                  config.max_context_tokens);
