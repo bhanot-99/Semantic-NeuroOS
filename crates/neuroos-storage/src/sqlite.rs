@@ -1,7 +1,7 @@
 //! `meta.sqlite3` (Architecture.md §7.2): WAL mode, `synchronous=NORMAL`,
 //! single writer (this process). Owns `focus_history`, `event_counters`,
 //! `aggregates_daily`, `entities`, `edges`, `chunks_meta`, `index_meta`.
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
 use neuroos_taint::TaintFlags;
@@ -148,6 +148,55 @@ pub fn insert_focus_history(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FocusHistoryRow {
+    pub app_id: String,
+    pub title: String,
+    pub pid: u32,
+    pub root_pid: u32,
+    pub t_start_ns: u64,
+    pub t_end_ns: u64,
+    pub dwell_ms: u64,
+}
+
+/// FR-STO-06: `QueryFocusHistory(t, ±window)` — the deictic-snap query
+/// ("what was I looking at when I said this"). Prefers a segment that
+/// actually contains `t_ns`; failing that, the segment whose nearest edge
+/// is closest to `t_ns`, among those overlapping `[t_ns - window_ns, t_ns +
+/// window_ns]`. `None` if nothing overlaps at all.
+pub fn query_focus_history(
+    conn: &Connection,
+    t_ns: u64,
+    window_ns: u64,
+) -> Result<Option<FocusHistoryRow>, StorageError> {
+    let lo = t_ns.saturating_sub(window_ns) as i64;
+    let hi = t_ns.saturating_add(window_ns) as i64;
+    let t = t_ns as i64;
+    conn.query_row(
+        "SELECT app_id, title, pid, root_pid, t_start_ns, t_end_ns, dwell_ms
+         FROM focus_history
+         WHERE t_start_ns <= ?2 AND t_end_ns >= ?1
+         ORDER BY
+             CASE WHEN t_start_ns <= ?3 AND t_end_ns >= ?3 THEN 0 ELSE 1 END,
+             MIN(ABS(t_start_ns - ?3), ABS(t_end_ns - ?3))
+         LIMIT 1",
+        (lo, hi, t),
+        |row| {
+            Ok(FocusHistoryRow {
+                app_id: row.get(0)?,
+                title: row.get(1)?,
+                pid: row.get(2)?,
+                root_pid: row.get(3)?,
+                t_start_ns: row.get::<_, i64>(4)? as u64,
+                t_end_ns: row.get::<_, i64>(5)? as u64,
+                dwell_ms: row.get::<_, i64>(6)? as u64,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
@@ -251,5 +300,63 @@ mod tests {
             .query_row("SELECT app_id FROM focus_history", [], |r| r.get(0))
             .unwrap();
         assert_eq!(app_id, "org.mozilla.firefox");
+    }
+
+    fn seed_two_sessions(conn: &Connection) {
+        insert_focus_history(
+            conn,
+            &FocusHistoryEntry {
+                app_id: "editor",
+                title: "main.rs",
+                pid: 1,
+                root_pid: 1,
+                t_start_ns: 1_000_000_000,
+                t_end_ns: 2_000_000_000,
+                dwell_ms: 1_000,
+            },
+        )
+        .unwrap();
+        insert_focus_history(
+            conn,
+            &FocusHistoryEntry {
+                app_id: "browser",
+                title: "docs",
+                pid: 2,
+                root_pid: 2,
+                t_start_ns: 5_000_000_000,
+                t_end_ns: 6_000_000_000,
+                dwell_ms: 1_000,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn query_focus_history_finds_the_session_containing_the_timestamp() {
+        let conn = open_in_memory().unwrap();
+        seed_two_sessions(&conn);
+        let row = query_focus_history(&conn, 1_500_000_000, 1_500_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.app_id, "editor");
+    }
+
+    #[test]
+    fn query_focus_history_finds_the_nearest_session_within_window_when_not_contained() {
+        let conn = open_in_memory().unwrap();
+        seed_two_sessions(&conn);
+        // 2.3s: 0.3s after editor's session ends, well before browser's starts
+        let row = query_focus_history(&conn, 2_300_000_000, 1_500_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.app_id, "editor");
+    }
+
+    #[test]
+    fn query_focus_history_outside_every_window_is_none() {
+        let conn = open_in_memory().unwrap();
+        seed_two_sessions(&conn);
+        let row = query_focus_history(&conn, 100_000_000_000, 1_500_000_000).unwrap();
+        assert_eq!(row, None);
     }
 }

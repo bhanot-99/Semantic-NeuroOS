@@ -96,6 +96,17 @@ impl StorageEngine {
             .unwrap_or_default();
         Ok(self.lance.query_all_families(&vector, top_k).await?)
     }
+
+    /// FR-STO-06: `QueryFocusHistory(t, ±window)` — the deictic-snap query.
+    pub fn query_focus_history(
+        &self,
+        t_ns: u64,
+        window_ns: u64,
+    ) -> Result<Option<crate::sqlite::FocusHistoryRow>, EngineError> {
+        Ok(crate::sqlite::query_focus_history(
+            &self.conn, t_ns, window_ns,
+        )?)
+    }
 }
 
 #[cfg(test)]
