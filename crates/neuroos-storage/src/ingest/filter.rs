@@ -47,7 +47,14 @@ pub enum FilterOutcome {
     /// Stage 3 gate not yet met: counted in memory, nothing persisted yet.
     NotYetPromoted { key: String },
     /// Ready for a domain adapter to persist as (or update) an entity.
-    Promoted { key: String },
+    /// `segment` is `Some((t_start_ns, t_end_ns))` when this touch was a
+    /// window dwell segment ending (a `StateChanged` deactivate) — the one
+    /// case a domain adapter needs more than `key` and the triggering
+    /// event's own timestamp to write `focus_history`.
+    Promoted {
+        key: String,
+        segment: Option<(u64, u64)>,
+    },
     /// Stage 4: this event type is never promoted by this filter.
     Demoted,
     /// No entity key applies (e.g. a periodic `ResourceSample`, or a raw
@@ -113,13 +120,21 @@ impl IngestFilter {
                 if !snapshot.root_pid_known {
                     return FilterOutcome::NotApplicable;
                 }
-                self.touch(format!("proc:{}", snapshot.root_pid), true, Duration::ZERO)
+                self.touch(
+                    format!("proc:{}", snapshot.root_pid),
+                    true,
+                    Duration::ZERO,
+                    None,
+                )
             }
             Some(Payload::Window(w)) => self.process_window(w, event.observed_at_ns),
             Some(Payload::Mpris(_)) => FilterOutcome::Demoted,
-            Some(Payload::FileActivity(f)) => {
-                self.touch(format!("file:{}", f.watch_label), true, Duration::ZERO)
-            }
+            Some(Payload::FileActivity(f)) => self.touch(
+                format!("file:{}", f.watch_label),
+                true,
+                Duration::ZERO,
+                None,
+            ),
             Some(Payload::Idle(_)) | Some(Payload::Resource(_)) | None => {
                 FilterOutcome::NotApplicable
             }
@@ -153,10 +168,10 @@ impl IngestFilter {
                     // One occurrence per focus session (Architecture.md §6.2's
                     // "N >= 3 occurrences" — 3 separate times focused, not 3
                     // raw wire events).
-                    self.touch(app_id, true, Duration::ZERO)
+                    self.touch(app_id, true, Duration::ZERO, None)
                 } else if let Some(started_ns) = self.active_since_ns.remove(&w.toplevel_id) {
                     let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
-                    self.touch(app_id, false, dwell)
+                    self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
                 } else {
                     FilterOutcome::NotApplicable
                 }
@@ -174,18 +189,24 @@ impl IngestFilter {
     /// resulting outcome. `add_occurrence` counts one focus/observation
     /// session; `extra_dwell` adds to cumulative active dwell. A key that
     /// already crossed the gate stays `Promoted` on every later touch.
-    fn touch(&mut self, key: String, add_occurrence: bool, extra_dwell: Duration) -> FilterOutcome {
+    fn touch(
+        &mut self,
+        key: String,
+        add_occurrence: bool,
+        extra_dwell: Duration,
+        segment: Option<(u64, u64)>,
+    ) -> FilterOutcome {
         let counter = self.counters.entry(key.clone()).or_default();
         if add_occurrence {
             counter.occurrences += 1;
         }
         counter.dwell += extra_dwell;
         if counter.promoted {
-            return FilterOutcome::Promoted { key };
+            return FilterOutcome::Promoted { key, segment };
         }
         if counter.gate() {
             counter.promoted = true;
-            FilterOutcome::Promoted { key }
+            FilterOutcome::Promoted { key, segment }
         } else {
             FilterOutcome::NotYetPromoted { key }
         }
@@ -304,7 +325,8 @@ mod tests {
         assert_eq!(
             f.process(&activated(1, 3_000_000_000, true)),
             FilterOutcome::Promoted {
-                key: "org.mozilla.firefox".into()
+                key: "org.mozilla.firefox".into(),
+                segment: None, // this touch is an activate, not a completed dwell segment
             }
         );
     }
@@ -329,7 +351,8 @@ mod tests {
         assert_eq!(
             f2.process(&activated(2, 5_100_000_000, false)),
             FilterOutcome::Promoted {
-                key: "cosmic-term".into()
+                key: "cosmic-term".into(),
+                segment: Some((0, 5_100_000_000)),
             }
         );
     }
@@ -343,7 +366,8 @@ mod tests {
         assert_eq!(
             f.process(&activated(1, 10_000_000_000, true)),
             FilterOutcome::Promoted {
-                key: "cosmic-term".into()
+                key: "cosmic-term".into(),
+                segment: None, // an activate, not a completed dwell segment
             }
         );
     }
@@ -374,7 +398,8 @@ mod tests {
         assert_eq!(
             f.process(&activated(1, 6_000_000_000, false)),
             FilterOutcome::Promoted {
-                key: "org.mozilla.firefox".into()
+                key: "org.mozilla.firefox".into(),
+                segment: Some((0, 6_000_000_000)),
             }
         );
     }
@@ -479,7 +504,8 @@ mod tests {
         assert_eq!(
             f.process(&event("git")),
             FilterOutcome::Promoted {
-                key: "file:git".into()
+                key: "file:git".into(),
+                segment: None,
             }
         );
     }
