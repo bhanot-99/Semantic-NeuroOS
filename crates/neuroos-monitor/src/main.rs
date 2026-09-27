@@ -135,10 +135,15 @@ async fn resource_and_focus_loop(interval: Duration, bus: EventBus, privacy: Pri
             continue;
         }
 
-        if let Ok(Some(sample)) = tokio::task::spawn_blocking(move || sampler.sample())
-            .await
-            .unwrap_or(Ok(None))
-        {
+        // Reading /proc/stat + /proc/meminfo is a small, fast local file
+        // read (not worth a spawn_blocking hop) — and calling it directly
+        // keeps `sampler` borrowed in place, so its delta-tracking state
+        // (the previous tick's tick counts) actually persists across ticks.
+        // (A prior version reassigned `sampler` to a fresh instance every
+        // tick to work around spawn_blocking's `move` closure needing to
+        // own it — that silently made sample() always see "first call"
+        // and never publish. Found via this function's own test timing out.)
+        if let Ok(Some(sample)) = sampler.sample() {
             bus.publish(neuroos_proto::v1::RawTelemetryEvent {
                 observed_at_ns: neuroos_common::now_ns(),
                 source: "proc".into(),
@@ -151,9 +156,6 @@ async fn resource_and_focus_loop(interval: Duration, bus: EventBus, privacy: Pri
                 )),
             });
         }
-        // sampler was moved into the closure above; recreate it for the
-        // next tick (cheap: it only holds one prior tick's counters).
-        sampler = sensors::proc::ResourceSampler::new();
 
         if let Ok(Some(app_id)) = tokio::task::spawn_blocking(focused_app_id).await
             && let Ok(Some(pid)) = sensors::proc::find_pid_for_app_id(&app_id)
