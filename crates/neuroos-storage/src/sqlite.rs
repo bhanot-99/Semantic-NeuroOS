@@ -197,6 +197,67 @@ pub fn query_focus_history(
     .map_err(StorageError::from)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexMeta {
+    pub embedding_model_id: String,
+    pub dim: i64,
+    pub index_kind: String,
+    pub p99_ms: f64,
+    pub updated_ns: i64,
+}
+
+/// FR-STO-11: which embedding model (if any) produced `collection`'s
+/// currently-stored vectors. `None` means the collection has never been
+/// indexed yet (nothing to compare a re-index decision against).
+pub fn get_index_meta(
+    conn: &Connection,
+    collection: &str,
+) -> Result<Option<IndexMeta>, StorageError> {
+    conn.query_row(
+        "SELECT embedding_model_id, dim, index_kind, p99_ms, updated_ns
+         FROM index_meta WHERE collection = ?1",
+        [collection],
+        |row| {
+            Ok(IndexMeta {
+                embedding_model_id: row.get(0)?,
+                dim: row.get(1)?,
+                index_kind: row.get(2)?,
+                p99_ms: row.get(3)?,
+                updated_ns: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
+/// FR-STO-11: records which model/index-kind `collection` is currently
+/// indexed with — called after every insert (so the *next* model change
+/// has something to compare against) and after a background re-index
+/// completes (so the mismatch that triggered it clears).
+pub fn upsert_index_meta(
+    conn: &Connection,
+    collection: &str,
+    embedding_model_id: &str,
+    dim: i64,
+    index_kind: &str,
+    p99_ms: f64,
+    updated_ns: i64,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO index_meta (collection, embedding_model_id, dim, index_kind, p99_ms, updated_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(collection) DO UPDATE SET
+             embedding_model_id = excluded.embedding_model_id,
+             dim = excluded.dim,
+             index_kind = excluded.index_kind,
+             p99_ms = excluded.p99_ms,
+             updated_ns = excluded.updated_ns",
+        (collection, embedding_model_id, dim, index_kind, p99_ms, updated_ns),
+    )?;
+    Ok(())
+}
+
 /// FR-STO-12/FR-PRV-03 ("forget"): deletes every row tied to `app_id`
 /// (entities, their chunk metadata, focus history, event counters) and
 /// returns the deleted entities' ids, so the caller can also purge the
@@ -506,5 +567,45 @@ mod tests {
             .query_row("SELECT app_id FROM focus_history", [], |r| r.get(0))
             .unwrap();
         assert_eq!(app_id, "editor");
+    }
+
+    #[test]
+    fn index_meta_is_none_before_first_write() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(get_index_meta(&conn, "attention").unwrap(), None);
+    }
+
+    #[test]
+    fn index_meta_upsert_then_read_round_trips() {
+        let conn = open_in_memory().unwrap();
+        upsert_index_meta(
+            &conn,
+            "attention",
+            "bge-small-en-v1.5",
+            384,
+            "flat",
+            1.5,
+            1000,
+        )
+        .unwrap();
+        let meta = get_index_meta(&conn, "attention").unwrap().unwrap();
+        assert_eq!(meta.embedding_model_id, "bge-small-en-v1.5");
+        assert_eq!(meta.dim, 384);
+        assert_eq!(meta.index_kind, "flat");
+        assert_eq!(meta.updated_ns, 1000);
+    }
+
+    #[test]
+    fn index_meta_upsert_overwrites_not_duplicates() {
+        let conn = open_in_memory().unwrap();
+        upsert_index_meta(&conn, "attention", "model-a", 384, "flat", 0.0, 1000).unwrap();
+        upsert_index_meta(&conn, "attention", "model-b", 384, "hnsw", 2.0, 2000).unwrap();
+        let meta = get_index_meta(&conn, "attention").unwrap().unwrap();
+        assert_eq!(meta.embedding_model_id, "model-b");
+        assert_eq!(meta.index_kind, "hnsw");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM index_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

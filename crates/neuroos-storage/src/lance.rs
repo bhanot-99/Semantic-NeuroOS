@@ -1,8 +1,10 @@
 //! LanceDB: vectors + chunks, one table per domain family (Architecture.md
 //! §7.2: `attention`, `work`, `knowledge`, `system`, `external`), columns
 //! `chunk_id, entity_id, text, vector[384], taint, t_ns, domain`.
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
@@ -11,8 +13,27 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use futures::TryStreamExt;
+use lancedb::index::Index;
+use lancedb::index::vector::IvfHnswFlatIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table};
+use neuroos_health::{Histogram, p99_ns};
+
+/// FR-STO-07: a family promotes to an HNSW index once its measured query
+/// p99 exceeds this — no item-count threshold, per spec.
+const HNSW_PROMOTION_P99_THRESHOLD: Duration = Duration::from_millis(5);
+
+/// Guards the p99 check against a single cold/slow query firing promotion
+/// off a near-empty histogram; not itself an item-count promotion
+/// criterion (FR-STO-07 has none) — just a minimum sample size for the
+/// p99 estimate to mean anything.
+const MIN_SAMPLES_BEFORE_PROMOTION_CHECK: u64 = 20;
+
+/// See `neuroos_health::histogram::lock`'s doc comment: recovers rather
+/// than panics on a poisoned mutex (rules.md §5).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// `bge-small-en-v1.5`'s output width (matches `embed::EMBEDDING_DIM`; kept
 /// separate so this module has no compile-time dependency on `embed`).
@@ -150,6 +171,14 @@ fn decode_batch(batch: &RecordBatch, has_distance: bool) -> Result<Vec<ChunkMatc
 
 pub struct LanceStore {
     conn: Connection,
+    /// FR-STO-07: per-family query-latency histogram driving HNSW
+    /// promotion (not persisted — resets on restart, which just means the
+    /// promotion decision re-measures fresh instead of carrying over a
+    /// stale one; already-created indexes stay on disk regardless).
+    query_latencies: Mutex<HashMap<String, Histogram>>,
+    /// Families already promoted to HNSW this session, so a slow query
+    /// doesn't retry `create_index` every time.
+    promoted: Mutex<HashSet<String>>,
 }
 
 impl LanceStore {
@@ -162,7 +191,11 @@ impl LanceStore {
             .to_str()
             .ok_or_else(|| LanceError::InvalidPath(path.to_path_buf()))?;
         let conn = lancedb::connect(uri).execute().await?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            query_latencies: Mutex::new(HashMap::new()),
+            promoted: Mutex::new(HashSet::new()),
+        };
         for family in FAMILIES {
             store.ensure_table(family).await?;
         }
@@ -203,9 +236,10 @@ impl LanceStore {
         Ok(())
     }
 
-    /// FR-STO-05: exact (flat) nearest-neighbor search within one family.
-    /// No index is created here — that only happens once FR-STO-07's HNSW
-    /// promotion threshold fires (P4-S05).
+    /// FR-STO-05: exact (flat) nearest-neighbor search within one family,
+    /// unless FR-STO-07's HNSW promotion has already fired for it (P4-S05)
+    /// — LanceDB transparently uses whatever index exists on the `vector`
+    /// column, so this method's own query stays the same either way.
     pub async fn query(
         &self,
         family: &str,
@@ -213,6 +247,7 @@ impl LanceStore {
         top_k: usize,
     ) -> Result<Vec<ChunkMatch>, LanceError> {
         let table = self.ensure_table(family).await?;
+        let start = Instant::now();
         let batches = table
             .query()
             .nearest_to(vector)?
@@ -221,11 +256,72 @@ impl LanceStore {
             .await?
             .try_collect::<Vec<_>>()
             .await?;
-        batches
+        let elapsed = start.elapsed();
+        let results = batches
             .iter()
             .map(|b| decode_batch(b, true))
             .collect::<Result<Vec<_>, _>>()
-            .map(|nested| nested.into_iter().flatten().collect())
+            .map(|nested| nested.into_iter().flatten().collect());
+        if self.record_query_latency(family, elapsed) {
+            self.promote_to_hnsw(family, &table).await;
+        }
+        results
+    }
+
+    /// Records one query's latency for `family` and reports whether it
+    /// should now be promoted to HNSW (FR-STO-07: p99 > 5.0 ms, no
+    /// item-count threshold). Split out from `query()` so the promotion
+    /// policy itself is unit-testable with synthetic durations instead of
+    /// needing a real query slow enough to cross 5ms.
+    fn record_query_latency(&self, family: &str, elapsed: Duration) -> bool {
+        if lock(&self.promoted).contains(family) {
+            return false;
+        }
+        let hist = {
+            let mut latencies = lock(&self.query_latencies);
+            let h = latencies.entry(family.to_string()).or_default();
+            h.record(elapsed);
+            h.to_proto()
+        };
+        if hist.count < MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
+            return false;
+        }
+        let Some(p99) = p99_ns(&hist) else {
+            return false;
+        };
+        if (p99 as u128) <= HNSW_PROMOTION_P99_THRESHOLD.as_nanos() {
+            return false;
+        }
+        lock(&self.promoted).insert(family.to_string())
+    }
+
+    /// Creates an `IVF_HNSW_FLAT` index on `table`'s `vector` column.
+    /// Best-effort: a training failure (e.g. too little data yet) logs and
+    /// un-marks `family` so the next qualifying query retries, rather than
+    /// failing the query that triggered it.
+    async fn promote_to_hnsw(&self, family: &str, table: &Table) {
+        let result = table
+            .create_index(
+                &["vector"],
+                Index::IvfHnswFlat(IvfHnswFlatIndexBuilder::default()),
+            )
+            .execute()
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(family, error = %err, "FR-STO-07 HNSW promotion failed, will retry on a future slow query");
+            lock(&self.promoted).remove(family);
+        } else {
+            tracing::info!(
+                family,
+                "FR-STO-07: promoted family to HNSW index (p99 > 5ms)"
+            );
+        }
+    }
+
+    /// Test/introspection hook: whether `family` has been promoted to HNSW
+    /// this session.
+    pub fn is_promoted(&self, family: &str) -> bool {
+        lock(&self.promoted).contains(family)
     }
 
     /// FR-STO-05's `QueryHybridVectorText`: search every family (a question
@@ -242,6 +338,49 @@ impl LanceStore {
         all.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         all.truncate(top_k);
         Ok(all)
+    }
+
+    /// FR-STO-11: every row currently in `family` (full scan, no vector
+    /// search) — the background re-index's source of each chunk's
+    /// original `text` to re-embed. The returned `distance` field is
+    /// meaningless here (no query vector); callers doing a re-index never
+    /// look at it.
+    pub async fn all_chunks(&self, family: &str) -> Result<Vec<ChunkMatch>, LanceError> {
+        let table = self.ensure_table(family).await?;
+        let batches = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        batches
+            .iter()
+            .map(|b| decode_batch(b, false))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|nested| nested.into_iter().flatten().collect())
+    }
+
+    /// FR-STO-11: writes new vectors (and unchanged metadata) back for
+    /// existing rows in `family`, matched by `chunk_id` — an upsert via
+    /// `merge_insert`, not delete+reinsert, so a query racing this sees
+    /// either the pre- or post-reindex vector for a row, never a gap.
+    pub async fn upsert_vectors(
+        &self,
+        family: &str,
+        chunks: &[ChunkRecord],
+    ) -> Result<(), LanceError> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let table = self.ensure_table(family).await?;
+        let batch = records_to_batch(chunks)?;
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema()),
+        );
+        let mut merge = table.merge_insert(&["chunk_id"]);
+        merge.when_matched_update_all(None);
+        merge.execute(reader).await?;
+        Ok(())
     }
 
     /// FR-STO-12 ("forget"): deletes every row matching `predicate` (a
@@ -372,5 +511,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LanceError::UnknownFamily(_)));
+    }
+
+    #[tokio::test]
+    async fn all_chunks_returns_every_row_in_the_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        store
+            .insert(
+                "attention",
+                &[
+                    chunk("a", vec![1.0; EMBEDDING_DIM as usize]),
+                    chunk("b", vec![-1.0; EMBEDDING_DIM as usize]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut ids = store
+            .all_chunks("attention")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.chunk_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn upsert_vectors_replaces_the_vector_for_an_existing_chunk_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        store
+            .insert(
+                "attention",
+                &[chunk("a", vec![1.0; EMBEDDING_DIM as usize])],
+            )
+            .await
+            .unwrap();
+
+        let mut updated = chunk("a", vec![-1.0; EMBEDDING_DIM as usize]);
+        updated.text = "re-embedded text".to_string();
+        store.upsert_vectors("attention", &[updated]).await.unwrap();
+
+        let results = store
+            .query("attention", &[-1.0; EMBEDDING_DIM as usize], 1)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, "a");
+        assert_eq!(results[0].text, "re-embedded text");
+
+        // the row was updated in place, not duplicated
+        assert_eq!(store.all_chunks("attention").await.unwrap().len(), 1);
+    }
+
+    // P4-S05 / FR-STO-07: promotion policy tested directly with synthetic
+    // durations (not via real queries slow enough to cross 5ms — that's
+    // covered by the PF benchmark, not a unit test).
+    #[tokio::test]
+    async fn fast_queries_never_promote() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        for _ in 0..MIN_SAMPLES_BEFORE_PROMOTION_CHECK * 2 {
+            assert!(!store.record_query_latency("attention", Duration::from_micros(100)));
+        }
+        assert!(!store.is_promoted("attention"));
+    }
+
+    #[tokio::test]
+    async fn too_few_samples_never_promotes_even_if_all_slow() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        for _ in 0..MIN_SAMPLES_BEFORE_PROMOTION_CHECK - 1 {
+            assert!(!store.record_query_latency("attention", Duration::from_millis(50)));
+        }
+        assert!(!store.is_promoted("attention"));
+    }
+
+    #[tokio::test]
+    async fn p99_above_threshold_reports_promotion_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        let mut promotions = 0;
+        for _ in 0..MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
+            if store.record_query_latency("attention", Duration::from_millis(50)) {
+                promotions += 1;
+            }
+        }
+        assert_eq!(promotions, 1, "should report the crossing exactly once");
+        assert!(store.is_promoted("attention"));
+        // Already promoted: further slow queries must not report again.
+        assert!(!store.record_query_latency("attention", Duration::from_millis(50)));
+    }
+
+    #[tokio::test]
+    async fn promotion_is_scoped_per_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        for _ in 0..MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
+            store.record_query_latency("attention", Duration::from_millis(50));
+        }
+        assert!(store.is_promoted("attention"));
+        assert!(!store.is_promoted("work"));
     }
 }

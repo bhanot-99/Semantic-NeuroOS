@@ -3,6 +3,7 @@
 //! `RawTelemetryEvent` -> filter -> adapter -> SQLite (always) + LanceDB
 //! (only for domains with text worth embedding).
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use neuroos_proto::v1::RawTelemetryEvent;
 
@@ -25,8 +26,11 @@ pub enum EngineError {
 pub struct StorageEngine {
     conn: rusqlite::Connection,
     filter: IngestFilter,
-    lance: LanceStore,
+    lance: Arc<LanceStore>,
     lance_dir: PathBuf,
+    sqlite_path: PathBuf,
+    models_dir: PathBuf,
+    onnxruntime_dylib: PathBuf,
     embedder: Embedder,
 }
 
@@ -38,15 +42,65 @@ impl StorageEngine {
         onnxruntime_dylib: &Path,
     ) -> Result<Self, EngineError> {
         let conn = crate::sqlite::open(sqlite_path)?;
-        let lance = LanceStore::open(lance_path).await?;
+        let lance = Arc::new(LanceStore::open(lance_path).await?);
         let embedder = Embedder::load(models_dir, onnxruntime_dylib)?;
-        Ok(Self {
+        let engine = Self {
             conn,
             filter: IngestFilter::new(),
             lance,
             lance_dir: lance_path.to_path_buf(),
+            sqlite_path: sqlite_path.to_path_buf(),
+            models_dir: models_dir.to_path_buf(),
+            onnxruntime_dylib: onnxruntime_dylib.to_path_buf(),
             embedder,
-        })
+        };
+        engine.spawn_reindex_for_changed_families();
+        Ok(engine)
+    }
+
+    /// FR-STO-11: on open, compares each family's stored
+    /// `index_meta.embedding_model_id` against the embedder just loaded;
+    /// any mismatch gets a background task that re-embeds every existing
+    /// chunk with its own, independently-loaded `Embedder` and writes the
+    /// new vectors back via `LanceStore::upsert_vectors` — `self.embedder`
+    /// (used by `ingest`/`query_hybrid`) is never touched by it, so
+    /// interactive ingest/query traffic is never blocked by a re-index.
+    fn spawn_reindex_for_changed_families(&self) {
+        let current_model_id = Embedder::model_id();
+        for family in crate::lance::FAMILIES {
+            let stale = match crate::sqlite::get_index_meta(&self.conn, family) {
+                Ok(Some(meta)) => meta.embedding_model_id != current_model_id,
+                // Never indexed yet -- nothing to reindex; ingest records
+                // index_meta going forward so the *next* model change has
+                // something to compare against.
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(family, error = %err, "FR-STO-11: failed to read index_meta, skipping reindex check");
+                    continue;
+                }
+            };
+            if !stale {
+                continue;
+            }
+            let lance = Arc::clone(&self.lance);
+            let sqlite_path = self.sqlite_path.clone();
+            let models_dir = self.models_dir.clone();
+            let onnxruntime_dylib = self.onnxruntime_dylib.clone();
+            let family = family.to_string();
+            tokio::spawn(async move {
+                if let Err(err) = reindex_family(
+                    &lance,
+                    &sqlite_path,
+                    &models_dir,
+                    &onnxruntime_dylib,
+                    &family,
+                )
+                .await
+                {
+                    tracing::error!(family, error = %err, "FR-STO-11: background reindex failed");
+                }
+            });
+        }
     }
 
     /// FR-STO-01/02: filters and persists one event, embedding+storing any
@@ -80,6 +134,22 @@ impl StorageEngine {
         self.lance
             .insert(chunk.family, std::slice::from_ref(&record))
             .await?;
+        // FR-STO-11: records which model produced this family's vectors,
+        // so a *future* `Embedder::model_id()` change has something to
+        // compare against on the next `open()`.
+        crate::sqlite::upsert_index_meta(
+            &self.conn,
+            chunk.family,
+            Embedder::model_id(),
+            crate::lance::EMBEDDING_DIM as i64,
+            if self.lance.is_promoted(chunk.family) {
+                "hnsw"
+            } else {
+                "flat"
+            },
+            0.0,
+            neuroos_common::now_ns() as i64,
+        )?;
         Ok(())
     }
 
@@ -191,6 +261,69 @@ impl StorageEngine {
             .await?;
         Ok(())
     }
+}
+
+/// FR-STO-11's actual re-index work: loads its own `Embedder` (a second,
+/// independent model load — never the caller's interactive one), re-embeds
+/// every chunk currently in `family` with it, writes the new vectors back
+/// via `LanceStore::upsert_vectors` (an upsert on `chunk_id`, so a query
+/// racing this sees either the pre- or post-reindex vector, never a gap),
+/// then records the new `embedding_model_id` so the mismatch that
+/// triggered this clears. A free function (not a `StorageEngine` method)
+/// so `spawn_reindex_for_changed_families` can run it in a `tokio::spawn`
+/// task that outlives the borrow of `&self`.
+async fn reindex_family(
+    lance: &LanceStore,
+    sqlite_path: &Path,
+    models_dir: &Path,
+    onnxruntime_dylib: &Path,
+    family: &str,
+) -> Result<(), EngineError> {
+    let mut embedder = Embedder::load(models_dir, onnxruntime_dylib)?;
+    let rows = lance.all_chunks(family).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let vector = embedder
+            .embed(&[row.text.as_str()])?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        records.push(ChunkRecord {
+            chunk_id: row.chunk_id,
+            entity_id: row.entity_id,
+            text: row.text,
+            vector,
+            taint: row.taint,
+            t_ns: row.t_ns,
+            domain: row.domain,
+        });
+    }
+    let reindexed = records.len();
+    lance.upsert_vectors(family, &records).await?;
+
+    let conn = crate::sqlite::open(sqlite_path)?;
+    crate::sqlite::upsert_index_meta(
+        &conn,
+        family,
+        Embedder::model_id(),
+        crate::lance::EMBEDDING_DIM as i64,
+        if lance.is_promoted(family) {
+            "hnsw"
+        } else {
+            "flat"
+        },
+        0.0,
+        neuroos_common::now_ns() as i64,
+    )?;
+    tracing::info!(
+        family,
+        rows = reindexed,
+        "FR-STO-11: background re-index complete"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -344,5 +477,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entities, 0);
+    }
+
+    /// Live proof (P4-S08/FR-STO-11): ingesting records `index_meta`, and
+    /// running the background re-index function directly (rather than
+    /// waiting for a spawned task) re-embeds the existing chunk in place
+    /// — still findable afterward, not duplicated, `index_meta` still
+    /// current — needs the real model + onnxruntime fetched, so
+    /// `#[ignore]`d like this crate's other real-download-dependent tests.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn reindex_family_re_embeds_in_place_without_duplicating() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::Opened(WindowOpened {
+                    app_id: "org.mozilla.firefox".into(),
+                    title: "quarterly revenue dashboard".into(),
+                    pid: 0,
+                    pid_known: false,
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::StateChanged(WindowStateChanged {
+                    states: vec![ToplevelState::Activated as i32],
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                6_000_000_000,
+                Kind::StateChanged(WindowStateChanged { states: vec![] }),
+            ))
+            .await
+            .unwrap();
+
+        let meta = crate::sqlite::get_index_meta(&engine.conn, "attention")
+            .unwrap()
+            .expect("ingest should have recorded index_meta");
+        assert_eq!(meta.embedding_model_id, Embedder::model_id());
+
+        reindex_family(
+            &engine.lance,
+            &engine.sqlite_path,
+            &engine.models_dir,
+            &engine.onnxruntime_dylib,
+            "attention",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            engine.lance.all_chunks("attention").await.unwrap().len(),
+            1,
+            "re-index must upsert in place, not duplicate rows"
+        );
+        assert!(
+            !engine.query_hybrid("revenue", 1).await.unwrap().is_empty(),
+            "the re-embedded chunk must still be findable"
+        );
     }
 }
