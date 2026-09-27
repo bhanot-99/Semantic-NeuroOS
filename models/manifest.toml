@@ -93,3 +93,21 @@ url = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.js
 dest = "bge-small-en-v1.5/tokenizer.json"
 sha256 = "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
 license = "MIT"
+
+[[model]]
+# Not itself a model — the ONNX Runtime C3's FastEmbed embedder (and C2's
+# Silero/openWakeWord/Kokoro) load against. Architecture.md §12.3: "pinned
+# release tarball with SHA-256", same convention as everything else here.
+# `ort`'s ORT_DYLIB_PATH env var points at the extracted lib/libonnxruntime.so
+# (rules.md R0-5: no runtime downloads — fastembed is built with
+# `ort-load-dynamic`, never `ort-download-binaries`/`hf-hub`, so nothing
+# downloads at build or run time except this operator script).
+name = "onnxruntime-linux-x64"
+component = "C3, C2"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz"
+dest = "onnxruntime/onnxruntime-linux-x64-1.19.2.tgz"
+sha256 = "eb00c64e0041f719913c4080e0fed7d9963dc3aa9b54664df6036d8308dbcd33"
+license = "MIT"
+archive = true
+extract_to = "onnxruntime"
+verify_file = "onnxruntime-linux-x64-1.19.2/lib/libonnxruntime.so"
