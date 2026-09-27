@@ -10,8 +10,25 @@ workspace = true
 
 [dependencies]
 neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
+neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
+neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "sync"] }
 cosmic-protocols = { version = "0.2", features = ["client", "wayland-client"] }
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+procfs = { version = "0.17", default-features = false }
+notify = "6"
+prost = "0.13"
+clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "sync", "test-util"] }

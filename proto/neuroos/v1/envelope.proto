@@ -28,6 +28,10 @@ message Envelope {
     HealthResponse       health_response = 12;
 
     RawTelemetryEvent    telemetry       = 20;
+    MonitorPauseRequest  monitor_pause_request   = 21;
+    MonitorPauseResponse monitor_pause_response  = 22;
+    MonitorStatusRequest  monitor_status_request  = 23;
+    MonitorStatusResponse monitor_status_response = 24;
 
     VoiceCommand         voice_command   = 30;
     PreambleRequest      preamble        = 31;

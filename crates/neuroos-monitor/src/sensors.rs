@@ -1,8 +1,7 @@
-// sensor modules (Architecture.md component C1); most are still stubs pending Phase 3
+// sensor modules (Architecture.md component C1)
+pub mod folders;
+pub mod idle;
+pub mod mpris;
+pub mod proc;
 pub mod wayland_cosmic;
-
-mod folders;
-mod idle;
-mod mpris;
-mod proc;
-mod wayland_wlr;
+pub mod wayland_wlr;

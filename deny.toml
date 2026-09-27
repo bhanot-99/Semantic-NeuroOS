@@ -19,6 +19,10 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "MPL-2.0",
+    # CC0-1.0: public-domain-equivalent dedication, strictly more permissive
+    # than MIT — not a copyleft/non-commercial concern rules.md §4.1 reserves
+    # an ADR for. Found via `notify` (Phase 3 folder sensor, P3-S07).
+    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 exceptions = [

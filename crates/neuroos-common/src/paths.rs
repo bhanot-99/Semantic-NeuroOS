@@ -77,6 +77,20 @@ pub fn healthd_sock() -> PathBuf {
     runtime_dir().join("healthd.sock")
 }
 
+/// `<runtime_dir>/monitor.sock` (Architecture.md §5.2: C1 server-push
+/// telemetry stream, client C3).
+pub fn monitor_sock() -> PathBuf {
+    runtime_dir().join("monitor.sock")
+}
+
+/// `<runtime_dir>/monitor.control.sock` — request/response control channel
+/// for `neuroosctl pause`/`resume`/`status` (FR-PRV-01), kept separate from
+/// `monitor.sock`'s server-push event stream so that contract stays a pure
+/// push pattern.
+pub fn monitor_control_sock() -> PathBuf {
+    runtime_dir().join("monitor.control.sock")
+}
+
 /// `/opt/neuroos/models/` — read-only, never written by any component.
 pub fn models_dir() -> PathBuf {
     PathBuf::from("/opt/neuroos/models")

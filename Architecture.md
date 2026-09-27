@@ -129,6 +129,7 @@ Runtime directory: `$XDG_RUNTIME_DIR/neuroos/` = `/run/user/$UID/neuroos/` (mode
 | Socket | Server | Clients | Pattern |
 | :--- | :--- | :--- | :--- |
 | `monitor.sock` | C1 | C3 | Server-push event stream |
+| `monitor.control.sock` | C1 | `neuroosctl` (pause/resume/status) | Request/response (added Phase 3, FR-PRV-01 — kept off `monitor.sock` so that stays a pure push pattern) |
 | `voice.sock` | C2 | C5 | Request/response (preamble, speak, cancel) |
 | `storage.sock` | C3 | C5a, C5b, C6 (forget), `neuroosctl` | Request/response |
 | `inference.sock` | C4 | C5a, C2 (ring fd) | Request/response + fd passing |
