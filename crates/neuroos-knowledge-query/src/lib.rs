@@ -5,6 +5,7 @@
 //! split).
 pub mod assemble;
 pub mod deictic;
+pub mod distill;
 pub mod evidence;
 pub mod graph_view;
 pub mod inference_client;

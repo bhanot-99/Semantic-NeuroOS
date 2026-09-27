@@ -6,6 +6,7 @@ use neuroos_taint::TaintFlags;
 
 use crate::assemble;
 use crate::deictic::{self, WindowContext};
+use crate::distill::{self, DistillationCache};
 use crate::evidence;
 use crate::inference_client::{InferenceClient, InferenceClientError};
 use crate::kernel_client::{KernelClient, KernelClientError};
@@ -79,12 +80,15 @@ pub struct AskResult {
 
 /// The full hot path: preamble, parallel deictic snap + evidence
 /// retrieval, prompt assembly (with taint union + wrapping), a C6
-/// capability check, and a real C4 generation.
+/// capability check, and a real C4 generation. `distill_cache` warms
+/// (FR-KNO-05) whenever the raw evidence is large -- see
+/// [`crate::distill`] -- and is never awaited by this function itself.
 pub async fn ask(
     voice: &VoiceClient,
     storage: &StorageClient,
     inference: &InferenceClient,
     kernel: &KernelClient,
+    distill_cache: &DistillationCache,
     question: &str,
     t_speech_start_ns: u64,
 ) -> Result<AskResult, AskError> {
@@ -102,6 +106,25 @@ pub async fn ask(
                 .map_err(AskError::Evidence)
         },
     )?;
+
+    // FR-KNO-05: fire-and-forget, never on the critical path to the
+    // answer below (rules.md AB-11).
+    if !chunks.is_empty() {
+        let raw_evidence_text = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        if let Ok(raw_tokens) = inference.count_tokens(&raw_evidence_text).await {
+            distill::maybe_spawn_distillation(
+                inference.clone(),
+                distill_cache.clone(),
+                question.to_string(),
+                &chunks,
+                raw_tokens,
+            );
+        }
+    }
 
     let prompt = assemble::assemble(inference, question, window.as_ref(), &chunks).await?;
 

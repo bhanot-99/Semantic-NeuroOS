@@ -184,6 +184,7 @@ async fn ask_end_to_end_real_c3_real_c4_mock_c2_c6() {
             let storage = StorageClient::new(storage_sock);
             let inference = InferenceClient::new(inference_sock);
             let kernel = KernelClient::new(kernel_sock);
+            let distill_cache = neuroos_knowledge_query::distill::DistillationCache::new();
 
             // Spoke at t=3s (mid-session) about "revenue" -- both the
             // deictic snap and the evidence retrieval should find the
@@ -193,6 +194,7 @@ async fn ask_end_to_end_real_c3_real_c4_mock_c2_c6() {
                 &storage,
                 &inference,
                 &kernel,
+                &distill_cache,
                 "what does the revenue dashboard say",
                 3_000_000_000,
             )

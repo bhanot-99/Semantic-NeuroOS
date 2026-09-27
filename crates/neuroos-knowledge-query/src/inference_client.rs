@@ -13,7 +13,7 @@ use neuroos_ipc::{
     write_envelope_deadline,
 };
 use neuroos_proto::v1::{
-    AttachRingRequest, Envelope, GenerateRequest, GetInfoRequest, Lane, envelope,
+    AttachRingRequest, DistillRequest, Envelope, GenerateRequest, GetInfoRequest, Lane, envelope,
 };
 use neuroos_shm::{FLAG_EOS, Ring};
 use tokio::net::UnixStream;
@@ -22,6 +22,9 @@ use tokio::net::UnixStream;
 /// 250ms; C4 generation gets 30s.
 pub const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
 pub const GENERATE_DEADLINE: Duration = Duration::from_secs(30);
+/// FR-KNO-05: distillation has a "≈6.0 s budget"; this leaves slack above
+/// that rather than matching it exactly.
+pub const DISTILL_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceClientError {
@@ -57,6 +60,7 @@ fn envelope_req(body: envelope::Body) -> Envelope {
     }
 }
 
+#[derive(Clone)]
 pub struct InferenceClient {
     socket_path: PathBuf,
 }
@@ -156,6 +160,39 @@ impl InferenceClient {
             _ => return Err(InferenceClientError::UnexpectedResponse),
         }
         read_all_tokens(ring, max_tokens, GENERATE_DEADLINE).await
+    }
+
+    /// FR-KNO-05: distills `chunks` on C4's background lane (implicit in
+    /// `DistillRequest` -- unlike `Generate`, it has no `lane` field: it
+    /// always runs on `LANE_BACKGROUND` per the proto's own doc comment).
+    /// Callers that must not block on this (the hot path never should,
+    /// rules.md AB-11) call it inside their own `tokio::spawn`, not here.
+    pub async fn distill(
+        &self,
+        ring_name: &str,
+        chunks: Vec<String>,
+        max_tokens: u32,
+    ) -> Result<String, InferenceClientError> {
+        let ring = self.attach_ring(ring_name).await?;
+        let mut stream = self.connect().await?;
+        let req = envelope_req(envelope::Body::DistillRequest(DistillRequest {
+            chunks,
+            max_tokens,
+            ring_name: ring_name.to_string(),
+        }));
+        write_envelope_deadline(&mut stream, &req, DEFAULT_MAX_FRAME, CONTROL_DEADLINE).await?;
+        let resp = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, CONTROL_DEADLINE)
+            .await?
+            .ok_or(InferenceClientError::NoResponse)?;
+        match resp.body {
+            Some(envelope::Body::DistillResponse(r)) if r.accepted => {}
+            Some(envelope::Body::DistillResponse(r)) => {
+                return Err(InferenceClientError::Remote(r.error));
+            }
+            Some(envelope::Body::Error(e)) => return Err(InferenceClientError::Remote(e.message)),
+            _ => return Err(InferenceClientError::UnexpectedResponse),
+        }
+        read_all_tokens(ring, max_tokens, DISTILL_DEADLINE).await
     }
 }
 
