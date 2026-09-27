@@ -31,6 +31,10 @@ pub const DOMAIN_NOTES: &str = "notes";
 pub const DOMAIN_CALENDAR: &str = "calendar";
 pub const DOMAIN_MEDIA_PLAYBACK: &str = "media_playback";
 pub const DOMAIN_SYSTEM_RESOURCE: &str = "system_resource";
+/// Sourced from C7's spool, not C1's event stream (P4-S06) — routed
+/// directly by `engine::StorageEngine::ingest_external_document`, not
+/// through this module's `ingest()` dispatcher.
+pub const DOMAIN_EXTERNAL_DOCUMENTS: &str = "external_documents";
 
 /// Comm names (or prefixes) recognized as a build tool for the
 /// (simplified) `build_job` heuristic. Architecture.md §7.3 describes this

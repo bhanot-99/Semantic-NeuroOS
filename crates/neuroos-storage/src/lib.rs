@@ -7,4 +7,5 @@ pub mod embed;
 pub mod engine;
 pub mod ingest;
 pub mod lance;
+pub mod spool;
 pub mod sqlite;

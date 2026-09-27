@@ -107,6 +107,37 @@ impl StorageEngine {
             &self.conn, t_ns, window_ns,
         )?)
     }
+
+    /// FR-STO-08 (P4-S06): ingests one already-parsed spool document as
+    /// `external_documents`, always tagged `EXTERNAL_UNTRUSTED` — taint is
+    /// never lowered from here on (R0-3). Deleting the spool file on
+    /// success is the caller's job (`spool::ingest_spool_file`), not this
+    /// method's — this only touches SQLite/LanceDB.
+    pub async fn ingest_external_document(
+        &mut self,
+        doc_id: &str,
+        text: &str,
+        fetched_at_ns: u64,
+    ) -> Result<(), EngineError> {
+        let entity_id = crate::sqlite::upsert_entity(
+            &self.conn,
+            crate::adapters::DOMAIN_EXTERNAL_DOCUMENTS,
+            "document",
+            doc_id,
+            neuroos_taint::TaintFlags::EXTERNAL_UNTRUSTED,
+            fetched_at_ns,
+            true,
+        )?;
+        self.store_chunk(PendingChunk {
+            family: "external",
+            entity_id,
+            domain: crate::adapters::DOMAIN_EXTERNAL_DOCUMENTS,
+            taint: neuroos_taint::TaintFlags::EXTERNAL_UNTRUSTED,
+            t_ns: fetched_at_ns,
+            text: text.to_string(),
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
