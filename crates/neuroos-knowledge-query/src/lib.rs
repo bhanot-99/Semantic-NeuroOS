@@ -7,6 +7,8 @@ pub mod assemble;
 pub mod deictic;
 pub mod evidence;
 pub mod graph_view;
+pub mod inference_client;
+pub mod kernel_client;
 pub mod orchestrate;
 pub mod storage_client;
 pub mod taint_wrap;
