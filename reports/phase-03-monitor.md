@@ -6,7 +6,7 @@
 | Component(s) | `neuroos-monitor`, `neuroosctl` (pause/resume/monitor-status) |
 | Sprints | 3 (of 2 planned; see §2.6) |
 | Dates | 2026-09-27 → (open) |
-| Status | 🟨 In gate review — 6 of 7 exit criteria met; the ≥ 8h real-usage dumps criterion needs owner input (see §3, §6) |
+| Status | 🟨 Done except the recording — 6 of 7 exit criteria met with evidence; a background recording is running now for the 7th (≥ 8h real-usage dumps), nothing else outstanding (see §3, §6) |
 | Author | AI assistant |
 | Sign-off | pending |
 
@@ -34,11 +34,12 @@ monitor-status`, `neuroosctl resume` all work against a running
 demo in this session used a raw socket client and saw a real "VLC now
 playing" event and real window-open events arrive live.
 
-**Is it on track?** Functionally complete and measured on time (one
-session). One thing is deliberately not done yet: the exit criteria call for
+**Is it on track?** Yes — everything in this phase is done except one item
+that can't be finished in a single sitting: the exit criteria call for
 committing ≥ 8 hours of real, anonymised recordings of actual desktop use as
-fixtures for Phase 4. That's real elapsed time of the owner's own usage, not
-something to fake in one sitting — see §6.
+fixtures for Phase 4. The owner chose to start that recording as a
+background process now rather than record it manually later (see §6); it
+keeps running independently of this code being merged.
 
 **Risks or concerns in plain words:**
 - A window's process ID (PID) is a best-effort guess (see §2.7, ADR-0009) —
@@ -147,7 +148,7 @@ special case invented for this measurement.
 | Sprint count | 2 | 3 (this session) | Full sensor set + control channel + neuroosctl integration + live verification took longer than a 2-sprint estimate; no scope was cut | — |
 | `neuroosctl replay` | Implied by P3-S06's story text | Not built | phases.md §7.1 item 10 assigns "Replay harness: `neuroosctl replay <dump>` → ingest → gate assertions" to **Phase 4** (C3's ingest pipeline doesn't exist yet); this phase built the write side (`--record`) and the read primitive (`DumpReader`, used by the anonymiser) that Phase 4 will build on | — |
 | wlroots foreign-toplevel fallback | phases.md §6.1 item 1 (tagged P1) | Not built | Reference machine is COSMIC-only; no way to test it live here, and P3-S07 (folders, also tagged P1) was prioritized since it was directly testable. Tracked as tech debt (§2.8) | — |
-| ≥ 8h anonymised real dumps | Required exit criterion | Not done | Needs real elapsed hours of the owner's actual desktop use across ≥ 3 work styles, and is privacy-sensitive (real window titles/paths/media titles) enough to need explicit consent before recording for hours, not just building the capability. See §6 | — |
+| ≥ 8h anonymised real dumps | Required exit criterion | In progress (background recording running, not yet ≥8h) | Needs real elapsed hours of the owner's actual desktop use across ≥ 3 work styles; privacy-sensitive enough (real window titles/paths/media titles) that it needed explicit consent before recording for hours, not just the capability. See §6 | Owner (chose to start it now, 2026-09-27) |
 
 ### 2.7 Decisions made (ADRs)
 
@@ -174,7 +175,7 @@ special case invented for this measurement.
 | 1 | All sensors emit correct events on the reference machine (COSMIC) | ✅ | Live proofs: real WindowOpened (brave-browser, real PID), real MPRIS "Playing" event over `monitor.sock`, real inotify FileActivityEvent, idle sensor connects+binds live |
 | 2 | Capture p99 < 1.5 ms and RSS ≤ 25 MiB measured | ✅ | §2.4: p99 = 0.008 ms, RSS ≈ 8.9 MiB, idle CPU 0% |
 | 3 | Exclusion and pause proven by property tests | ✅ | `privacy::tests::proptests::excluded_app_id_is_never_allowed`; live `neuroosctl pause/resume/monitor-status` round trip |
-| 4 | ≥ 3 anonymised real dumps committed (≥ 8h total) — required input for Phase 4 | ❌ | Not started; see §6 |
+| 4 | ≥ 3 anonymised real dumps committed (≥ 8h total) — required input for Phase 4 | 🟨 | Background recording running (owner authorized 2026-09-27); not yet ≥8h. Only remaining item in this phase — see §6 |
 | 5 | Coverage ≥ 80% | ✅ | 82.29% line / 81.56% region / 89.59% function (`cargo llvm-cov nextest --run-ignored all`) |
 | 6 | Phase report written; memory.md updated | ✅ (this report; memory.md update in the same commit) | — |
 
@@ -215,14 +216,18 @@ special case invented for this measurement.
 
 **On the ≥ 8h recording:** this needs the owner's own real desktop use
 across ≥ 3 different work styles (coding with builds, browsing docs, media
-playing), recorded with `neuroos-monitor --record <file>` and then run
-through `neuroos-monitor anonymize <in> <out>` before committing to
-`tests/fixtures/telemetry/`. Recording captures real window titles, file
-paths and media metadata from the owner's actual session for hours at a
-time — genuinely sensitive enough that it shouldn't start without the
-owner's explicit go-ahead on *when* and *how long*, even though the
-anonymiser strips personal content before anything is committed. Options
-put to the owner in this session's follow-up: run it themselves opportunistically
-over the coming days, authorize the assistant to start a background
-recording now for a bounded window, or some other arrangement — whichever
-they prefer.
+playing). Recording captures real window titles, file paths and media
+metadata from the owner's actual session for hours at a time — genuinely
+sensitive enough that it needed the owner's explicit go-ahead before it
+could start, even though the anonymiser strips personal content before
+anything is committed.
+
+**Decision:** the owner chose to start a background recording immediately
+rather than record it manually later. `.dev-cache/telemetry-raw/record-loop.sh`
+runs `neuroos-monitor --record` against the real desktop session (gitignored
+raw output, rotating to a fresh dump file every 3h). When stopped, each
+`dump-*.bin` worth keeping goes through `neuroos-monitor anonymize <in>
+tests/fixtures/telemetry/<name>.bin` before committing; once ≥ 3 dumps
+totaling ≥ 8h are committed, this row flips to ✅ and this phase's status
+to Passed. Everything else in this report already stands as-is — this is
+the only remaining action.
