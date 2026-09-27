@@ -132,6 +132,22 @@ pub async fn read_envelope_with_fd(
     Ok(Some((env, received_fd)))
 }
 
+/// Deadline-wrapped [`read_envelope_with_fd`], matching
+/// [`crate::read_envelope_deadline`]'s convention.
+pub async fn read_envelope_with_fd_deadline(
+    stream: &UnixStream,
+    max_frame: u32,
+    deadline: std::time::Duration,
+) -> Result<Option<(neuroos_proto::v1::Envelope, Option<OwnedFd>)>, FramingError> {
+    match tokio::time::timeout(deadline, read_envelope_with_fd(stream, max_frame)).await {
+        Ok(res) => res,
+        Err(_) => Err(FramingError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "read deadline exceeded",
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code

@@ -3888,6 +3888,7 @@ dependencies = [
  "neuroos-health",
  "neuroos-ipc",
  "neuroos-proto",
+ "neuroos-shm",
  "neuroos-storage",
  "neuroos-taint",
  "neuroos-testkit",
