@@ -1,0 +1,65 @@
+{
+  "component": "neuroos-inference",
+  "results": [
+    {
+      "n_ctx": 128,
+      "n_threads": 8,
+      "prompt_tokens": 71,
+      "ttft_ms": 629.536,
+      "prefill_ms_per_token": 8.8667,
+      "decode_ms_per_token": 72.1145,
+      "rss_bytes_after": 1282179072,
+      "error": ""
+    },
+    {
+      "n_ctx": 512,
+      "n_threads": 8,
+      "prompt_tokens": 451,
+      "ttft_ms": 3720.6,
+      "prefill_ms_per_token": 8.24968,
+      "decode_ms_per_token": 56.09,
+      "rss_bytes_after": 1345310720,
+      "error": ""
+    },
+    {
+      "n_ctx": 1024,
+      "n_threads": 8,
+      "prompt_tokens": 961,
+      "ttft_ms": 8520.11,
+      "prefill_ms_per_token": 8.86588,
+      "decode_ms_per_token": 60.214,
+      "rss_bytes_after": 1391181824,
+      "error": ""
+    },
+    {
+      "n_ctx": 512,
+      "n_threads": 1,
+      "prompt_tokens": 451,
+      "ttft_ms": 16960.8,
+      "prefill_ms_per_token": 37.6071,
+      "decode_ms_per_token": 141.341,
+      "rss_bytes_after": 1345728512,
+      "error": ""
+    },
+    {
+      "n_ctx": 512,
+      "n_threads": 4,
+      "prompt_tokens": 451,
+      "ttft_ms": 5404.67,
+      "prefill_ms_per_token": 11.9837,
+      "decode_ms_per_token": 57.9292,
+      "rss_bytes_after": 1345859584,
+      "error": ""
+    },
+    {
+      "n_ctx": 512,
+      "n_threads": 8,
+      "prompt_tokens": 451,
+      "ttft_ms": 3666.35,
+      "prefill_ms_per_token": 8.12938,
+      "decode_ms_per_token": 55.2372,
+      "rss_bytes_after": 1345859584,
+      "error": ""
+    }
+  ]
+}

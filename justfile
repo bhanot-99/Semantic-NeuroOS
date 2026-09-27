@@ -4,6 +4,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 py_dir := "python/neuroos-knowledge-background"
 py_src_dir := py_dir / "src"
 cpp_build := "cpp/build"
+cpp_build_glob := "cpp/build*"
 
 # --- proto -----------------------------------------------------------------
 
@@ -32,7 +33,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf
+test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf test-cpp-ipc test-inference
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -57,6 +58,19 @@ test-sandboxed-echo: build-rust
 test-healthd-pf: build-rust
     bash tests/contract/healthd_pf.sh
 
+# Phase 2 prerequisite infra: libneuroos's C++ IPC framing, UDS server/client,
+# SCM_RIGHTS fd passing (used to hand the token ring fd to C2) and the C++
+# health server, all real UDS round trips (not mocked).
+test-cpp-ipc: build-cpp
+    ./cpp/build/cpp-ipc-smoke
+
+# Phase 2 IT (phases.md §5.3): real neuroos-inference against the real
+# downloaded BitNet model — GetInfo/AttachRing/Generate/Cancel over a real
+# inference.sock, real tokens through a real memfd ring. Skips cleanly if
+# the model hasn't been fetched yet (see the script).
+test-inference: build-cpp
+    bash tests/contract/inference_smoke.sh
+
 # P0-S07 spike S-02: memfd seqlock ring, default scale + cross-language interop.
 # The 10M-message and ThreadSanitizer runs are spike evidence, not routine CI
 # (TSan on the Rust side needs a nightly toolchain and takes minutes; see
@@ -71,12 +85,12 @@ test-shm: build-rust build-cpp
 
 fmt:
     cargo fmt --all
-    find cpp \( -path {{cpp_build}} -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 -i
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 -i
     cd {{py_dir}} && uv run ruff format
 
 fmt-check:
     cargo fmt --all -- --check
-    find cpp \( -path {{cpp_build}} -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 --dry-run --Werror
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 --dry-run --Werror
     cd {{py_dir}} && uv run ruff format --check
 
 # --- lint --------------------------------------------------------------------
@@ -87,7 +101,7 @@ lint-rust:
     cargo clippy --workspace --all-targets -- -D warnings
 
 lint-cpp: build-cpp
-    find cpp \( -path {{cpp_build}} -o -path cpp/third_party \) -prune -o -name '*.cpp' -print | xargs -r clang-tidy -p {{cpp_build}}
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o -name '*.cpp' -print | xargs -r clang-tidy -p {{cpp_build}}
 
 lint-py: proto-py
     cd {{py_dir}} && uv run ruff check src

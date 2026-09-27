@@ -35,8 +35,16 @@ message Envelope {
     IngestRequest        ingest_request  = 40;
     IngestResponse       ingest_response = 41;
 
-    InferRequest         infer_request   = 60;
-    InferResponse        infer_response  = 61;
+    GenerateRequest      generate_request     = 60;
+    GenerateResponse     generate_response    = 61;
+    CancelRequest        cancel_request       = 62;
+    CancelResponse       cancel_response      = 63;
+    DistillRequest       distill_request      = 64;
+    DistillResponse      distill_response     = 65;
+    AttachRingRequest    attach_ring_request  = 66;
+    AttachRingResponse   attach_ring_response = 67;
+    GetInfoRequest       get_info_request     = 68;
+    GetInfoResponse      get_info_response    = 69;
 
     AskRequest           ask_request     = 70;
     AskResponse          ask_response    = 71;

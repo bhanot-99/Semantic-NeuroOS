@@ -59,3 +59,11 @@ target_link_libraries(shm-reader-cpp PRIVATE libneuroos)
 
 add_executable(shm-stress-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_stress.cpp)
 target_link_libraries(shm-stress-cpp PRIVATE libneuroos Threads::Threads)
+
+# Phase 2 prerequisite infra: libneuroos's new C++ IPC framing/UDS/SCM_RIGHTS code.
+add_executable(cpp-ipc-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_ipc_smoke.cpp)
+target_link_libraries(cpp-ipc-smoke PRIVATE libneuroos Threads::Threads)
+
+# Phase 2 IT: drives a real running neuroos-inference (real model) over inference.sock.
+add_executable(cpp-inference-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_inference_smoke.cpp)
+target_link_libraries(cpp-inference-smoke PRIVATE libneuroos Threads::Threads)
