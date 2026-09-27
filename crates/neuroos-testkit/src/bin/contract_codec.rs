@@ -1,3 +1,7 @@
+// rules.md §5 exempts these lints for one-off diagnostic tools: crashing loudly
+// on unexpected input IS the correct behavior for a spike/interop CLI tool,
+// unlike a long-running service.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // tests/contract/ cross-language proto round-trip helper (Rust side).
 // `encode-fixture`: writes the canonical test Envelope to stdout.
 // `roundtrip`: reads an Envelope from stdin, decodes it, re-encodes it to stdout.

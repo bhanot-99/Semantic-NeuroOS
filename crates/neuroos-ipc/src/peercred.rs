@@ -28,6 +28,7 @@ pub fn is_allowed(cred: PeerCred, allowed_uids: &[u32]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
     fn cred(uid: u32) -> PeerCred {

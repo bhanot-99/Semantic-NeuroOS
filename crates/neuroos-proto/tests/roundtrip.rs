@@ -1,3 +1,6 @@
+// integration test: rules.md §5's no-unwrap rule is scoped to non-test code;
+// clippy's restriction lints don't auto-exempt files under tests/, so this is explicit.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use neuroos_proto::v1::{Envelope, Error, ErrorCode, envelope};
 use prost::Message;
 

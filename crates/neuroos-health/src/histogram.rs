@@ -1,6 +1,14 @@
 //! Fixed-bucket latency histogram, log-scale in nanoseconds.
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Locks `m`, recovering rather than panicking if a prior holder panicked
+/// while holding it (rules.md §5: no `unwrap()`/`panic!` in non-test code).
+/// A histogram counter has no invariant a partial update could leave
+/// meaningfully broken, so recovering the poisoned guard is safe here.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Upper bounds in ns: 1us .. ~10s, one decade apart plus a 5x step each decade.
 const BUCKET_UPPER_BOUNDS_NS: &[u64] = &[
@@ -49,23 +57,24 @@ impl Histogram {
             .iter()
             .position(|&b| ns <= b)
             .unwrap_or(BUCKET_UPPER_BOUNDS_NS.len() - 1);
-        self.counts.lock().unwrap()[idx] += 1;
-        *self.count.lock().unwrap() += 1;
-        *self.sum_ns.lock().unwrap() += ns;
+        lock(&self.counts)[idx] += 1;
+        *lock(&self.count) += 1;
+        *lock(&self.sum_ns) += ns;
     }
 
     pub fn to_proto(&self) -> neuroos_proto::v1::LatencyHistogram {
         neuroos_proto::v1::LatencyHistogram {
             bucket_upper_bound_ns: BUCKET_UPPER_BOUNDS_NS.to_vec(),
-            bucket_counts: self.counts.lock().unwrap().clone(),
-            count: *self.count.lock().unwrap(),
-            sum_ns: *self.sum_ns.lock().unwrap(),
+            bucket_counts: lock(&self.counts).clone(),
+            count: *lock(&self.count),
+            sum_ns: *lock(&self.sum_ns),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
     #[test]

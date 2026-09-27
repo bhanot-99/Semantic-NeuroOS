@@ -59,7 +59,7 @@ pub struct Ring {
     map: SharedMap,
     capacity_slots: u32,
     slot_size: u32,
-    fd: Option<OwnedFd>,
+    fd: OwnedFd,
 }
 
 impl Ring {
@@ -85,7 +85,7 @@ impl Ring {
             map,
             capacity_slots,
             slot_size,
-            fd: Some(fd),
+            fd,
         };
         ring.header().init(capacity_slots, slot_size);
         Ok(ring)
@@ -119,12 +119,12 @@ impl Ring {
             map,
             capacity_slots,
             slot_size,
-            fd: Some(fd),
+            fd,
         })
     }
 
     pub fn fd(&self) -> BorrowedFd<'_> {
-        memfd_as_fd(self.fd.as_ref().expect("Ring always holds its fd"))
+        memfd_as_fd(&self.fd)
     }
 
     fn header(&self) -> &RawHeader {

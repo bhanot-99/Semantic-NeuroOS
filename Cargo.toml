@@ -28,5 +28,16 @@ publish = false
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
+# rules.md §5: no unwrap/expect/panic/todo in non-test code. `-D warnings` in
+# `just lint-rust` escalates these to build failures. Test code (#[cfg(test)])
+# is exempt by clippy's own scoping; one-off diagnostic/interop CLI tools get
+# an explicit per-file `#![allow(...)]` with a comment, not a workspace-wide
+# exemption.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+
 [profile.release]
 lto = "thin"

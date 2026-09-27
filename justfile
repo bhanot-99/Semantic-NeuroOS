@@ -32,7 +32,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo
+test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -51,6 +51,11 @@ test-security:
 # PrivateNetwork=true proves no network / UDS works / peer UID enforced, together.
 test-sandboxed-echo: build-rust
     bash tests/contract/sandboxed_echo.sh
+
+# P1 PF (phases.md §4.3): real neuroos-healthd binary against 8 real mock
+# health servers via health_mock_farm; RSS <= 15 MiB, one scrape cycle overhead low.
+test-healthd-pf: build-rust
+    bash tests/contract/healthd_pf.sh
 
 # P0-S07 spike S-02: memfd seqlock ring, default scale + cross-language interop.
 # The 10M-message and ThreadSanitizer runs are spike evidence, not routine CI

@@ -1,4 +1,8 @@
 // prost codegen from proto/neuroos/v1
+// rules.md §5's no-panic rule is for runtime service code; a build script
+// halting the build with a clear panic message on failure is correct and
+// how cargo expects build.rs to behave.
+#![allow(clippy::expect_used)]
 use std::path::Path;
 
 fn main() {

@@ -25,6 +25,7 @@ pub fn rss_bytes() -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
     #[test]

@@ -11,5 +11,6 @@ workspace = true
 [dependencies]
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
+neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }

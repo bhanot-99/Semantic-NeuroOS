@@ -9,3 +9,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+jiff = "0.2"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

@@ -15,14 +15,14 @@
 
 | Field | Value |
 | :--- | :--- |
-| Last updated | 2026-09-26 |
-| Project stage | Phase 0 — all 10 stories done, exit criteria check + phase report pending |
-| Current phase | **Phase 0 — Foundation, Contracts & Spikes** (stories done, gate pending) |
-| Current sprint | Sprint 0 (started 2026-09-26) |
-| Current story | — (all P0-S01…S10 done; next: verify exit criteria §3.4, write `reports/phase-00-foundation.md`, gate to Phase 1) |
-| Overall progress | 0 / 11 phases complete (10 / 10 Sprint-0 stories done, all on branch `p0/s01-just-ci-green`, not yet merged to `main`) |
+| Last updated | 2026-09-27 |
+| Project stage | Phase 0 done (owner signed off 2026-09-27 on the 4 flagged deviations); Phase 1 (healthd) done (clean gate, no sign-off items); Phase 2 (Inference) not started |
+| Current phase | **Phase 2 — Neural Inference Engine (C4)** (not started; Phases 0 and 1 complete) |
+| Current sprint | Sprint 2 (starts on Phase 2 kickoff) |
+| Current story | — (P1-S01…S04 all done; next: pick up P2-S01 per phases.md §5.2) |
+| Overall progress | 2 / 11 phases done (Phase 0, Phase 1), on branch `p1/s01-healthd`, not yet merged to `main` |
 | Health | 🟢 On track |
-| Next milestone | M0 Foundation |
+| Next milestone | M1 (healthd done; inference next) |
 
 ---
 
@@ -30,12 +30,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Story | — (all P0-S01…S10 done) |
+| Story | — (all P1-S01…S04 done; Phase 1 gated) |
 | File(s) being edited | — |
-| Branch | `p0/s01-just-ci-green` (all of P0-S01…S10 built here per owner's direction; not yet merged to `main`) |
+| Branch | `p1/s01-healthd` (P1-S01…S04 built here; not yet merged to `main`) |
 | Started | — |
 | Goal of this session | — |
-| Next concrete step | Verify Phase 0 exit criteria (phases.md §3.4) one by one, write `reports/phase-00-foundation.md`, decide whether to merge `p0/s01-just-ci-green` to `main` before or as part of the phase gate. Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
+| Next concrete step | Start Phase 2 (Neural Inference Engine, C4) per phases.md §5: P2-S01 first (BitNet service, `Generate`/stream). `p0/s01-just-ci-green` is already merged to `main` (PR #1); `p1/s01-healthd` still needs an owner merge decision. Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
 
 ---
 
@@ -45,6 +45,8 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-27 | P1-S04 | `neuroosctl status` implemented for real (was a one-line stub left over from the prior session's WIP commit despite `neuroos-health::percentile` already having been moved out specifically to support it). Subcommand `status` connects to `healthd.sock`, sends `AggregateStatusRequest`, prints a text table or (`--json`) JSON; percentiles computed via the shared `neuroos_health::{p50_ns,p99_ns}` from whichever named latency histogram sorts first (deterministic pick). Manually verified end to end against a real `neuroos-healthd` + 8-mock `health_mock_farm`. 5 new unit/integration tests. | `crates/neuroosctl/src/main.rs` |
+| 2026-09-27 | Phase 1 gate | Fixed `just ci` (was red: 2 clippy `collapsible_if` errors in `neuroos-testkit/src/health_mocks.rs`, 1 unused import, fmt drift — all left over from the prior session's WIP commit that was never run through `just ci`). Wired the orphaned `tests/contract/healthd_pf.sh` PF test into `justfile` (`just test-healthd-pf`, included in `just test`) — proved real RSS 9.4 MiB (budget ≤ 15 MiB) with 9 targets. Measured coverage 84.99% region / 83.35% line across `neuroos-healthd`+`neuroosctl` (≥ 80% bar). Verified soak breach math against fixed vectors and against a real running `neuroos-healthd --soak` process. Wrote `reports/phase-01-healthd.md`; all P1 exit criteria met, no owner sign-off items (unlike Phase 0). | `reports/phase-01-healthd.md`; `just ci` green, 77 tests |
 | 2026-09-26 | P0-S10 | Real `deny.toml`: license allowlist (rules.md §4), network-crate ban (`reqwest`/`hyper`/`ureq`/`curl`/`hickory-resolver`/etc., `wrappers = ["neuroos-fetcher"]` — only the fetcher may ever depend on these) wired into `just ci` for the first time. **Found two real issues wiring it for real**: `cosmic-protocols` (P0-S08's COSMIC dependency) is GPL-3.0-only (new exception, ADR-0007); internal workspace path deps needed explicit `version = "0.1.0"` to satisfy the wildcard-dependency check. Proved the ban actually fires: added `reqwest` to a non-fetcher crate as a throwaway test → real `error[banned]` for both `reqwest` and its transitive `hyper-util`, reverted. | `docs/adr/0007-cosmic-protocols-gpl-exception.md` |
 | 2026-09-26 | P0-S09 | `models/manifest.toml`: all 10 real models Architecture.md §7.1 names (BitNet, whisper-tiny.en-q5_1, Silero VAD, 3× openWakeWord, Kokoro int8 + one voice, bge-small-en-v1.5 + tokenizer), with real URLs and real sha256 hashes computed from actual downloads. `scripts/fetch-models.sh` (Python-in-bash, stdlib `tomllib`) downloads, verifies, is idempotent (skips already-correct files), and **proven to reject bad data**: tested both a corrupted cached file (silently re-fetched and fixed) and a deliberately-wrong manifest hash (fetch aborted, no file installed, non-zero exit). Wired as `just fetch-models` (not in `just ci` — several GB) and `just lint-manifest` (schema check, no network, in `just ci`). | commit on `p0/s01-just-ci-green` |
 | 2026-09-26 | P0-S08 | Spike S-03: `zcosmic_toplevel_info_v1` proven live against this machine's real COSMIC session (5 real windows correctly listed: app_id/title/Activated state). Ported into `crates/neuroos-monitor/src/sensors/wayland_cosmic.rs` as real code (`list_toplevels()`), not a stub — 2 unit tests + 1 `#[ignore]`d live-session integration test (passed for real). Spike S-04: added `microsoft/BitNet` as a pinned git submodule (`cpp/third_party/bitnet.cpp`, nested `3rdparty/llama.cpp` pinned too), downloaded the real `BitNet-b1.58-2B-4T-gguf` i2_s model (~1.1 GiB), built with AVX2 confirmed active (`-march=native` → `__AVX2__`). Real throughput: 17.89 t/s decode / 17.07 t/s prefill, 8 threads (R-02 first signal). Also fixed `justfile`'s cpp find/lint/fmt recipes to exclude `cpp/third_party` (were sweeping the vendored submodule source). | `docs/adr/0006-cosmic-toplevel-and-bitnet-spikes.md` |
@@ -63,20 +65,25 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 ## 4. Current Sprint Board
 
-**Sprint 0 goal:** repository, toolchains, contracts and shared IPC libraries in place; spikes S-01 and S-02 started. **All 10 stories done as of 2026-09-26** — the "Sprint 0 / Sprint 0b" split in earlier revisions of this table was this file's own internal organization, not a phases.md split; phases.md §3.2 lists all 10 as one set and all 10 are now complete.
+**Sprint 1 (2026-09-26 → 2026-09-27) — done:** healthd core, cgroup reader, soak engine, `neuroosctl status`. All 4 P1 stories done, Phase 1 gated (`reports/phase-01-healthd.md`).
 
 | Story | Title | Pts | Status |
 | :--- | :--- | :--- | :--- |
-| P0-S01 | `just ci` green on clean checkout (scaffold, toolchains, justfile) | 5 | Done |
-| P0-S02 | Proto v1 contracts + codegen for Rust/C++/Python | 5 | Done |
-| P0-S03 | `neuroos-ipc` (framing, UDS, SO_PEERCRED, deadlines, reconnect) | 8 | Done |
-| P0-S04 | `neuroos-health` endpoint + histograms | 3 | Done |
-| P0-S05 | systemd templates with hardening baseline | 3 | Done |
-| P0-S06 | Spike S-01 unit mode → ADR-0002 | 5 | Done |
-| P0-S07 | Spike S-02 memfd seqlock ring | 5 | Done |
-| P0-S08 | Spikes S-03 (COSMIC) + S-04 (bitnet.cpp) | 5 | Done |
-| P0-S09 | Model manifest + fetch script | 3 | Done |
-| P0-S10 | cargo-deny network-crate ban | 2 | Done |
+| P1-S01 | healthd scrapes every configured health socket every 30 s, marks unreachable ones DOWN | 5 | Done |
+| P1-S02 | Operator sees each unit's cgroup memory against its budget | 3 | Done |
+| P1-S03 | Soak mode flags RSS growth > 5% or p99 drift > 10% | 5 | Done |
+| P1-S04 | `neuroosctl status` shows the aggregate report | 3 | Done |
+
+**Sprint 2 goal (next, not yet started):** Phase 2 — Neural Inference Engine (C4 `neuroos-inference`), per phases.md §5.
+
+| Story | Title | Pts | Status |
+| :--- | :--- | :--- | :--- |
+| P2-S01 | Send a prompt, receive a streamed completion | 8 | Backlog |
+| P2-S02 | Generated text through a zero-copy shared-memory ring | 5 | Backlog |
+| P2-S03 | Cancel a generation, stops within one decode step | 3 | Backlog |
+| P2-S04 | Background distillation never delays interactive by more than one decode step | 5 | Backlog |
+| P2-S05 | Force JSON output matching a grammar | 3 | Backlog |
+| P2-S06 | Measured TTFT/prefill/decode numbers replacing blueprint projections | 5 | Backlog |
 
 Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 
@@ -86,8 +93,8 @@ Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 
 | Phase | Name | Status | Started | Finished | Report |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| 0 | Foundation, Contracts & Spikes | 🟨 In gate review (all 10 stories done; 2 exit criteria items pending owner sign-off — report §3/§2.7) | 2026-09-26 | — | `reports/phase-00-foundation.md` |
-| 1 | Health Aggregator (healthd) | ⬜ Not started | — | — | `reports/phase-01-healthd.md` |
+| 0 | Foundation, Contracts & Spikes | ✅ Done (owner signed off 2026-09-27 on the 4 flagged deviations — report §2.6/§4) | 2026-09-26 | 2026-09-27 | `reports/phase-00-foundation.md` |
+| 1 | Health Aggregator (healthd) | ✅ Done (all exit criteria met, no owner sign-off items) | 2026-09-26 | 2026-09-27 | `reports/phase-01-healthd.md` |
 | 2 | Neural Inference Engine (C4) | ⬜ Not started | — | — | `reports/phase-02-inference.md` |
 | 3 | Desktop Telemetry Monitor (C1) | ⬜ Not started | — | — | `reports/phase-03-monitor.md` |
 | 4 | Semantic Storage Engine (C3) | ⬜ Not started | — | — | `reports/phase-04-storage.md` |
@@ -190,6 +197,7 @@ Newest first. One entry per work session.
 
 | Date | Session summary | Stories touched | Next step |
 | :--- | :--- | :--- | :--- |
+| 2026-09-27 | Picked up Phase 1 from a prior session's WIP commit (healthd core: scrape loop, cgroup reader, soak engine, `healthd.sock` server — all real, well-tested — but `just ci` was red and `neuroosctl status` (P1-S04) was still a one-line stub). Fixed `just ci` (3 clippy `collapsible_if` errors, 1 unused import, fmt drift). Implemented `neuroosctl status` (text table + `--json`) for real, with 5 new tests, verified manually end to end against a live healthd + mock farm. Wired the orphaned `tests/contract/healthd_pf.sh` PF test into `justfile`/`just ci` — proved real RSS 9.4 MiB (≤ 15 MiB budget). Measured coverage 84.99%/83.35% (region/line) across `neuroos-healthd`+`neuroosctl`. Ran a real `neuroos-healthd --soak` process to confirm CSV output beyond the unit tests. Wrote `reports/phase-01-healthd.md`; Phase 1 gated clean (no owner sign-off items, unlike Phase 0). | P1-S01…S04 | Start Phase 2 (Neural Inference Engine, C4); owner still needs to review/merge `p1/s01-healthd` and sign off on Phase 0's 4 flagged deviations. |
 | 2026-09-26 | Built all of P0-S02 through P0-S10 on `p0/s01-just-ci-green`, one story per commit, per owner's direction ("build all from S02 to S10 in this branch"). Real work throughout, not stubs: proto codegen + cross-language round-trip (S02); `neuroos-ipc` framing/UDS/SO_PEERCRED/deadlines/reconnect, 16 tests (S03); `neuroos-health` (S04); systemd hardening baseline + found/fixed a real `PrivateNetwork`-doesn't-block-DNS gap (S05); spike S-01 run for real, reverses the unit-mode preference (S06, ADR-0002); memfd seqlock ring in Rust+C++, found/fixed 2 real concurrency bugs via stress-testing and ThreadSanitizer (S07, ADR-0005); COSMIC toplevel spike against the live desktop + real bitnet.cpp submodule build with a downloaded model and a real tokens/s figure (S08, ADR-0006); model manifest + fetch script proven against 10 real downloaded/verified models (S09); `cargo-deny` wired for real, found `cosmic-protocols` is GPL-3.0 (S10, ADR-0007). `just ci` green after every story. | P0-S02 … P0-S10 | Verify Phase 0 exit criteria, write the phase report, decide on merging to `main`. |
 | 2026-09-26 | Scaffolded full repo tree per Architecture.md §14 (empty stubs); committed + pushed to `main` (`981a4ba`). Created branch `p0/s01-just-ci-green`; wired Rust workspace, cpp CMake build, python uv project; installed missing toolchains (clang-format-18, shellcheck, cargo-nextest) with owner's help; `just ci`/`build`/`test`/`bench` all green; committed `c48b5fc`. | P0-S01 | Merge `p0/s01-just-ci-green` to `main` (owner to confirm PR vs direct merge), then start P0-S02. |
 | 2026-09-26 | Read both blueprints; reconciled conflicts; produced PRD, Architecture, rules, phases, design, memory and the reports folder. | Planning | Owner reviews the documents and answers any open questions they can; then start P0-S01. |
