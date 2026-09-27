@@ -20,10 +20,11 @@ fn filter() -> EnvFilter {
 pub fn init_logging() -> Result<(), TryInitError> {
     let running_under_systemd = std::env::var_os("JOURNAL_STREAM").is_some();
 
-    if running_under_systemd
-        && let Ok(journald) = tracing_journald::layer()
-    {
-        return tracing_subscriber::registry().with(filter()).with(journald).try_init();
+    if running_under_systemd && let Ok(journald) = tracing_journald::layer() {
+        return tracing_subscriber::registry()
+            .with(filter())
+            .with(journald)
+            .try_init();
     }
 
     tracing_subscriber::registry()

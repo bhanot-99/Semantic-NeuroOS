@@ -86,10 +86,15 @@ pub fn load_config() -> Result<Config, ConfigError> {
 
 pub fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text)
-            .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source: Box::new(source) }),
+        Ok(text) => toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        }),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(source) => Err(ConfigError::Io { path: path.to_path_buf(), source }),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

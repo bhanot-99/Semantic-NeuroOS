@@ -26,7 +26,10 @@ pub async fn serve(
     }
 }
 
-async fn handle_connection<S>(stream: &mut S, aggregate: &Aggregate) -> Result<(), neuroos_ipc::FramingError>
+async fn handle_connection<S>(
+    stream: &mut S,
+    aggregate: &Aggregate,
+) -> Result<(), neuroos_ipc::FramingError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -54,10 +57,12 @@ where
             trace_id: req.trace_id,
             request_id: req.request_id,
             sent_at_ns: neuroos_common::now_ns(),
-            body: Some(envelope::Body::AggregateStatusResponse(AggregateStatusResponse {
-                components,
-                generated_at_ns: neuroos_common::now_ns(),
-            })),
+            body: Some(envelope::Body::AggregateStatusResponse(
+                AggregateStatusResponse {
+                    components,
+                    generated_at_ns: neuroos_common::now_ns(),
+                },
+            )),
         };
         write_envelope(stream, &resp, DEFAULT_MAX_FRAME).await?;
     }

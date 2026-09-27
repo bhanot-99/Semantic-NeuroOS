@@ -25,7 +25,9 @@ pub async fn scrape_cycle(
     let handles: Vec<_> = targets
         .iter()
         .cloned()
-        .map(|target| tokio::spawn(async move { scrape::scrape_one(&target, per_target_timeout).await }))
+        .map(|target| {
+            tokio::spawn(async move { scrape::scrape_one(&target, per_target_timeout).await })
+        })
         .collect();
 
     for handle in handles {
@@ -38,9 +40,20 @@ pub async fn scrape_cycle(
         };
 
         if let Some(engine) = soak_engine {
-            let p99 = record.latency_histograms.values().next().and_then(neuroos_health::p99_ns).unwrap_or(0);
+            let p99 = record
+                .latency_histograms
+                .values()
+                .next()
+                .and_then(neuroos_health::p99_ns)
+                .unwrap_or(0);
             if capture_baseline {
-                engine.set_baseline(&record.name, soak::Baseline { rss_bytes: record.rss_bytes, p99_ns: p99 });
+                engine.set_baseline(
+                    &record.name,
+                    soak::Baseline {
+                        rss_bytes: record.rss_bytes,
+                        p99_ns: p99,
+                    },
+                );
             } else {
                 match engine.record(&record.name, record.rss_bytes, p99) {
                     Ok(breaches) => {
@@ -70,7 +83,14 @@ pub async fn run_forever(
     let mut baseline_captured = false;
     loop {
         interval.tick().await;
-        scrape_cycle(&targets, &aggregate, soak_engine.as_deref(), per_target_timeout, !baseline_captured).await;
+        scrape_cycle(
+            &targets,
+            &aggregate,
+            soak_engine.as_deref(),
+            per_target_timeout,
+            !baseline_captured,
+        )
+        .await;
         baseline_captured = true;
     }
 }

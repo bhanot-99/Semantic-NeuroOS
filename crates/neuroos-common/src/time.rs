@@ -21,7 +21,10 @@ mod tests {
         let ns = now_ns();
         // 2026-01-01T00:00:00Z in epoch ns, as a sanity floor.
         let year_2026_ns: u64 = 1_767_225_600 * 1_000_000_000;
-        assert!(ns > year_2026_ns, "now_ns() = {ns} looks wrong (before 2026)");
+        assert!(
+            ns > year_2026_ns,
+            "now_ns() = {ns} looks wrong (before 2026)"
+        );
     }
 
     #[test]

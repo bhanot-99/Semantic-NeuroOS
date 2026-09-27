@@ -28,7 +28,9 @@ fn apply_cgroup_usage(mut record: ComponentRecord, target: &Target) -> Component
     };
     match crate::cgroup::read_usage(cgroup_path) {
         Ok(usage) => record.rss_bytes = usage.memory_current_bytes,
-        Err(e) => tracing::debug!(target = %target.name, error = %e, "cgroup read failed, using self-reported rss"),
+        Err(e) => {
+            tracing::debug!(target = %target.name, error = %e, "cgroup read failed, using self-reported rss")
+        }
     }
     record
 }
@@ -47,8 +49,13 @@ fn down_record(target: &Target) -> ComponentRecord {
     }
 }
 
-async fn scrape_one_inner(target: &Target, timeout: Duration) -> Result<ComponentRecord, ScrapeError> {
-    let mut stream = connect(&target.socket, timeout).await.map_err(ScrapeError::Connect)?;
+async fn scrape_one_inner(
+    target: &Target,
+    timeout: Duration,
+) -> Result<ComponentRecord, ScrapeError> {
+    let mut stream = connect(&target.socket, timeout)
+        .await
+        .map_err(ScrapeError::Connect)?;
 
     let request = Envelope {
         schema_version: 1,
@@ -107,7 +114,12 @@ mod tests {
     use super::*;
 
     fn target(name: &str, socket: PathBuf) -> Target {
-        Target { name: name.into(), socket, budget_bytes: 100 * 1024 * 1024, cgroup_path: None }
+        Target {
+            name: name.into(),
+            socket,
+            budget_bytes: 100 * 1024 * 1024,
+            cgroup_path: None,
+        }
     }
 
     #[tokio::test]
@@ -149,7 +161,10 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_target_is_down() {
-        let t = target("nope", PathBuf::from("/tmp/neuroos-healthd-test-nonexistent.sock"));
+        let t = target(
+            "nope",
+            PathBuf::from("/tmp/neuroos-healthd-test-nonexistent.sock"),
+        );
         let record = scrape_one(&t, Duration::from_millis(200)).await;
         assert_eq!(record.status, neuroos_proto::v1::Status::Down);
     }

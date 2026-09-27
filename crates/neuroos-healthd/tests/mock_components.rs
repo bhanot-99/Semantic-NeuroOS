@@ -4,7 +4,6 @@
 //! IT (phases.md §4.3): healthd against 8 mock components from testkit —
 //! healthy, slow (> timeout), crashing, returning malformed frames (2 of
 //! each) — proving DOWN/OK classification end to end, not just per-function.
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,13 +55,21 @@ async fn healthd_classifies_all_8_mock_components_correctly() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let targets: Vec<Target> = vec![
-        healthy_a, healthy_b, slow_a, slow_b, crashing_a, crashing_b, malformed_a, malformed_b,
+        healthy_a,
+        healthy_b,
+        slow_a,
+        slow_b,
+        crashing_a,
+        crashing_b,
+        malformed_a,
+        malformed_b,
     ];
     let aggregate = Arc::new(Aggregate::new(&targets));
 
     // per-target timeout well under the "slow" mocks' 10s hang, so they
     // classify as DOWN within this one cycle rather than blocking it.
-    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300), true).await;
+    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300), true)
+        .await;
 
     let snapshot = aggregate.snapshot();
     assert_eq!(snapshot.len(), 8);

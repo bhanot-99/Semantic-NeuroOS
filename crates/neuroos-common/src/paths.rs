@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// `~/.config/neuroos/`
@@ -99,7 +101,10 @@ mod tests {
         unsafe {
             std::env::set_var("NEUROOS_CONFIG", "/tmp/neuroos-test-config.toml");
         }
-        assert_eq!(config_file(), PathBuf::from("/tmp/neuroos-test-config.toml"));
+        assert_eq!(
+            config_file(),
+            PathBuf::from("/tmp/neuroos-test-config.toml")
+        );
         unsafe {
             std::env::remove_var("NEUROOS_CONFIG");
         }

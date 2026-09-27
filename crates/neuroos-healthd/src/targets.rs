@@ -44,7 +44,12 @@ pub fn default_targets() -> Vec<Target> {
             } else {
                 runtime.join(format!("{name}.health.sock"))
             };
-            Target { name: name.to_string(), socket, budget_bytes: mib * 1024 * 1024, cgroup_path: None }
+            Target {
+                name: name.to_string(),
+                socket,
+                budget_bytes: mib * 1024 * 1024,
+                cgroup_path: None,
+            }
         })
         .collect()
 }
@@ -76,14 +81,24 @@ mod tests {
     fn default_targets_cover_every_component() {
         let targets = default_targets();
         assert_eq!(targets.len(), HARD_CAP_MIB.len());
-        assert!(targets.iter().any(|t| t.name == "neuroos-inference" && t.budget_bytes == 1900 * 1024 * 1024));
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.name == "neuroos-inference" && t.budget_bytes == 1900 * 1024 * 1024)
+        );
     }
 
     #[test]
     fn fetcher_uses_its_own_runtime_dir() {
         let targets = default_targets();
-        let fetcher = targets.iter().find(|t| t.name == "neuroos-fetcher").unwrap();
-        assert_eq!(fetcher.socket, PathBuf::from("/run/neuroos-fetcher/health.sock"));
+        let fetcher = targets
+            .iter()
+            .find(|t| t.name == "neuroos-fetcher")
+            .unwrap();
+        assert_eq!(
+            fetcher.socket,
+            PathBuf::from("/run/neuroos-fetcher/health.sock")
+        );
     }
 
     #[test]
@@ -92,7 +107,8 @@ mod tests {
         let extra = vec![TargetConfig {
             name: "neuroos-custom".into(),
             socket: PathBuf::from("/tmp/custom.sock"),
-            budget_bytes: 1024, cgroup_path: None,
+            budget_bytes: 1024,
+            cgroup_path: None,
         }];
         let merged = merge_targets(base.clone(), &extra);
         assert_eq!(merged.len(), base.len() + 1);
@@ -102,8 +118,12 @@ mod tests {
     #[test]
     fn extra_target_cannot_override_a_known_name() {
         let base = default_targets();
-        let extra =
-            vec![TargetConfig { name: "neuroos-monitor".into(), socket: PathBuf::from("/tmp/evil.sock"), budget_bytes: 1, cgroup_path: None }];
+        let extra = vec![TargetConfig {
+            name: "neuroos-monitor".into(),
+            socket: PathBuf::from("/tmp/evil.sock"),
+            budget_bytes: 1,
+            cgroup_path: None,
+        }];
         let merged = merge_targets(base.clone(), &extra);
         assert_eq!(merged.len(), base.len());
         let monitor = merged.iter().find(|t| t.name == "neuroos-monitor").unwrap();

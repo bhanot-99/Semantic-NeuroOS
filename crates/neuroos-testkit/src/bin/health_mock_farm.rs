@@ -10,9 +10,15 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let runtime_dir = PathBuf::from(args.next().expect("usage: health_mock_farm <runtime_dir> <name>..."));
+    let runtime_dir = PathBuf::from(
+        args.next()
+            .expect("usage: health_mock_farm <runtime_dir> <name>..."),
+    );
     let names: Vec<String> = args.collect();
-    assert!(!names.is_empty(), "usage: health_mock_farm <runtime_dir> <name>...");
+    assert!(
+        !names.is_empty(),
+        "usage: health_mock_farm <runtime_dir> <name>..."
+    );
 
     let my_uid = current_uid();
     for name in &names {

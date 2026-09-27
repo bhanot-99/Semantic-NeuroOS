@@ -2,9 +2,9 @@
 //! component, then flag RSS growth > 5% or p99 drift > 10% against it.
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 const RSS_GROWTH_BREACH_PCT: f64 = 5.0;
@@ -33,14 +33,20 @@ pub struct Breach {
 
 /// Pure drift math, fixed-vector-testable independent of any I/O: `None`
 /// baseline values (component never captured) never breach.
-pub fn check_breaches(component: &str, baseline: Option<Baseline>, rss_bytes: u64, p99_ns: u64) -> Vec<Breach> {
+pub fn check_breaches(
+    component: &str,
+    baseline: Option<Baseline>,
+    rss_bytes: u64,
+    p99_ns: u64,
+) -> Vec<Breach> {
     let Some(baseline) = baseline else {
         return Vec::new();
     };
     let mut breaches = Vec::new();
 
     if baseline.rss_bytes > 0 {
-        let growth_pct = ((rss_bytes as f64 - baseline.rss_bytes as f64) / baseline.rss_bytes as f64) * 100.0;
+        let growth_pct =
+            ((rss_bytes as f64 - baseline.rss_bytes as f64) / baseline.rss_bytes as f64) * 100.0;
         if growth_pct > RSS_GROWTH_BREACH_PCT {
             breaches.push(Breach {
                 component: component.to_string(),
@@ -75,21 +81,36 @@ pub struct SoakEngine {
 
 impl SoakEngine {
     pub fn new(csv_path: impl Into<PathBuf>) -> Self {
-        Self { baselines: Mutex::new(HashMap::new()), csv_path: csv_path.into() }
+        Self {
+            baselines: Mutex::new(HashMap::new()),
+            csv_path: csv_path.into(),
+        }
     }
 
     pub fn set_baseline(&self, component: &str, baseline: Baseline) {
-        self.baselines.lock().unwrap_or_else(|p| p.into_inner()).insert(component.to_string(), baseline);
+        self.baselines
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(component.to_string(), baseline);
     }
 
     pub fn baseline_for(&self, component: &str) -> Option<Baseline> {
-        self.baselines.lock().unwrap_or_else(|p| p.into_inner()).get(component).copied()
+        self.baselines
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(component)
+            .copied()
     }
 
     /// Checks `component` against its baseline and appends one CSV row
     /// (creating the file with a header if it doesn't exist yet). Returns
     /// any breaches found.
-    pub fn record(&self, component: &str, rss_bytes: u64, p99_ns: u64) -> std::io::Result<Vec<Breach>> {
+    pub fn record(
+        &self,
+        component: &str,
+        rss_bytes: u64,
+        p99_ns: u64,
+    ) -> std::io::Result<Vec<Breach>> {
         let baseline = self.baseline_for(component);
         let breaches = check_breaches(component, baseline, rss_bytes, p99_ns);
         self.append_csv_row(component, rss_bytes, p99_ns, &breaches)?;
@@ -99,12 +120,21 @@ impl SoakEngine {
     /// Hand-rolled CSV (no crate dependency for a 5-column, comma/newline-free
     /// row: `component` is always one of our own fixed target names, and
     /// `breach_summary` only ever emits `;`-separated `key=value` pairs).
-    fn append_csv_row(&self, component: &str, rss_bytes: u64, p99_ns: u64, breaches: &[Breach]) -> std::io::Result<()> {
+    fn append_csv_row(
+        &self,
+        component: &str,
+        rss_bytes: u64,
+        p99_ns: u64,
+        breaches: &[Breach],
+    ) -> std::io::Result<()> {
         if let Some(parent) = self.csv_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file_is_new = !self.csv_path.exists();
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.csv_path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.csv_path)?;
         if file_is_new {
             writeln!(file, "timestamp_ns,component,rss_bytes,p99_ns,breach")?;
         }
@@ -149,14 +179,20 @@ mod tests {
 
     #[test]
     fn exactly_5_percent_rss_growth_does_not_breach() {
-        let baseline = Baseline { rss_bytes: 100_000_000, p99_ns: 0 };
+        let baseline = Baseline {
+            rss_bytes: 100_000_000,
+            p99_ns: 0,
+        };
         let breaches = check_breaches("x", Some(baseline), 105_000_000, 0);
         assert!(breaches.is_empty(), "exactly 5% must not breach (only >5%)");
     }
 
     #[test]
     fn just_over_5_percent_rss_growth_breaches() {
-        let baseline = Baseline { rss_bytes: 100_000_000, p99_ns: 0 };
+        let baseline = Baseline {
+            rss_bytes: 100_000_000,
+            p99_ns: 0,
+        };
         let breaches = check_breaches("x", Some(baseline), 105_000_001, 0);
         assert_eq!(breaches.len(), 1);
         assert_eq!(breaches[0].kind, BreachKind::RssGrowth);
@@ -164,14 +200,20 @@ mod tests {
 
     #[test]
     fn exactly_10_percent_p99_drift_does_not_breach() {
-        let baseline = Baseline { rss_bytes: 0, p99_ns: 10_000_000 };
+        let baseline = Baseline {
+            rss_bytes: 0,
+            p99_ns: 10_000_000,
+        };
         let breaches = check_breaches("x", Some(baseline), 0, 11_000_000);
         assert!(breaches.is_empty());
     }
 
     #[test]
     fn just_over_10_percent_p99_drift_breaches() {
-        let baseline = Baseline { rss_bytes: 0, p99_ns: 10_000_000 };
+        let baseline = Baseline {
+            rss_bytes: 0,
+            p99_ns: 10_000_000,
+        };
         let breaches = check_breaches("x", Some(baseline), 0, 11_000_001);
         assert_eq!(breaches.len(), 1);
         assert_eq!(breaches[0].kind, BreachKind::P99Drift);
@@ -179,14 +221,20 @@ mod tests {
 
     #[test]
     fn rss_shrinking_never_breaches() {
-        let baseline = Baseline { rss_bytes: 100_000_000, p99_ns: 0 };
+        let baseline = Baseline {
+            rss_bytes: 100_000_000,
+            p99_ns: 0,
+        };
         let breaches = check_breaches("x", Some(baseline), 1, 0);
         assert!(breaches.is_empty());
     }
 
     #[test]
     fn both_can_breach_simultaneously() {
-        let baseline = Baseline { rss_bytes: 100, p99_ns: 100 };
+        let baseline = Baseline {
+            rss_bytes: 100,
+            p99_ns: 100,
+        };
         let breaches = check_breaches("x", Some(baseline), 1000, 1000);
         assert_eq!(breaches.len(), 2);
     }
@@ -196,7 +244,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let csv_path = dir.path().join("soak.csv");
         let engine = SoakEngine::new(&csv_path);
-        engine.set_baseline("comp", Baseline { rss_bytes: 100, p99_ns: 100 });
+        engine.set_baseline(
+            "comp",
+            Baseline {
+                rss_bytes: 100,
+                p99_ns: 100,
+            },
+        );
         engine.record("comp", 200, 100).unwrap();
         let text = read_csv_for_test(&csv_path);
         assert!(text.starts_with("timestamp_ns,component,rss_bytes,p99_ns,breach"));

@@ -19,14 +19,20 @@ pub struct CgroupUsage {
 pub fn read_usage(cgroup_dir: &Path) -> io::Result<CgroupUsage> {
     let memory_current_bytes = read_u64_file(&cgroup_dir.join("memory.current"))?;
     let memory_peak_bytes = read_u64_file(&cgroup_dir.join("memory.peak")).unwrap_or(0);
-    Ok(CgroupUsage { memory_current_bytes, memory_peak_bytes })
+    Ok(CgroupUsage {
+        memory_current_bytes,
+        memory_peak_bytes,
+    })
 }
 
 fn read_u64_file(path: &Path) -> io::Result<u64> {
     let text = std::fs::read_to_string(path)?;
-    text.trim()
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("{}: not a u64", path.display())))
+    text.trim().parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: not a u64", path.display()),
+        )
+    })
 }
 
 #[cfg(test)]

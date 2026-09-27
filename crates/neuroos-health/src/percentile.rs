@@ -12,7 +12,11 @@ pub fn percentile_ns(hist: &LatencyHistogram, p: f64) -> Option<u64> {
     }
     let target = (hist.count as f64 * p).ceil() as u64;
     let mut cumulative = 0u64;
-    for (bound, count) in hist.bucket_upper_bound_ns.iter().zip(hist.bucket_counts.iter()) {
+    for (bound, count) in hist
+        .bucket_upper_bound_ns
+        .iter()
+        .zip(hist.bucket_counts.iter())
+    {
         cumulative += count;
         if cumulative >= target.max(1) {
             return Some(*bound);

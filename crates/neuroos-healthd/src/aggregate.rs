@@ -42,7 +42,10 @@ impl ComponentRecord {
     /// reporting OK but over budget is downgraded to DEGRADED; DOWN/UNKNOWN
     /// are left as-is (budget doesn't matter if we can't reach it anyway).
     pub fn apply_budget_alert(mut self) -> Self {
-        if self.status == Status::Ok && self.budget_bytes > 0 && self.rss_bytes * 10 >= self.budget_bytes * 9 {
+        if self.status == Status::Ok
+            && self.budget_bytes > 0
+            && self.rss_bytes * 10 >= self.budget_bytes * 9
+        {
             self.status = Status::Degraded;
         }
         self
@@ -56,9 +59,13 @@ pub struct Aggregate {
 
 impl Aggregate {
     pub fn new(targets: &[Target]) -> Self {
-        let records =
-            targets.iter().map(|t| (t.name.clone(), ComponentRecord::unknown(t))).collect();
-        Self { records: Mutex::new(records) }
+        let records = targets
+            .iter()
+            .map(|t| (t.name.clone(), ComponentRecord::unknown(t)))
+            .collect();
+        Self {
+            records: Mutex::new(records),
+        }
     }
 
     pub fn update(&self, record: ComponentRecord) {
@@ -72,7 +79,6 @@ impl Aggregate {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
-
 }
 
 #[cfg(test)]
@@ -82,7 +88,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn target(name: &str, budget_mib: u64) -> Target {
-        Target { name: name.into(), socket: PathBuf::from("/tmp/x.sock"), budget_bytes: budget_mib * 1024 * 1024, cgroup_path: None }
+        Target {
+            name: name.into(),
+            socket: PathBuf::from("/tmp/x.sock"),
+            budget_bytes: budget_mib * 1024 * 1024,
+            cgroup_path: None,
+        }
     }
 
     fn get(agg: &Aggregate, name: &str) -> Option<ComponentRecord> {
