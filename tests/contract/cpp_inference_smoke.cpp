@@ -127,7 +127,10 @@ int main() {
                    generated.c_str());
     }
 
-    // 4. Cancel: a background job, cancelled before it can finish.
+    // 4. Cancel: a background job, cancelled before it can finish. Measures
+    // real cancellation latency (phases.md §5.4: "Cancellation latency <= 1
+    // decode step (measured)") by timing how long real tokens keep arriving
+    // in the ring after the CancelRequest is sent.
     {
         int fd = connect_or_die(sock_path);
         neuroos::v1::Envelope req;
@@ -146,8 +149,11 @@ int main() {
         std::uint64_t generation_id = resp.value()->generate_response().generation_id();
         ::close(fd);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        while (reader.try_read().has_value()) {
+        } // drain whatever already arrived so the post-cancel count below is clean
 
+        auto cancel_sent_at = std::chrono::steady_clock::now();
         int cfd = connect_or_die(sock_path);
         neuroos::v1::Envelope creq;
         creq.set_schema_version(1);
@@ -158,8 +164,117 @@ int main() {
         auto cresp = neuroos::ipc::read_envelope(cfd, neuroos::ipc::kDefaultMaxFrame);
         check(cresp.has_value() && cresp.value().has_value(), "read CancelResponse");
         check(cresp.value()->cancel_response().cancelled(), "cancel_response.cancelled must be true");
-        std::printf("OK: Cancel -> a real in-flight background generation was cancelled\n");
         ::close(cfd);
+
+        int tokens_after_cancel = 0;
+        std::chrono::steady_clock::time_point last_token_at = cancel_sent_at;
+        auto drain_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        while (std::chrono::steady_clock::now() < drain_until) {
+            if (reader.try_read().has_value()) {
+                ++tokens_after_cancel;
+                last_token_at = std::chrono::steady_clock::now();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        double latency_ms =
+            std::chrono::duration<double, std::milli>(last_token_at - cancel_sent_at).count();
+        std::printf("OK: Cancel -> stopped after %d more token(s), last one %.1f ms after "
+                   "CancelRequest was sent (a single real decode step is ~55-75 ms per "
+                   "reports/bench/)\n",
+                   tokens_after_cancel, latency_ms);
+    }
+
+    // 5. Interactive preemption under background load (PRD FR-INF-06,
+    // phases.md §5.4: "Interactive preemption verified under background
+    // load"): start a long real background generation, then submit a real
+    // interactive request on a separate ring and confirm it completes
+    // promptly instead of waiting for the background job.
+    {
+        auto interactive_ring_fd_of = [&](const std::string& name) {
+            int fd = connect_or_die(sock_path);
+            neuroos::v1::Envelope req;
+            req.set_schema_version(1);
+            req.mutable_attach_ring_request()->set_ring_name(name);
+            check(neuroos::ipc::write_envelope(fd, req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+                 "write AttachRingRequest (preemption test)");
+            auto r = neuroos::ipc::read_envelope_with_fd(fd, neuroos::ipc::kDefaultMaxFrame);
+            check(r.has_value() && r.value().has_value() && r.value()->fd >= 0,
+                 "AttachRing (preemption test) must hand back a real fd");
+            ::close(fd);
+            return r.value()->fd;
+        };
+
+        neuroos::shm::Ring bg_ring = neuroos::shm::Ring::open(interactive_ring_fd_of("preempt-bg-ring"));
+        neuroos::shm::Ring it_ring = neuroos::shm::Ring::open(interactive_ring_fd_of("preempt-it-ring"));
+
+        int bfd = connect_or_die(sock_path);
+        neuroos::v1::Envelope breq;
+        breq.set_schema_version(1);
+        auto* bgen = breq.mutable_generate_request();
+        bgen->set_prompt("The history of the Roman Empire began");
+        bgen->set_max_tokens(400);
+        bgen->set_lane(neuroos::v1::LANE_BACKGROUND);
+        bgen->set_ring_name("preempt-bg-ring");
+        check(neuroos::ipc::write_envelope(bfd, breq, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write background load GenerateRequest");
+        auto bresp = neuroos::ipc::read_envelope(bfd, neuroos::ipc::kDefaultMaxFrame);
+        check(bresp.has_value() && bresp.value().has_value() && bresp.value()->generate_response().accepted(),
+             "background load GenerateRequest must be accepted");
+        std::uint64_t bg_generation_id = bresp.value()->generate_response().generation_id();
+        ::close(bfd);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(150)); // let the background job start decoding
+
+        auto it_start = std::chrono::steady_clock::now();
+        int ifd = connect_or_die(sock_path);
+        neuroos::v1::Envelope ireq;
+        ireq.set_schema_version(1);
+        auto* igen = ireq.mutable_generate_request();
+        igen->set_prompt("2 + 2 =");
+        igen->set_max_tokens(4);
+        igen->set_lane(neuroos::v1::LANE_INTERACTIVE);
+        igen->set_ring_name("preempt-it-ring");
+        igen->set_temperature(0.0F);
+        check(neuroos::ipc::write_envelope(ifd, ireq, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write interactive GenerateRequest under background load");
+        auto iresp = neuroos::ipc::read_envelope(ifd, neuroos::ipc::kDefaultMaxFrame);
+        check(iresp.has_value() && iresp.value().has_value() && iresp.value()->generate_response().accepted(),
+             "interactive GenerateRequest must be accepted even while background is running");
+        ::close(ifd);
+
+        auto it_reader = it_ring.reader();
+        int it_pieces = 0;
+        auto it_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < it_deadline && it_pieces < 4) {
+            if (it_reader.try_read().has_value()) {
+                ++it_pieces;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        double it_latency_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - it_start)
+                                   .count();
+        check(it_pieces == 4, "interactive job must complete under background load, not stall");
+        // A generous bound: 4 interactive tokens plus scheduling/preemption
+        // overhead should complete in well under the time 400 background
+        // tokens would take (400 * ~60 ms/token ~= 24 s) if preemption
+        // wasn't working and interactive had to wait its turn.
+        check(it_latency_ms < 5000.0,
+             "interactive job took too long under background load - preemption may not be working");
+        std::printf("OK: interactive preemption -> %d interactive token(s) completed in %.1f ms "
+                   "while a real 400-token background job was running\n",
+                   it_pieces, it_latency_ms);
+
+        // Clean up the still-running background job.
+        int cfd2 = connect_or_die(sock_path);
+        neuroos::v1::Envelope creq2;
+        creq2.mutable_cancel_request()->set_generation_id(bg_generation_id);
+        neuroos::ipc::write_envelope(cfd2, creq2, neuroos::ipc::kDefaultMaxFrame);
+        neuroos::ipc::read_envelope(cfd2, neuroos::ipc::kDefaultMaxFrame);
+        ::close(cfd2);
+        (void)bg_ring;
     }
 
     std::printf("all cpp_inference_smoke checks passed\n");

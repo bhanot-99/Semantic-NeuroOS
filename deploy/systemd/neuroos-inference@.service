@@ -28,7 +28,11 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-MemoryDenyWriteExecute=false
+# spike S-05 (Phase 2, phases.md §5.1 item 8): verified real neuroos-inference
+# --bench (model load + inference) runs to completion under `systemd-run
+# --user -p MemoryDenyWriteExecute=yes` with no crash — the AVX2 ggml-cpu
+# backend is pre-compiled (-march=native), no JIT, so this is safe.
+MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 InaccessiblePaths=-/run/systemd/resolve
