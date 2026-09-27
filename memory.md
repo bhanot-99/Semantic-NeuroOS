@@ -11,6 +11,28 @@
 
 ---
 
+## 🔴 CRITICAL — unresolved R0-1 violation in `neuroos-storage` (read this first)
+
+**`cargo deny check` fails**: `neuroos-storage` (C3, branch `p4/s01-storage`) currently links `reqwest`/`hyper`/`hyper-util` — rules.md R0-1: *"No HTTP client, DNS resolver, socket to an IP address, or telemetry SDK in any other component"* (C7/`neuroos-fetcher` is the only exception). This is a Rule Zero item, not ordinary tech debt.
+
+**Root cause**: `lancedb` 0.39's dependency `lance` 12.0.0 unconditionally depends on `lance-namespace` -> `lance-namespace-reqwest-client`, with **no Cargo feature to disable it** (confirmed: `lance-namespace-12.0.0`'s Cargo.toml has no `[features]` section at all). Confirmed this is not version-specific: `lance` 11.0.0 (what `lancedb` 0.38 would use) has the identical unconditional `lance-namespace` dependency. Every reasonably recent `lancedb` release appears to bundle an HTTP-based namespace/catalog client regardless of local-only usage.
+
+(Related, separate, already-worse issue found and improved on the way here: `lancedb` 0.15 — used briefly earlier this session to dodge an unrelated compile bug, see below — unconditionally pulls the full AWS SDK stack via `lance`'s hardcoded `features = ["dynamodb"]`, which pulls in an *older*, more-vulnerable `hyper`0.14/`rustls-webpki` chain with active RUSTSEC CVEs (CRL-parsing panic, h2 unbounded-frame DoS, quick-xml memory exhaustion). Switching to 0.39 removed all of those specific CVEs even though the newer `lance-namespace` path still brings in a current, unpatched `reqwest`/`hyper`.)
+
+**Current state (this session stopped here — laptop shutdown, not a "good enough, moving on" call):**
+- `vendor/lancedb-0.39.0-patched/` — a locally-patched copy of lancedb 0.39.0's source, `[patch.crates-io]`'d in root `Cargo.toml`. The patch fixes a real, separate upstream bug (`job.rs`'s `decode()` referenced `Error::Http` — a `#[cfg(feature = "remote")]`-gated variant — unconditionally, so the crate fails to compile at all with `default-features = false`; see the `PATCHED` comment in that file). This patch is correct and worth keeping regardless of the R0-1 issue.
+- Everything **functionally works and is tested**: all 42 non-live + 4 live `neuroos-storage` tests pass against real lancedb 0.39, real SQLite, real embeddings.
+- `cargo deny check` still fails on `banned: hyper/hyper-util/reqwest` (from `lance-namespace-reqwest-client`, not from anything neuroos-storage's own code calls) and one `unmaintained` advisory (`paste`, via `lance-bitpacking`/`tokenizers` — informational, not an active exploit, no fix available upstream yet).
+
+**Options for next session (in the order I'd try them):**
+1. **Vendor-patch `lance-namespace` too** (smaller crate than all of `lance` — check how deep `lance-namespace-reqwest-client` is actually wired into `lance-io`'s real code paths for local-file-only usage; if it's a generic trait implementation nothing calls when there's no namespace configured, stubbing it out or making the dependency itself optional in a patched `lance-namespace` Cargo.toml may be a small, safe change).
+2. **Replace LanceDB with a custom flat-vector store in SQLite** — Architecture.md's own FR-STO-05 only requires "exact SIMD flat search" up to 20k items before HNSW promotion (P4-S05, not yet built either); a vector column stored as a BLOB with a Rust dot-product/cosine-distance scan is a completely legitimate, dependency-light implementation of exactly that requirement, and sidesteps this whole dependency tree. Bigger rewrite of `lance.rs`/`engine.rs`/`spool.rs`'s LanceDB calls, but architecturally cleaner and removes a large, fast-moving dependency.
+3. **An explicit, owner-approved ADR exception** (rules.md's pattern for GPL crates, D-13/ADR-0007 — R0-1 doesn't explicitly name an ADR carve-out the way R0-2 does, so this needs the owner's explicit sign-off, not just an ADR written unilaterally) accepting that `reqwest`/`hyper` are linked but never invoked by any code path `neuroos-storage` actually calls (true today, but doesn't shrink the attack surface or bypass `cargo deny`'s CI gate without also updating `deny.toml`, which itself needs the same sign-off).
+
+**Do not merge `p4/s01-storage` to `main` until this is resolved or the owner explicitly accepts option 3.**
+
+---
+
 ## 1. Status Snapshot
 
 | Field | Value |
@@ -110,12 +132,12 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | P4-S01 | Noisy events never become persistent nodes (4-stage ingest filter) | 8 | Done |
 | P4-S02 | Events stored in the right domain with the right taint | 5 | Done |
 | P4-S03 | Top-k relevant chunks for a question in ~13ms (embedder) | 8 | Done (embedder + LanceDB + hybrid query all real and live-verified; latency not yet benchmarked) |
-| P4-S04 | Window focused at a given moment ± 1.5s (`QueryFocusHistory`) | 3 | Backlog (SQLite `focus_history` table + rows already exist from P4-S02; the read-query API itself not yet written) |
+| P4-S04 | Window focused at a given moment ± 1.5s (`QueryFocusHistory`) | 3 | Done |
 | P4-S05 | Slow collection auto-promotes to HNSW | 5 | Backlog (P1) |
-| P4-S06 | Fetched documents ingested as untrusted (`external_documents`, C7 spool) | 3 | Backlog |
-| P4-S07 | Old data expires and backups exist (lifecycle: GC, 6-hourly backup) | 5 | Backlog |
+| P4-S06 | Fetched documents ingested as untrusted (`external_documents`, C7 spool) | 3 | Done |
+| P4-S07 | Old data expires and backups exist (lifecycle: GC, 6-hourly backup) | 5 | Done |
 | P4-S08 | Model upgrade re-indexes without downtime | 5 | Backlog |
-| P4-S09 | Forget a time range or an app (FR-STO-12/FR-PRV-03) | 3 | Backlog |
+| P4-S09 | Forget a time range or an app (FR-STO-12/FR-PRV-03) | 3 | Done |
 | P4-S10 | (Conditional) SQLite v1 migrator | 5 | Dropped — OQ-03's default ("drop unless a sample DB is provided") applies; no sample DB provided |
 
 Columns: Backlog → Ready → In Progress → In Review → Testing → Done.

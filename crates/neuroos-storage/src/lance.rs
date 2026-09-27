@@ -183,11 +183,8 @@ impl LanceStore {
         if names.iter().any(|n| n == family) {
             Ok(self.conn.open_table(family).execute().await?)
         } else {
-            Ok(self
-                .conn
-                .create_table(family, Box::new(empty_reader()))
-                .execute()
-                .await?)
+            let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(empty_reader());
+            Ok(self.conn.create_table(family, reader).execute().await?)
         }
     }
 
@@ -199,8 +196,10 @@ impl LanceStore {
         }
         let table = self.ensure_table(family).await?;
         let batch = records_to_batch(chunks)?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema());
-        table.add(Box::new(reader)).execute().await?;
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema()),
+        );
+        table.add(reader).execute().await?;
         Ok(())
     }
 

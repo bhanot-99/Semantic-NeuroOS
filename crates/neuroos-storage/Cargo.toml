@@ -17,9 +17,9 @@ thiserror = "2"
 tracing = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 fastembed = { version = "7", default-features = false, features = ["ort-load-dynamic"] }
-lancedb = { version = "=0.15", default-features = false }
-arrow-array = "=53.4.1"
-arrow-schema = "=53.4.1"
+lancedb = { version = "=0.39.0", default-features = false }
+arrow-array = "58"
+arrow-schema = "58"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

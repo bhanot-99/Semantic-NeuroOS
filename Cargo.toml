@@ -41,3 +41,15 @@ todo = "warn"
 
 [profile.release]
 lto = "thin"
+
+# lancedb 0.39.0's job.rs references Error::Http unconditionally even
+# though that variant is #[cfg(feature = "remote")]-gated in error.rs — a
+# real upstream bug that breaks the build with default-features off (which
+# neuroos-storage needs: enabling "remote" pulls reqwest/hyper into C3,
+# violating rules.md R0-1 — no HTTP client outside C7). vendor/ has the
+# same 0.39.0 source with only that function's 2 match arms fixed (see the
+# PATCHED comment in vendor/lancedb-0.39.0-patched/src/job.rs); everything
+# else, including every genuinely `remote`-gated Error::Http use, is
+# untouched. Revisit if a later release fixes this upstream.
+[patch.crates-io]
+lancedb = { path = "vendor/lancedb-0.39.0-patched" }

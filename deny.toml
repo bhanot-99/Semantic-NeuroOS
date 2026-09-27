@@ -23,6 +23,9 @@ allow = [
     # than MIT — not a copyleft/non-commercial concern rules.md §4.1 reserves
     # an ADR for. Found via `notify` (Phase 3 folder sensor, P3-S07).
     "CC0-1.0",
+    # BSL-1.0 (Boost Software License): permissive, MIT/BSD-equivalent in
+    # spirit, no copyleft. Found via xxhash-rust (P4, lance's dependency).
+    "BSL-1.0",
 ]
 confidence-threshold = 0.8
 exceptions = [
