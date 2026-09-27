@@ -96,7 +96,50 @@ fn handle_request(env: Envelope, privacy: &PrivacyState, bus: &EventBus) -> Enve
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+    use neuroos_ipc::read_envelope;
     use neuroos_proto::v1::{MonitorPauseRequest, MonitorStatusRequest};
+
+    #[tokio::test]
+    async fn a_real_client_pauses_over_a_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.control.sock");
+        let privacy = PrivacyState::new(Vec::new());
+        let bus = EventBus::new(4);
+        tokio::spawn(serve(
+            path.clone(),
+            vec![crate::current_uid()],
+            privacy.clone(),
+            bus,
+        ));
+
+        let mut client = wait_for_connect(&path).await;
+        let req = request(envelope::Body::MonitorPauseRequest(MonitorPauseRequest {
+            duration_s: 0,
+            resume: false,
+        }));
+        write_envelope(&mut client, &req, DEFAULT_MAX_FRAME)
+            .await
+            .unwrap();
+        let resp = read_envelope(&mut client, DEFAULT_MAX_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            resp.body,
+            Some(envelope::Body::MonitorPauseResponse(_))
+        ));
+        assert!(privacy.is_paused(neuroos_common::now_ns()));
+    }
+
+    async fn wait_for_connect(path: &std::path::Path) -> UnixStream {
+        for _ in 0..50 {
+            if let Ok(s) = UnixStream::connect(path).await {
+                return s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("monitor.control.sock never became connectable");
+    }
 
     fn request(body: envelope::Body) -> Envelope {
         Envelope {

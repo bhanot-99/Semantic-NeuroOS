@@ -202,4 +202,34 @@ mod tests {
             .is_err();
         assert!(timed_out, "paused sensor must not publish");
     }
+
+    /// Live proof (P3-S02): connects to the real compositor, binds
+    /// `ext_idle_notifier_v1` + `wl_seat` and enters the blocking dispatch
+    /// loop without erroring (triggering a real idle/resume transition
+    /// deterministically needs real user inactivity, so this only proves
+    /// setup succeeds) — run manually with `cargo test -p neuroos-monitor
+    /// -- --ignored idle_sensor_connects_to_a_real_compositor`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a real Wayland/COSMIC session; see doc comment"]
+    async fn idle_sensor_connects_to_a_real_compositor() {
+        let bus = EventBus::new(4);
+        let privacy = PrivacyState::new(Vec::new());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::task::spawn_blocking(move || run_once(60_000, &bus, &privacy)),
+        )
+        .await;
+        // Timing out means run_once is still parked in its dispatch loop —
+        // i.e. connect+bind succeeded. Returning early (Ok) would mean it
+        // hit ProtocolUnsupported/NoSeat/a real error instead.
+        assert!(
+            result.is_err(),
+            "run_once returned early: {:?}",
+            result.map(|r| r.map(|inner| inner.err()))
+        );
+        // See ADR-0009 / wayland_cosmic's own live test: the blocking thread
+        // above never returns, so let the process exit directly rather than
+        // hang on tokio::Runtime::drop waiting for it.
+        std::process::exit(0);
+    }
 }

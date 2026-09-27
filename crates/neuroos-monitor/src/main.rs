@@ -199,3 +199,62 @@ async fn record_loop(path: PathBuf, mut sub: neuroos_monitor::bus::EventSubscrib
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use super::*;
+
+    #[tokio::test]
+    async fn record_loop_writes_published_events_to_the_dump_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.bin");
+        let bus = EventBus::new(4);
+        let handle = tokio::spawn(record_loop(path.clone(), bus.subscribe()));
+
+        // record_loop opens the dump file before its first recv(); give it
+        // a moment, matching the same real-race handling other socket
+        // tests in this crate use.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bus.publish(neuroos_proto::v1::RawTelemetryEvent {
+            observed_at_ns: 99,
+            source: "test".into(),
+            payload: Some(neuroos_proto::v1::raw_telemetry_event::Payload::Idle(
+                neuroos_proto::v1::IdleEvent { idle: true },
+            )),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+
+        let mut reader = dump::DumpReader::open(&path).await.unwrap();
+        let event = reader.read_event().await.unwrap().unwrap();
+        assert_eq!(event.observed_at_ns, 99);
+    }
+
+    #[tokio::test]
+    async fn resource_and_focus_loop_publishes_a_resource_sample() {
+        let bus = EventBus::new(4);
+        let mut sub = bus.subscribe();
+        let privacy = PrivacyState::new(Vec::new());
+        let handle = tokio::spawn(resource_and_focus_loop(
+            std::time::Duration::from_millis(50),
+            bus,
+            privacy,
+        ));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("expected a resource sample within 5s");
+        handle.abort();
+        assert_eq!(event.source, "proc");
+    }
+
+    /// Live proof: needs a real Wayland/COSMIC session (same as
+    /// wayland_cosmic's own live tests) — run manually with `cargo test -p
+    /// neuroos-monitor -- --ignored focused_app_id`.
+    #[test]
+    #[ignore = "needs a real Wayland/COSMIC session"]
+    fn focused_app_id_resolves_the_real_activated_toplevel() {
+        assert!(focused_app_id().is_some());
+    }
+}

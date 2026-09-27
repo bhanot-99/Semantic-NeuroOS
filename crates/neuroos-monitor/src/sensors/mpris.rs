@@ -205,4 +205,30 @@ mod tests {
         );
         assert_eq!(metadata_array_str(&m, "xesam:artist"), "A, B");
     }
+
+    /// Live proof (P3-S03): connects to the real session bus, lists names
+    /// and watches for owner changes, without erroring — needs a real
+    /// D-Bus session, so `#[ignore]`d like the Wayland sensors' own live
+    /// tests, but `run_once`'s loop here is a plain async stream (no
+    /// blocking OS thread), so it aborts cleanly with no ADR-0009-style
+    /// runtime-drop hang.
+    #[tokio::test]
+    #[ignore = "needs a real D-Bus session bus"]
+    async fn mpris_sensor_connects_to_the_real_session_bus() {
+        let bus = EventBus::new(4);
+        let privacy = PrivacyState::new(Vec::new());
+        // Timing out (dropping the future) means connect + list_names +
+        // subscribe all succeeded and it's parked waiting for the next
+        // owner-change signal; an early Err would mean a real failure.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run_once(&bus, &privacy),
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(Err(e)) => panic!("run_once errored: {e}"),
+            Ok(Ok(())) => panic!("run_once returned Ok(()) unexpectedly"),
+        }
+    }
 }

@@ -47,3 +47,80 @@ async fn handle_subscriber(mut stream: UnixStream, mut sub: crate::bus::EventSub
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use super::*;
+    use neuroos_ipc::read_envelope;
+    use neuroos_proto::v1::raw_telemetry_event::Payload;
+    use neuroos_proto::v1::{IdleEvent, RawTelemetryEvent};
+
+    #[tokio::test]
+    async fn a_connected_client_receives_a_published_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.sock");
+        let bus = EventBus::new(8);
+        tokio::spawn(serve(path.clone(), vec![current_test_uid()], bus.clone()));
+
+        let mut client = wait_for_connect(&path).await;
+        // let the accept loop actually register the subscriber before
+        // publishing, or the event is published before anyone's listening.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        bus.publish(RawTelemetryEvent {
+            observed_at_ns: 42,
+            source: "test".into(),
+            payload: Some(Payload::Idle(IdleEvent { idle: true })),
+        });
+
+        let env = read_envelope(&mut client, DEFAULT_MAX_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        match env.body {
+            Some(envelope::Body::Telemetry(t)) => assert_eq!(t.observed_at_ns, 42),
+            other => panic!("expected Telemetry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_clients_each_get_their_own_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.sock");
+        let bus = EventBus::new(8);
+        tokio::spawn(serve(path.clone(), vec![current_test_uid()], bus.clone()));
+
+        let mut a = wait_for_connect(&path).await;
+        let mut b = wait_for_connect(&path).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        bus.publish(RawTelemetryEvent {
+            observed_at_ns: 7,
+            source: "test".into(),
+            payload: Some(Payload::Idle(IdleEvent { idle: false })),
+        });
+
+        for client in [&mut a, &mut b] {
+            let env = read_envelope(client, DEFAULT_MAX_FRAME)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(env.body, Some(envelope::Body::Telemetry(_))));
+        }
+    }
+
+    async fn wait_for_connect(path: &std::path::Path) -> UnixStream {
+        for _ in 0..50 {
+            if let Ok(s) = UnixStream::connect(path).await {
+                return s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("monitor.sock never became connectable");
+    }
+
+    fn current_test_uid() -> u32 {
+        crate::current_uid()
+    }
+}
