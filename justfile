@@ -32,7 +32,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf
+test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf test-cpp-ipc
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -56,6 +56,12 @@ test-sandboxed-echo: build-rust
 # health servers via health_mock_farm; RSS <= 15 MiB, one scrape cycle overhead low.
 test-healthd-pf: build-rust
     bash tests/contract/healthd_pf.sh
+
+# Phase 2 prerequisite infra: libneuroos's C++ IPC framing, UDS server/client,
+# SCM_RIGHTS fd passing (used to hand the token ring fd to C2) and the C++
+# health server, all real UDS round trips (not mocked).
+test-cpp-ipc: build-cpp
+    ./cpp/build/cpp-ipc-smoke
 
 # P0-S07 spike S-02: memfd seqlock ring, default scale + cross-language interop.
 # The 10M-message and ThreadSanitizer runs are spike evidence, not routine CI
