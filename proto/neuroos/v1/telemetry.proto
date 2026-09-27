@@ -121,3 +121,30 @@ enum FileActivityKind {
   FILE_ACTIVITY_KIND_DELETED = 3;
   FILE_ACTIVITY_KIND_RENAMED = 4;
 }
+
+// monitor.control.sock request/response pair (FR-PRV-01), kept off
+// monitor.sock's push-event stream on purpose (Architecture.md §5.2 lists
+// monitor.sock as server-push only; `neuroosctl` needs request/response).
+message MonitorPauseRequest {
+  // 0 = pause indefinitely (until an explicit resume). Ignored (treated as
+  // a resume) when `resume` is true.
+  uint64 duration_s = 1;
+  bool resume = 2;
+}
+
+message MonitorPauseResponse {
+  // Echoes the resulting state, same fields as MonitorStatusResponse's
+  // pause fields, so a client doesn't need a follow-up status call.
+  bool paused = 1;
+  uint64 paused_until_ns = 2; // 0 = not paused, u64::MAX = paused indefinitely
+}
+
+message MonitorStatusRequest {}
+
+message MonitorStatusResponse {
+  bool paused = 1;
+  uint64 paused_until_ns = 2;
+  repeated string excluded_app_ids = 3;
+  uint64 subscriber_count = 4;
+  uint64 events_dropped_total = 5;
+}

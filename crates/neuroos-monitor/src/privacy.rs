@@ -50,6 +50,14 @@ impl PrivacyState {
         self.excluded_app_ids.contains(app_id)
     }
 
+    /// Sorted for a deterministic `MonitorStatusResponse` (a `HashSet`'s
+    /// iteration order isn't stable).
+    pub fn excluded_app_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.excluded_app_ids.iter().cloned().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// The single gate every sensor event passes through before publication
     /// (FR-MON-08): excluded apps and paused periods never leave C1.
     pub fn allows(&self, app_id: Option<&str>, now_ns: u64) -> bool {

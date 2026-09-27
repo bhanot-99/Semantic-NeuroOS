@@ -2,10 +2,13 @@
 //! format. Split from `main.rs` so integration tests can drive real sensor
 //! and bus logic without needing a second process (mirrors
 //! `neuroos-healthd`'s split).
+pub mod anonymise;
 pub mod bus;
+pub mod control;
 pub mod dump;
 pub mod privacy;
 pub mod sensors;
+pub mod stream;
 
 pub fn current_uid() -> u32 {
     // SAFETY: getuid() takes no arguments and cannot fail.
