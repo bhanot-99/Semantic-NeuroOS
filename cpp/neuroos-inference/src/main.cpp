@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
 
     std::thread server_thread([&] {
         neuroos::inference::serve(neuroos::paths::runtime_dir() + "/inference.sock", {my_uid},
-                                  model.value(), lanes, rings);
+                                  model.value(), lanes, rings, config.max_context_tokens);
     });
 
     while (g_shutdown == 0) {
@@ -85,5 +85,8 @@ int main(int argc, char** argv) {
     // health_thread/server_thread loop forever inside blocking accept();
     // process exit reclaims them (matches neuroos-healthd's own shutdown
     // model — no graceful in-flight-request drain in Phase 2 scope).
-    std::quick_exit(0);
+    // std::exit (not quick_exit): runs atexit handlers/static destructors,
+    // which is what flushes gcov coverage counters to disk when built with
+    // --coverage — found while measuring Phase 2's coverage exit criterion.
+    std::exit(0);
 }

@@ -222,10 +222,31 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
         if (should_cancel()) {
             break; // FR-INF-05/06: bounded to at most one decode step
         }
-        llama_token next = llama_sampler_sample(chain.get(), ctx_, -1);
-        llama_sampler_accept(chain.get(), next);
+        llama_token next = 0;
+        bool have_next = false;
+        bool grammar_exhausted = false;
+        try {
+            // rules.md §8: wrap third-party code that throws at the
+            // boundary. llama.cpp's grammar sampler (llama-grammar.cpp)
+            // throws std::runtime_error ("Unexpected empty grammar stack
+            // after accepting piece") once a GBNF rule fully completes —
+            // found via testing (a real "yes"|"no" grammar reaching "no"):
+            // it doesn't signal completion by forcing EOS, it throws from
+            // the accept() call that completes the rule, *after* already
+            // sampling the correct final token. Treated as the grammar's
+            // own way of saying "generation is done", not a real failure —
+            // `next` is still the right token, just needs to be the last one.
+            next = llama_sampler_sample(chain.get(), ctx_, -1);
+            have_next = true;
+            llama_sampler_accept(chain.get(), next);
+        } catch (const std::exception& e) {
+            grammar_exhausted = true;
+        }
+        if (!have_next) {
+            break; // sampling itself failed before producing a token
+        }
 
-        bool eos = llama_vocab_is_eog(vocab, next);
+        bool eos = grammar_exhausted || llama_vocab_is_eog(vocab, next);
         GeneratedToken piece{static_cast<std::uint32_t>(next), token_to_text(vocab, next), eos};
         on_token(piece);
         if (eos) {

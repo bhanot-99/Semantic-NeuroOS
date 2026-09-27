@@ -4,6 +4,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 py_dir := "python/neuroos-knowledge-background"
 py_src_dir := py_dir / "src"
 cpp_build := "cpp/build"
+cpp_build_glob := "cpp/build*"
 
 # --- proto -----------------------------------------------------------------
 
@@ -84,12 +85,12 @@ test-shm: build-rust build-cpp
 
 fmt:
     cargo fmt --all
-    find cpp \( -path {{cpp_build}} -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 -i
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 -i
     cd {{py_dir}} && uv run ruff format
 
 fmt-check:
     cargo fmt --all -- --check
-    find cpp \( -path {{cpp_build}} -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 --dry-run --Werror
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 --dry-run --Werror
     cd {{py_dir}} && uv run ruff format --check
 
 # --- lint --------------------------------------------------------------------
@@ -100,7 +101,7 @@ lint-rust:
     cargo clippy --workspace --all-targets -- -D warnings
 
 lint-cpp: build-cpp
-    find cpp \( -path {{cpp_build}} -o -path cpp/third_party \) -prune -o -name '*.cpp' -print | xargs -r clang-tidy -p {{cpp_build}}
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o -name '*.cpp' -print | xargs -r clang-tidy -p {{cpp_build}}
 
 lint-py: proto-py
     cd {{py_dir}} && uv run ruff check src

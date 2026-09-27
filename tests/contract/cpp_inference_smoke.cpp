@@ -277,6 +277,74 @@ int main() {
         (void)bg_ring;
     }
 
+    // 6. GBNF grammar (PRD FR-INF-04, phases.md §5.2 P2-S05): force the real
+    // model to answer with exactly "yes" or "no", nothing else.
+    {
+        int fd = connect_or_die(sock_path);
+        neuroos::v1::Envelope req;
+        req.set_schema_version(1);
+        auto* gen = req.mutable_generate_request();
+        gen->set_prompt("Is water wet? Answer with exactly one word.");
+        gen->set_max_tokens(3);
+        gen->set_lane(neuroos::v1::LANE_INTERACTIVE);
+        gen->set_ring_name("smoke-test-ring");
+        gen->set_temperature(0.0F);
+        gen->set_grammar_gbnf("root ::= \"yes\" | \"no\"\n");
+        check(neuroos::ipc::write_envelope(fd, req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write grammar-constrained GenerateRequest");
+        auto resp = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
+        check(resp.has_value() && resp.value().has_value(), "read grammar-constrained GenerateResponse");
+        check(resp.value()->generate_response().accepted(), "grammar-constrained GenerateRequest must be accepted");
+        ::close(fd);
+
+        std::string generated;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto piece = reader.try_read();
+            if (!piece.has_value()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            generated.append(reinterpret_cast<const char*>(piece->payload.data()), piece->payload.size());
+            if ((piece->flags & neuroos::shm::kFlagEos) != 0 || generated == "yes" || generated == "no") {
+                break;
+            }
+        }
+        check(generated == "yes" || generated == "no",
+             ("grammar must force output to exactly \"yes\" or \"no\", got \"" + generated + "\"").c_str());
+        std::printf("OK: GBNF grammar -> real model output constrained to exactly \"%s\"\n",
+                   generated.c_str());
+    }
+
+    // 7. Oversized prompt rejected synchronously (phases.md §5.3 FI), not
+    // silently dropped after being queued.
+    {
+        int fd = connect_or_die(sock_path);
+        neuroos::v1::Envelope req;
+        req.set_schema_version(1);
+        auto* gen = req.mutable_generate_request();
+        // GetInfo (step 1) confirmed context_length; max_context_tokens for
+        // this run's config is 512 (see inference_smoke.sh) — one word
+        // repeated 2000 times tokenizes to well over that.
+        std::string huge_prompt;
+        for (int i = 0; i < 2000; ++i) {
+            huge_prompt += "word ";
+        }
+        gen->set_prompt(huge_prompt);
+        gen->set_max_tokens(1);
+        gen->set_lane(neuroos::v1::LANE_INTERACTIVE);
+        gen->set_ring_name("smoke-test-ring");
+        check(neuroos::ipc::write_envelope(fd, req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write oversized GenerateRequest");
+        auto resp = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
+        check(resp.has_value() && resp.value().has_value(), "read oversized-prompt GenerateResponse");
+        check(!resp.value()->generate_response().accepted(), "oversized prompt must be rejected, not accepted");
+        check(!resp.value()->generate_response().error().empty(), "rejection must include an error message");
+        std::printf("OK: oversized prompt rejected synchronously: \"%s\"\n",
+                   resp.value()->generate_response().error().c_str());
+        ::close(fd);
+    }
+
     std::printf("all cpp_inference_smoke checks passed\n");
     return 0;
 }
