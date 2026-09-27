@@ -9,3 +9,12 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
+neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
+neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
+neuroos-taint = { path = "../neuroos-taint", version = "0.1.0" }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"

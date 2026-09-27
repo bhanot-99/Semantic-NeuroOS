@@ -811,6 +811,15 @@ dependencies = [
 [[package]]
 name = "neuroos-storage"
 version = "0.1.0"
+dependencies = [
+ "neuroos-common",
+ "neuroos-ipc",
+ "neuroos-proto",
+ "neuroos-taint",
+ "proptest",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "neuroos-taint"
