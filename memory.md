@@ -35,7 +35,7 @@
 | Branch | `p3/s01-monitor` (built here; not yet merged to `main`); `p2/s01-inference` also still needs an owner merge decision |
 | Started | — |
 | Goal of this session | — |
-| Next concrete step | Owner decides how to handle the ≥8h real-usage recording exit criterion (phases.md §6.4) — see `reports/phase-03-monitor.md` §6 for the options put to them. Once ≥3 anonymised dumps (≥8h total) are committed to `tests/fixtures/telemetry/`, close Phase 3's gate and start Phase 4 (Semantic Storage Engine, C3). Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
+| Next concrete step | **Recording in progress** (owner chose "start now, stop later" 2026-09-27): `.dev-cache/telemetry-raw/record-loop.sh` running in the background (real desktop session, real `neuroos-monitor --record`), rotating to a fresh dump file every 3h so a long session becomes several dumps rather than one giant file. Raw dumps land in `.dev-cache/telemetry-raw/` (gitignored — never commit these directly, they have real content). When the owner says stop: `pkill -f record-loop.sh; pkill -f "neuroos-monitor --record"`, then for each `dump-*.bin` ≥ a few minutes long run `./target/release/neuroos-monitor anonymize <in> tests/fixtures/telemetry/<name>.bin`, confirm ≥3 dumps totaling ≥8h, commit the anonymised ones, then close Phase 3's gate (flip §5's row to ✅, update `reports/phase-03-monitor.md` §3/§6) and start Phase 4 (Semantic Storage Engine, C3). Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
 
 ---
 
