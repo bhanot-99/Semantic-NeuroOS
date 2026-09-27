@@ -7,5 +7,7 @@ pub mod assemble;
 pub mod deictic;
 pub mod evidence;
 pub mod graph_view;
+pub mod orchestrate;
 pub mod storage_client;
 pub mod taint_wrap;
+pub mod voice_client;

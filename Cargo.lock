@@ -3888,6 +3888,7 @@ dependencies = [
  "neuroos-proto",
  "neuroos-storage",
  "neuroos-taint",
+ "neuroos-testkit",
  "tempfile",
  "thiserror",
  "tokio",

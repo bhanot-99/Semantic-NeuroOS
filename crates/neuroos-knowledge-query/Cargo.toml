@@ -21,4 +21,5 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 neuroos-storage = { path = "../neuroos-storage", version = "0.1.0" }
+neuroos-testkit = { path = "../neuroos-testkit", version = "0.1.0" }
 tempfile = "3"
