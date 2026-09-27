@@ -1,14 +1,78 @@
-// C4 inference engine types
+// C4 inference engine types (Phase 2). The token stream itself travels over
+// the memfd seqlock ring (Architecture.md §5.5), not this socket — every
+// message here is control plane: start/cancel/attach-ring/introspect.
 syntax = "proto3";
 package neuroos.v1;
 
-// first-cut; full grammar/lane control set lands in Phase 2. Token stream itself
-// travels over the memfd seqlock ring (Architecture.md §5.5), not this socket.
-message InferRequest {
-  string prompt = 1;
-  uint32 max_tokens = 2;
+enum Lane {
+  LANE_UNSPECIFIED = 0;
+  LANE_INTERACTIVE = 1; // preempts; PRD FR-INF-06
+  LANE_BACKGROUND = 2;  // yields between decode steps; PRD FR-INF-06
 }
 
-message InferResponse {
-  string ring_shm_name = 1;   // informational; fd passed via SCM_RIGHTS out of band
+// As C5, I can send a prompt and receive a streamed completion (P2-S01).
+message GenerateRequest {
+  string prompt = 1;
+  uint32 max_tokens = 2;
+  Lane lane = 3;
+  string ring_name = 4;      // which attached ring (AttachRingRequest) to stream tokens into
+  float temperature = 5;     // 0.0 = greedy
+  uint64 seed = 6;           // 0 = engine picks a random seed
+  string grammar_gbnf = 7;   // empty = unconstrained; GBNF text (P2-S05)
+}
+
+message GenerateResponse {
+  uint64 generation_id = 1;  // correlates to the ring slots' generation_id (Architecture.md §5.5)
+  bool accepted = 2;
+  string error = 3;          // set iff !accepted (queue full, unknown ring_name, model not loaded)
+}
+
+// As C2, I can cancel a generation and it stops within one decode step (P2-S03).
+message CancelRequest {
+  uint64 generation_id = 1;
+}
+message CancelResponse {
+  bool cancelled = 1; // false if generation_id was already finished/unknown
+}
+
+// As C5, background distillation runs without delaying an interactive
+// request by more than one decode step (P2-S04). Distillation always runs
+// on LANE_BACKGROUND; its output also streams through a ring like Generate.
+message DistillRequest {
+  repeated string chunks = 1;
+  uint32 max_tokens = 2;
+  string ring_name = 3;
+}
+message DistillResponse {
+  uint64 generation_id = 1;
+  bool accepted = 2;
+  string error = 3;
+}
+
+// As C2, I receive generated text through a zero-copy shared-memory ring
+// (P2-S02): request a named ring; the response frame carries the memfd via
+// SCM_RIGHTS (framing.hpp's write_envelope_with_fd), not a field here.
+// Creates the ring on first use if `ring_name` is new.
+message AttachRingRequest {
+  string ring_name = 1;
+  uint32 capacity_slots = 2; // 0 = engine default (Architecture.md §5.5: 256 KiB / slot_size)
+  uint32 slot_size = 3;      // 0 = engine default
+}
+message AttachRingResponse {
+  bool ok = 1;
+  string error = 2; // set iff !ok
+}
+
+// GetInfo is also how tests count tokens without a full Generate call
+// (Architecture.md §5.1's "Tokenize/Count (for tests)"): set `tokenize_text`
+// to get `token_count` back alongside the model info.
+message GetInfoRequest {
+  string tokenize_text = 1; // empty = skip tokenization, just report model info
+}
+message GetInfoResponse {
+  string model_name = 1;
+  uint32 context_length = 2;
+  uint64 vocab_size = 3;
+  string build_info = 4;
+  uint32 token_count = 5; // valid iff request's tokenize_text was non-empty
 }
