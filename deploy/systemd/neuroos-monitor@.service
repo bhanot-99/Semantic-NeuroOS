@@ -17,7 +17,12 @@ Environment=NEUROOS_RUNTIME_DIR=/run/user/%i/neuroos
 PrivateNetwork=true
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=tmpfs
+# Deviates from the shared ProtectHome=tmpfs baseline (Architecture.md §8.1):
+# FR-MON-09's folder sensor needs read access to whatever git/notes/ICS
+# paths the operator configures under [[monitor.folders]] in config.toml,
+# which can be anywhere under $HOME and isn't known at unit-authoring time.
+# read-only still blocks every write.
+ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

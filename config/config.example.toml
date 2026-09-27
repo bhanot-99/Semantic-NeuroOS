@@ -1,1 +1,25 @@
 # example operator configuration, copy to config.toml
+
+[monitor]
+# FR-MON-02: ext_idle_notify_v1 timeout before "idle" fires.
+idle_timeout_s = 60
+# FR-MON-04: system CPU/memory sampling period.
+resource_sample_interval_s = 5
+# FR-PRV-02: app_ids never emitted, merged with the built-in password-manager
+# defaults (org.keepassxc.KeePassXC, com.bitwarden.desktop, 1password, ...)
+# unless exclude_defaults = false.
+excluded_app_ids = []
+exclude_defaults = true
+# Event bus capacity: RawTelemetryEvents buffered per monitor.sock subscriber
+# before the oldest is dropped and the drop counter increments.
+bus_capacity = 4096
+
+# FR-MON-09 (P1): folders watched for file activity. `label` becomes
+# FileActivityEvent.watch_label.
+# [[monitor.folders]]
+# label = "git"
+# path = "/home/user/projects/my-repo"
+#
+# [[monitor.folders]]
+# label = "notes"
+# path = "/home/user/Notes"
