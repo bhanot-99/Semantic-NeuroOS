@@ -36,6 +36,8 @@ pub struct Config {
     pub inference: InferenceConfig,
     #[serde(default)]
     pub monitor: MonitorConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 /// `[inference]` (Phase 2, C++ `neuroos-inference`): see the module doc
@@ -196,6 +198,30 @@ fn default_true() -> bool {
     true
 }
 
+/// `[storage]` (Phase 4/5, C3 `neuroos-storage`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Architecture.md §8.2's fixed Landlock read-only path for C3's
+    /// embedding model + ONNX Runtime. Overridable for dev/test (e.g.
+    /// `.dev-cache/models`, since `/opt/neuroos/models` needs root to
+    /// populate and isn't present on this dev machine).
+    #[serde(default = "default_models_dir")]
+    pub models_dir: PathBuf,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            models_dir: default_models_dir(),
+        }
+    }
+}
+
+fn default_models_dir() -> PathBuf {
+    PathBuf::from("/opt/neuroos/models")
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FolderWatch {
@@ -326,6 +352,21 @@ mod tests {
         assert_eq!(cfg.monitor.idle_timeout_s, 30);
         assert_eq!(cfg.monitor.folders.len(), 1);
         assert_eq!(cfg.monitor.folders[0].label, "git");
+    }
+
+    #[test]
+    fn storage_models_dir_defaults_to_the_fixed_opt_path() {
+        let cfg = Config::default();
+        assert_eq!(cfg.storage.models_dir, PathBuf::from("/opt/neuroos/models"));
+    }
+
+    #[test]
+    fn parses_a_storage_section_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[storage]\nmodels_dir = \"/tmp/dev-models\"\n").unwrap();
+        let cfg = load_config_from(&path).unwrap();
+        assert_eq!(cfg.storage.models_dir, PathBuf::from("/tmp/dev-models"));
     }
 
     #[test]

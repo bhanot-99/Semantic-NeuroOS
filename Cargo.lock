@@ -3880,6 +3880,19 @@ version = "0.1.0"
 [[package]]
 name = "neuroos-knowledge-query"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "neuroos-common",
+ "neuroos-health",
+ "neuroos-ipc",
+ "neuroos-proto",
+ "neuroos-storage",
+ "neuroos-taint",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "neuroos-monitor"

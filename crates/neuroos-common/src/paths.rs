@@ -91,6 +91,38 @@ pub fn monitor_control_sock() -> PathBuf {
     runtime_dir().join("monitor.control.sock")
 }
 
+/// `<runtime_dir>/storage.sock` (Architecture.md §5.2: C3 request/response,
+/// clients C5a/C5b/C6/`neuroosctl`).
+pub fn storage_sock() -> PathBuf {
+    runtime_dir().join("storage.sock")
+}
+
+/// `<runtime_dir>/inference.sock` (Architecture.md §5.2: C4 request/response
+/// + fd passing, clients C5a/C2).
+pub fn inference_sock() -> PathBuf {
+    runtime_dir().join("inference.sock")
+}
+
+/// `<runtime_dir>/knowledge.sock` (Architecture.md §5.2: C5a request/response
+/// + progress stream, clients C2/`neuroosctl ask`).
+pub fn knowledge_sock() -> PathBuf {
+    runtime_dir().join("knowledge.sock")
+}
+
+/// `<runtime_dir>/voice.sock` (Architecture.md §5.2: C2 request/response,
+/// client C5a). C2 itself lands in Phase 6; Phase 5 talks to a mock server
+/// bound at this same path.
+pub fn voice_sock() -> PathBuf {
+    runtime_dir().join("voice.sock")
+}
+
+/// `<runtime_dir>/kernel.sock` (Architecture.md §5.2: C6 request/response,
+/// clients C5a/`neuroosctl`). C6 itself lands in Phase 7; Phase 5 talks to a
+/// mock server bound at this same path.
+pub fn kernel_sock() -> PathBuf {
+    runtime_dir().join("kernel.sock")
+}
+
 /// `/opt/neuroos/models/` — read-only, never written by any component.
 pub fn models_dir() -> PathBuf {
     PathBuf::from("/opt/neuroos/models")
