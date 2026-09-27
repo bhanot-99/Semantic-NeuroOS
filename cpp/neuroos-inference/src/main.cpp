@@ -82,11 +82,14 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     spdlog::info("shutting down");
-    // health_thread/server_thread loop forever inside blocking accept();
-    // process exit reclaims them (matches neuroos-healthd's own shutdown
-    // model — no graceful in-flight-request drain in Phase 2 scope).
-    // std::exit (not quick_exit): runs atexit handlers/static destructors,
-    // which is what flushes gcov coverage counters to disk when built with
-    // --coverage — found while measuring Phase 2's coverage exit criterion.
-    std::exit(0);
+    // health_thread/server_thread loop forever inside blocking accept(), and
+    // their per-connection threads hold references into `lanes`/`model`/etc
+    // that outlive this scope. std::quick_exit (not std::exit): std::exit
+    // runs static destructors while those detached threads are still live —
+    // tried it while measuring coverage, and it segfaults (a destructor
+    // racing a still-running worker thread's use of the same object).
+    // quick_exit skips destructors entirely, matching neuroos-healthd's own
+    // documented shutdown model (no graceful in-flight-request drain in
+    // Phase 2 scope): the OS reclaims everything on process exit regardless.
+    std::quick_exit(0);
 }

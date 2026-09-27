@@ -213,7 +213,11 @@ int main() {
         breq.set_schema_version(1);
         auto* bgen = breq.mutable_generate_request();
         bgen->set_prompt("The history of the Roman Empire began");
-        bgen->set_max_tokens(400);
+        std::uint32_t bg_max_tokens = 400;
+        if (const char* override_tokens = std::getenv("NEUROOS_TEST_BG_MAX_TOKENS")) {
+            bg_max_tokens = static_cast<std::uint32_t>(std::strtoul(override_tokens, nullptr, 10));
+        }
+        bgen->set_max_tokens(bg_max_tokens);
         bgen->set_lane(neuroos::v1::LANE_BACKGROUND);
         bgen->set_ring_name("preempt-bg-ring");
         check(neuroos::ipc::write_envelope(bfd, breq, neuroos::ipc::kDefaultMaxFrame).has_value(),
@@ -245,7 +249,11 @@ int main() {
 
         auto it_reader = it_ring.reader();
         int it_pieces = 0;
-        auto it_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        int it_deadline_s = 10;
+        if (const char* override_s = std::getenv("NEUROOS_TEST_PREEMPTION_DEADLINE_S")) {
+            it_deadline_s = std::atoi(override_s);
+        }
+        auto it_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(it_deadline_s);
         while (std::chrono::steady_clock::now() < it_deadline && it_pieces < 4) {
             if (it_reader.try_read().has_value()) {
                 ++it_pieces;
@@ -260,8 +268,15 @@ int main() {
         // A generous bound: 4 interactive tokens plus scheduling/preemption
         // overhead should complete in well under the time 400 background
         // tokens would take (400 * ~60 ms/token ~= 24 s) if preemption
-        // wasn't working and interactive had to wait its turn.
-        check(it_latency_ms < 5000.0,
+        // wasn't working and interactive had to wait its turn. Configurable
+        // via NEUROOS_TEST_PREEMPTION_MAX_MS for a slow (e.g. -O0 coverage)
+        // build of neuroos-inference itself, which is proportionally slower
+        // across the board, not specifically because preemption broke.
+        double max_ms = 5000.0;
+        if (const char* override_ms = std::getenv("NEUROOS_TEST_PREEMPTION_MAX_MS")) {
+            max_ms = std::strtod(override_ms, nullptr);
+        }
+        check(it_latency_ms < max_ms,
              "interactive job took too long under background load - preemption may not be working");
         std::printf("OK: interactive preemption -> %d interactive token(s) completed in %.1f ms "
                    "while a real 400-token background job was running\n",
