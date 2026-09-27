@@ -38,6 +38,12 @@ message Envelope {
 
     IngestRequest        ingest_request  = 40;
     IngestResponse       ingest_response = 41;
+    QueryFocusHistoryRequest  query_focus_history_request  = 42;
+    QueryFocusHistoryResponse query_focus_history_response = 43;
+    QueryHybridRequest        query_hybrid_request         = 44;
+    QueryHybridResponse       query_hybrid_response        = 45;
+    ForgetRequest              forget_request  = 46;
+    ForgetResponse             forget_response = 47;
 
     GenerateRequest      generate_request     = 60;
     GenerateResponse     generate_response    = 61;

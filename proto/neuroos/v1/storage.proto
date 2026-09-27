@@ -2,7 +2,8 @@
 syntax = "proto3";
 package neuroos.v1;
 
-// first-cut; full ingest/query/adapter set lands in Phase 4
+import "neuroos/v1/common.proto";
+
 message IngestRequest {
   string source = 1;
   bytes payload = 2;
@@ -10,4 +11,58 @@ message IngestRequest {
 
 message IngestResponse {
   bool accepted = 1;
+}
+
+// FR-STO-06 / Architecture.md §6.1: the deictic-snap query ("what was I
+// looking at when I said this").
+message QueryFocusHistoryRequest {
+  uint64 t_ns = 1;
+  uint64 window_ns = 2;
+}
+
+message FocusHistoryRow {
+  string app_id = 1;
+  string title = 2;
+  uint32 pid = 3;
+  uint32 root_pid = 4;
+  uint64 t_start_ns = 5;
+  uint64 t_end_ns = 6;
+  uint64 dwell_ms = 7;
+}
+
+message QueryFocusHistoryResponse {
+  // unset (prost: None) iff nothing overlapped the window.
+  FocusHistoryRow row = 1;
+}
+
+// FR-STO-05 / FR-KNO-03: QueryHybridVectorText.
+message QueryHybridRequest {
+  string text = 1;
+  uint32 top_k = 2;
+}
+
+message ChunkMatch {
+  string chunk_id = 1;
+  int64 entity_id = 2;
+  string text = 3;
+  Taint taint = 4;
+  uint64 t_ns = 5;
+  string domain = 6;
+  float distance = 7;
+}
+
+message QueryHybridResponse {
+  repeated ChunkMatch matches = 1;
+}
+
+// FR-STO-12 / FR-PRV-03: forget a time range or an app.
+message ForgetRequest {
+  oneof target {
+    string app_id = 1;
+    uint64 since_ns = 2;
+  }
+}
+
+message ForgetResponse {
+  uint64 forgotten = 1;
 }
