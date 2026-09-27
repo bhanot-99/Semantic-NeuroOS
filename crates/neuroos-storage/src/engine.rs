@@ -138,6 +138,39 @@ impl StorageEngine {
         })
         .await
     }
+
+    /// FR-STO-12/FR-PRV-03: forgets everything tied to `app_id` — SQLite
+    /// rows and their matching LanceDB chunks (`entity_id IN (...)`, safe
+    /// to build directly since only our own `i64` entity ids are
+    /// interpolated, never user text). Returns how many entities were
+    /// forgotten.
+    pub async fn forget_by_app(&mut self, app_id: &str) -> Result<usize, EngineError> {
+        let entity_ids = crate::sqlite::forget_by_app(&self.conn, app_id)?;
+        self.delete_lance_rows(&entity_ids).await?;
+        Ok(entity_ids.len())
+    }
+
+    /// Same, but for everything at or after `since_ns`.
+    pub async fn forget_since(&mut self, since_ns: u64) -> Result<usize, EngineError> {
+        let entity_ids = crate::sqlite::forget_since(&self.conn, since_ns)?;
+        self.delete_lance_rows(&entity_ids).await?;
+        Ok(entity_ids.len())
+    }
+
+    async fn delete_lance_rows(&self, entity_ids: &[i64]) -> Result<(), EngineError> {
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+        let ids = entity_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.lance
+            .delete_all_families(&format!("entity_id IN ({ids})"))
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +256,73 @@ mod tests {
             results.iter().any(|r| r.text.contains("revenue")),
             "expected the ingested revenue-dashboard chunk among results: {results:?}"
         );
+    }
+
+    /// Live proof (P4-S09): a real ingested+embedded document is actually
+    /// gone from both SQLite and LanceDB after forget_by_app — needs the
+    /// real model + onnxruntime fetched, so `#[ignore]`d like this crate's
+    /// other real-download-dependent tests.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn forget_by_app_removes_the_entity_and_its_lance_chunk() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::Opened(WindowOpened {
+                    app_id: "org.mozilla.firefox".into(),
+                    title: "quarterly revenue dashboard".into(),
+                    pid: 0,
+                    pid_known: false,
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::StateChanged(WindowStateChanged {
+                    states: vec![ToplevelState::Activated as i32],
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                6_000_000_000,
+                Kind::StateChanged(WindowStateChanged { states: vec![] }),
+            ))
+            .await
+            .unwrap();
+        assert!(!engine.query_hybrid("revenue", 1).await.unwrap().is_empty());
+
+        let forgotten = engine.forget_by_app("org.mozilla.firefox").await.unwrap();
+        assert_eq!(forgotten, 1);
+        assert!(
+            engine.query_hybrid("revenue", 1).await.unwrap().is_empty(),
+            "the forgotten chunk must no longer be found by vector search"
+        );
+        let entities: i64 = engine
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE label = 'org.mozilla.firefox'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(entities, 0);
     }
 }

@@ -197,6 +197,55 @@ pub fn query_focus_history(
     .map_err(StorageError::from)
 }
 
+/// FR-STO-12/FR-PRV-03 ("forget"): deletes every row tied to `app_id`
+/// (entities, their chunk metadata, focus history, event counters) and
+/// returns the deleted entities' ids, so the caller can also purge the
+/// matching LanceDB rows (`entity_id IN (...)`).
+pub fn forget_by_app(conn: &Connection, app_id: &str) -> Result<Vec<i64>, StorageError> {
+    let entity_ids = collect_ids(conn, "SELECT id FROM entities WHERE label = ?1", [app_id])?;
+    conn.execute(
+        "DELETE FROM chunks_meta WHERE entity_id IN (SELECT id FROM entities WHERE label = ?1)",
+        [app_id],
+    )?;
+    conn.execute("DELETE FROM entities WHERE label = ?1", [app_id])?;
+    conn.execute("DELETE FROM focus_history WHERE app_id = ?1", [app_id])?;
+    conn.execute("DELETE FROM event_counters WHERE key = ?1", [app_id])?;
+    Ok(entity_ids)
+}
+
+/// Same, but for everything at or after `since_ns` (an absolute UTC-ns
+/// cutoff — `neuroosctl forget --since 1h` becomes `since_ns = now - 1h`
+/// at the call site, not in here, so this stays a pure "delete after X"
+/// primitive).
+pub fn forget_since(conn: &Connection, since_ns: u64) -> Result<Vec<i64>, StorageError> {
+    let since = since_ns as i64;
+    let entity_ids = collect_ids(
+        conn,
+        "SELECT id FROM entities WHERE created_ns >= ?1",
+        [since],
+    )?;
+    conn.execute(
+        "DELETE FROM chunks_meta WHERE entity_id IN (SELECT id FROM entities WHERE created_ns >= ?1)",
+        [since],
+    )?;
+    conn.execute("DELETE FROM entities WHERE created_ns >= ?1", [since])?;
+    conn.execute("DELETE FROM focus_history WHERE t_start_ns >= ?1", [since])?;
+    conn.execute("DELETE FROM event_counters WHERE first_ns >= ?1", [since])?;
+    Ok(entity_ids)
+}
+
+fn collect_ids<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<i64>, StorageError> {
+    let mut stmt = conn.prepare(sql)?;
+    let ids = stmt
+        .query_map(params, |row| row.get(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
@@ -358,5 +407,104 @@ mod tests {
         seed_two_sessions(&conn);
         let row = query_focus_history(&conn, 100_000_000_000, 1_500_000_000).unwrap();
         assert_eq!(row, None);
+    }
+
+    #[test]
+    fn forget_by_app_deletes_only_that_apps_rows() {
+        let conn = open_in_memory().unwrap();
+        seed_two_sessions(&conn); // "editor" and "browser"
+        let editor_id = upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "editor",
+            TaintFlags::empty(),
+            1,
+            false,
+        )
+        .unwrap();
+        upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "browser",
+            TaintFlags::empty(),
+            1,
+            false,
+        )
+        .unwrap();
+        touch_event_counter(&conn, "window_focus", "editor", 1, 0).unwrap();
+
+        let deleted = forget_by_app(&conn, "editor").unwrap();
+        assert_eq!(deleted, vec![editor_id]);
+
+        let remaining_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM focus_history WHERE app_id = 'editor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_history, 0);
+        let browser_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM focus_history WHERE app_id = 'browser'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            browser_history, 1,
+            "forgetting one app must not touch another"
+        );
+        let editor_counters: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_counters WHERE key = 'editor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(editor_counters, 0);
+    }
+
+    #[test]
+    fn forget_since_deletes_only_rows_at_or_after_the_cutoff() {
+        let conn = open_in_memory().unwrap();
+        seed_two_sessions(&conn); // editor: t_start=1s, browser: t_start=5s
+        upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "editor",
+            TaintFlags::empty(),
+            1_000_000_000,
+            false,
+        )
+        .unwrap();
+        upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "browser",
+            TaintFlags::empty(),
+            5_000_000_000,
+            false,
+        )
+        .unwrap();
+
+        let deleted = forget_since(&conn, 3_000_000_000).unwrap();
+        assert_eq!(deleted.len(), 1); // only "browser"'s entity (created_ns=5s)
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM focus_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "only editor's (t_start=1s) session should remain"
+        );
+        let app_id: String = conn
+            .query_row("SELECT app_id FROM focus_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(app_id, "editor");
     }
 }

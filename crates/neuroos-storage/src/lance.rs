@@ -244,6 +244,23 @@ impl LanceStore {
         all.truncate(top_k);
         Ok(all)
     }
+
+    /// FR-STO-12 ("forget"): deletes every row matching `predicate` (a
+    /// LanceDB SQL-like filter, e.g. `"entity_id IN (1,2,3)"`) from one
+    /// family.
+    pub async fn delete(&self, family: &str, predicate: &str) -> Result<(), LanceError> {
+        let table = self.ensure_table(family).await?;
+        table.delete(predicate).await?;
+        Ok(())
+    }
+
+    /// Same, across every family — "forget" isn't scoped to one domain.
+    pub async fn delete_all_families(&self, predicate: &str) -> Result<(), LanceError> {
+        for family in FAMILIES {
+            self.delete(family, predicate).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +340,25 @@ mod tests {
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_matching_rows_by_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        let mut a = chunk("a", vec![1.0; EMBEDDING_DIM as usize]);
+        a.entity_id = 1;
+        let mut b = chunk("b", vec![1.0; EMBEDDING_DIM as usize]);
+        b.entity_id = 2;
+        store.insert("attention", &[a, b]).await.unwrap();
+
+        store.delete("attention", "entity_id = 1").await.unwrap();
+        let remaining = store
+            .query("attention", &[1.0; EMBEDDING_DIM as usize], 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].chunk_id, "b");
     }
 
     #[tokio::test]
