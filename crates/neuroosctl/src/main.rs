@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
-use neuroos_proto::v1::{AggregateStatusRequest, ComponentStatus, Envelope, Status, envelope};
+use neuroos_proto::v1::{
+    AggregateStatusRequest, ComponentStatus, Envelope, MonitorPauseRequest, MonitorStatusRequest,
+    Status, envelope,
+};
 use serde::Serialize;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,6 +26,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Stop all C1 sensing until resumed (FR-PRV-01, P3-S05).
+    Pause {
+        /// Pause for this many seconds, then auto-resume. Omit to pause
+        /// indefinitely (until an explicit `neuroosctl resume`).
+        duration: Option<u64>,
+    },
+    /// Resume C1 sensing after a `pause` (FR-PRV-01, P3-S05).
+    Resume,
+    /// Show C1's pause state, exclusion list and event-bus counters.
+    MonitorStatus,
 }
 
 #[derive(Serialize, Debug)]
@@ -49,8 +62,101 @@ async fn main() {
     let cli = Cli::parse();
     let exit_code = match cli.command {
         Commands::Status { json } => run_status(json).await,
+        Commands::Pause { duration } => run_pause(duration, false).await,
+        Commands::Resume => run_pause(None, true).await,
+        Commands::MonitorStatus => run_monitor_status().await,
     };
     std::process::exit(exit_code);
+}
+
+async fn monitor_control_request(body: envelope::Body) -> Result<Envelope, String> {
+    let socket_path = neuroos_common::paths::monitor_control_sock();
+    let mut stream = connect(&socket_path, REQUEST_TIMEOUT)
+        .await
+        .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
+    let request = Envelope {
+        schema_version: 1,
+        trace_id: String::new(),
+        request_id: 0,
+        sent_at_ns: neuroos_common::now_ns(),
+        body: Some(body),
+    };
+    write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
+        .await
+        .map_err(|e| format!("write request: {e}"))?;
+    read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
+        .await
+        .map_err(|e| format!("read response: {e}"))?
+        .ok_or_else(|| "neuroos-monitor closed the connection with no response".to_string())
+}
+
+async fn run_pause(duration: Option<u64>, resume: bool) -> i32 {
+    let response =
+        monitor_control_request(envelope::Body::MonitorPauseRequest(MonitorPauseRequest {
+            duration_s: duration.unwrap_or(0),
+            resume,
+        }))
+        .await;
+    match response {
+        Ok(Envelope {
+            body: Some(envelope::Body::MonitorPauseResponse(r)),
+            ..
+        }) => {
+            if r.paused {
+                match r.paused_until_ns {
+                    u64::MAX => println!("monitor paused indefinitely"),
+                    ns => println!(
+                        "monitor paused for {}s",
+                        ns.saturating_sub(neuroos_common::now_ns()) / 1_000_000_000
+                    ),
+                }
+            } else {
+                println!("monitor resumed");
+            }
+            0
+        }
+        Ok(other) => {
+            eprintln!("neuroosctl: unexpected response: {other:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("neuroosctl: could not reach neuroos-monitor: {e}");
+            1
+        }
+    }
+}
+
+async fn run_monitor_status() -> i32 {
+    let response = monitor_control_request(envelope::Body::MonitorStatusRequest(
+        MonitorStatusRequest {},
+    ))
+    .await;
+    match response {
+        Ok(Envelope {
+            body: Some(envelope::Body::MonitorStatusResponse(r)),
+            ..
+        }) => {
+            println!("paused: {}", r.paused);
+            if r.paused {
+                match r.paused_until_ns {
+                    u64::MAX => println!("paused_until: indefinite"),
+                    ns => println!("paused_until_ns: {ns}"),
+                }
+            }
+            println!("excluded_app_ids: {}", r.excluded_app_ids.join(", "));
+            println!("subscribers: {}", r.subscriber_count);
+            println!("events_dropped_total: {}", r.events_dropped_total);
+            0
+        }
+        Ok(other) => {
+            eprintln!("neuroosctl: unexpected response: {other:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("neuroosctl: could not reach neuroos-monitor: {e}");
+            1
+        }
+    }
 }
 
 async fn run_status(json: bool) -> i32 {
