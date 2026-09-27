@@ -9,3 +9,16 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
+neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
+neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
+neuroos-taint = { path = "../neuroos-taint", version = "0.1.0" }
+neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+neuroos-storage = { path = "../neuroos-storage", version = "0.1.0" }
+tempfile = "3"
