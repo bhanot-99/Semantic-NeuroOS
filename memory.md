@@ -16,13 +16,13 @@
 | Field | Value |
 | :--- | :--- |
 | Last updated | 2026-09-27 |
-| Project stage | Phase 0 done (owner signed off); Phase 1 (healthd) done, merged to `main` (PR #2); Phase 2 (Inference) done, merged to `main` (PR #3); **Phase 3 (Monitor) fully done except one item: a background recording is running now to satisfy the ≥8h real-usage fixture requirement — everything else (all 7 stories, all other exit criteria) is complete and verified** |
-| Current phase | **Phase 3 — Desktop Telemetry Monitor (C1)** — done pending recording results (see `reports/phase-03-monitor.md` §6) |
-| Current sprint | Sprint 3 |
-| Current story | — (P3-S01…S07 all done; only remaining action is waiting for the background recording to accumulate ≥8h, then anonymise+commit) |
-| Overall progress | 3 / 11 phases fully done and merged (Phase 0, Phase 1, Phase 2); Phase 3 done pending the recording, on branch `p3/s01-monitor` (PR open) |
-| Health | 🟢 On track — Phase 3 is otherwise complete; Phase 4 starts once the recording finishes (phases.md §7: "Depends on: P0, P3 dumps") |
-| Next milestone | M1 done (healthd + inference); Phase 3 sensing built and merged; Phase 4 (storage) starts once the recording is done |
+| Project stage | Phase 0 done (owner signed off); Phase 1 (healthd) done, merged (PR #2); Phase 2 (Inference) done, merged (PR #3); Phase 3 (Monitor) done and merged (PR #4) except the ≥8h recording, which was stopped mid-attempt (found a real bug, see §8) and will be redone fresh next session; **Phase 4 (Storage) in progress on `p4/s01-storage`: P4-S01…S03 done (ingest filter, domain adapters+taint, real embedder+LanceDB+hybrid query, all live-verified)** |
+| Current phase | **Phase 4 — Semantic Storage Engine (C3)** — building everything not blocked on the recording (owner's explicit direction); soak-replay gate stays blocked until fresh dumps exist |
+| Current sprint | Sprint 4 |
+| Current story | P4-S04 next (`QueryFocusHistory`) — see §4 sprint board for the full backlog |
+| Overall progress | 3 / 11 phases fully done and merged (Phase 0, 1, 2); Phase 3 merged, recording redo pending; Phase 4 in progress on branch `p4/s01-storage` |
+| Health | 🟢 On track | 
+| Next milestone | M1 done; Phase 3 sensing merged; Phase 4 storage engine underway, soak-replay gate blocked on a fresh recording |
 
 ---
 
@@ -30,12 +30,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Story | — (all P3-S01…S07 done; nothing left to build for Phase 3) |
-| File(s) being edited | — |
-| Branch | `p3/s01-monitor`, PR open against `main` (code merges independently of the recording — see below) |
-| Started | — |
-| Goal of this session | — |
-| Next concrete step | **Recording in progress, everything else done.** `.dev-cache/telemetry-raw/record-loop.sh` runs in the background (real desktop session, real `neuroos-monitor --record`), rotating to a fresh dump file every 3h so a long session becomes several dumps rather than one giant file. Raw dumps land in `.dev-cache/telemetry-raw/` (gitignored — never commit these directly, they have real content). When the owner says stop: `pkill -f record-loop.sh; pkill -f "neuroos-monitor --record"`, then for each `dump-*.bin` ≥ a few minutes long run `./target/release/neuroos-monitor anonymize <in> tests/fixtures/telemetry/<name>.bin`, confirm ≥3 dumps totaling ≥8h, commit the anonymised ones (a small follow-up commit/PR, same as how Phase 0's flagged deviations were closed after its own merge), flip §5's Phase 3 row to ✅ Done and `reports/phase-03-monitor.md`'s status to Passed, then start Phase 4 (Semantic Storage Engine, C3). Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
+| Story | P4-S04 (`QueryFocusHistory`) next; P4-S01…S03 done this session |
+| File(s) being edited | `crates/neuroos-storage/src/{ingest/filter.rs, adapters/mod.rs, sqlite.rs, embed.rs, lance.rs, engine.rs}` |
+| Branch | `p4/s01-storage` (not yet pushed/PR'd) |
+| Started | 2026-09-27 |
+| Goal of this session | Build as much of Phase 4 as possible without depending on the (currently stopped, to-be-redone) recording |
+| Next concrete step | **Recording stopped, will redo fresh next session.** The first attempt (started 2026-09-27 15:55) hit the `resource_and_focus_loop` bug (see §8 tech debt) partway through — its dumps (`.dev-cache/telemetry-raw/dump-20260927-{155501,185501}.bin`, ~4h combined) have real idle/window/mpris/process-tree events but zero real `system_resource` samples. Owner stopped it (laptop shutdown) rather than restart immediately; next session, start clean with the already-fixed release binary: `cargo build --release -p neuroos-monitor` (rebuilds fast, already done once), then `.dev-cache/telemetry-raw/record-loop.sh`. The two old dumps are still on disk if worth keeping as partial data — otherwise `rm .dev-cache/telemetry-raw/dump-2026*.bin` before the fresh run so filenames don't confuse which is complete. Once ≥3 fresh dumps totaling ≥8h exist: anonymise each (`neuroos-monitor anonymize <in> tests/fixtures/telemetry/<name>.bin`), commit, flip §5's Phase 3 row to ✅ Done and `reports/phase-03-monitor.md`'s status to Passed. Meanwhile Phase 4 continues on `p4/s01-storage` for everything not blocked on real dumps (see §4 sprint board) — owner explicitly asked to build as much of Phase 4 as possible without waiting on the recording. Blueprints still need moving to `docs/blueprints/` (deferred since P0-S01, still not done). |
 
 ---
 
@@ -45,6 +45,7 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 
 | Date | Phase / Story | Completed | Evidence |
 | :--- | :--- | :--- | :--- |
+| 2026-09-27 | P4-S01…S03 | Built the first 3 Phase 4 stories on new branch `p4/s01-storage`: real `neuroos-taint` (TaintFlags + union-only propagate()), the 4-stage ingest filter (PPID collapse, self-observation exclusion, promotion gate — N>=3 focus sessions or >5s dwell, MPRIS demotion), SQLite schema + migration runner (meta.sqlite3, WAL), domain adapters mapping filtered events to 10 of Architecture.md §7.3's 13 domains (the other 3 have non-C1 sources), a real FastEmbed embedder, a real LanceDB vector store (one table per domain family), and `StorageEngine` tying all of it into one real ingest/query pipeline. Live-verified end to end, not mocked: a real focus session's title got embedded and stored, then a real `query_hybrid("revenue numbers")` call found it by vector similarity. Found and fixed 3 real things: fastembed needs 3 more tokenizer files beyond tokenizer.json (config.json/tokenizer_config.json/special_tokens_map.json), fetched and verified for real; `ort` 2.0.0-rc.13 (fastembed's pinned dep) rejects ONNX Runtime < 1.24.x, so re-fetched 1.30.0 instead of the initially-chosen 1.19.2; lancedb 0.38/0.39 both fail to compile with `default-features = false` (an `Error::Http` variant referenced unconditionally in job.rs but `#[cfg(feature="remote")]`-gated in error.rs — a real upstream bug), worked around by pinning lancedb =0.15 (predates that code). Also found and fixed a **pre-existing Phase 3 bug** while debugging the live pipeline test: `neuroos-monitor`'s `resource_and_focus_loop` recreated `sampler` fresh every tick, silently resetting its delta-tracking state so `ResourceSample`/`system_resource` has never actually published a real event since Phase 3 — this means the recording that was already ~4h in when this was found has zero real resource samples; owner stopped it (laptop shutdown) rather than restart immediately, fresh attempt with the now-fixed binary pending next session. | `crates/neuroos-storage/src/{ingest,adapters,sqlite,embed,lance,engine}.rs`; `models/manifest.toml` (ONNX Runtime + tokenizer files) |
 | 2026-09-27 | Phase 3 (all stories) | Built all 7 stories from scratch on `p3/s01-monitor`: real typed `telemetry.proto` schema (was a generic-bytes placeholder), `EventBus` (tokio broadcast, bounded+drop-counted), `PrivacyState` (pause+exclusion gate, property-tested), push-event COSMIC toplevel sensor (upgraded from the P0-S08 one-shot spike), `ext_idle_notify_v1` idle sensor, zbus-based MPRIS watcher, `/proc` resource sampler + process-tree snapshot, `notify`-based folder watcher, `monitor.sock` push server + new `monitor.control.sock` request/response channel, `--record`/anonymiser, and `neuroosctl pause/resume/monitor-status`. Verified live end to end against the real reference desktop throughout, not mocks: real WindowOpened events with a real resolved PID (ADR-0009 — found neither `zcosmic_toplevel_info_v1` nor `com.system76.CosmicComp`'s D-Bus interface expose a PID, approximated via `/proc` matching instead), a real MPRIS "Playing" event from VLC round-tripped over a raw socket client, a real `MonitorStatusRequest`/`neuroosctl pause`/`resume` round trip. Found and fixed a real bug via testing: `spawn_blocking`'s infinite dispatch loops (Wayland sensors) hang tokio's multi-thread `Runtime::drop` forever if a test tries to return normally after spawning one — fixed with `std::process::exit(0)` for the (correctly) `#[ignore]`d live tests and a `recv_timeout`-based cooperative-cancellation redesign for `folders.rs`'s own always-on test. Measured PF: capture pipeline p99 = 0.008 ms (budget 1.5 ms; first attempt measured a tight burst and got 9.995 ms — a benchmark methodology bug, not a real one), RSS ≈ 8.9 MiB (budget 25 MiB), idle CPU 0%. Coverage 82.29% line / 89.59% function via `cargo llvm-cov nextest --run-ignored all` (nextest's per-test-process isolation is what makes including the `exit(0)`-using live tests in a coverage run safe). Wrote `reports/phase-03-monitor.md`; 6 of 7 exit criteria met — the ≥8h anonymised real-usage recordings criterion is deliberately not started (needs the owner's real elapsed hours + explicit consent given it captures real window titles/paths/media metadata for hours at a time). | `reports/phase-03-monitor.md`; `docs/adr/0009-toplevel-pid-resolution-heuristic.md` |
 | 2026-09-27 | Phase 2 gate | All 6 exit criteria verified with evidence; `reports/phase-02-inference.md` written. Cancellation latency measured (0 tokens after cancel), interactive preemption measured under real background load (4 tokens in 230-453ms while a 400-token background job ran), weights confirmed read-only mmap via `/proc/<pid>/maps` (`r--s`), spike S-05 confirmed `MemoryDenyWriteExecute=true` safe (real `--bench` run under `systemd-run --user`), C++ coverage 75.4% excluding the `--bench` CLI tool (67.5% including it — gcov measurement gap, not a real gap, see report §2.4). ADR-0008 records the FR-INF-07 target miss and the decision to proceed. | `reports/phase-02-inference.md` |
 | 2026-09-27 | P2-S05/S06 | Real GBNF grammar test found and fixed a process-crashing bug: llama.cpp's grammar sampler throws on rule completion inside `llama_sampler_accept`, uncaught on a detached worker thread → `std::terminate`. Fixed with try/catch treating the exception as the grammar's own "done" signal (rules.md §8). Real benchmark harness (`neuroos-inference --bench`) measured against the actual model at 128/512/1024 contexts + thread sweep: decode 55.9-72.1 ms/token, prefill 8.25-8.87 ms/token — both miss FR-INF-07's targets (45ms/2.5ms); RSS 1.22-1.33 GiB within the 1,590 MiB budget. | `reports/bench/inference-1790486839.json`; `docs/adr/0008-inference-benchmark-vs-fr-inf-07-targets.md` |
@@ -102,6 +103,21 @@ Newest first. One line per meaningful unit of work. Format: `YYYY-MM-DD · [Phas
 | P3-S06 | Record and replay a telemetry dump | 3 | Done |
 | P3-S07 | File activity for configured git/notes/ICS folders | 5 | Done |
 
+**Sprint 4 (2026-09-27, in progress) — Phase 4 — Semantic Storage Engine (C3 `neuroos-storage`), per phases.md §7, branch `p4/s01-storage`.** Owner asked to build everything not blocked on the ≥8h recording (P4's soak-replay gate) while a fresh recording attempt is pending next session.
+
+| Story | Title | Pts | Status |
+| :--- | :--- | :--- | :--- |
+| P4-S01 | Noisy events never become persistent nodes (4-stage ingest filter) | 8 | Done |
+| P4-S02 | Events stored in the right domain with the right taint | 5 | Done |
+| P4-S03 | Top-k relevant chunks for a question in ~13ms (embedder) | 8 | Done (embedder + LanceDB + hybrid query all real and live-verified; latency not yet benchmarked) |
+| P4-S04 | Window focused at a given moment ± 1.5s (`QueryFocusHistory`) | 3 | Backlog (SQLite `focus_history` table + rows already exist from P4-S02; the read-query API itself not yet written) |
+| P4-S05 | Slow collection auto-promotes to HNSW | 5 | Backlog (P1) |
+| P4-S06 | Fetched documents ingested as untrusted (`external_documents`, C7 spool) | 3 | Backlog |
+| P4-S07 | Old data expires and backups exist (lifecycle: GC, 6-hourly backup) | 5 | Backlog |
+| P4-S08 | Model upgrade re-indexes without downtime | 5 | Backlog |
+| P4-S09 | Forget a time range or an app (FR-STO-12/FR-PRV-03) | 3 | Backlog |
+| P4-S10 | (Conditional) SQLite v1 migrator | 5 | Dropped — OQ-03's default ("drop unless a sample DB is provided") applies; no sample DB provided |
+
 Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 
 ---
@@ -113,8 +129,8 @@ Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 | 0 | Foundation, Contracts & Spikes | ✅ Done (owner signed off 2026-09-27 on the 4 flagged deviations — report §2.6/§4) | 2026-09-26 | 2026-09-27 | `reports/phase-00-foundation.md` |
 | 1 | Health Aggregator (healthd) | ✅ Done (all exit criteria met, no owner sign-off items) | 2026-09-26 | 2026-09-27 | `reports/phase-01-healthd.md` |
 | 2 | Neural Inference Engine (C4) | ✅ Done (all 7 exit criteria met) | 2026-09-27 | 2026-09-27 | `reports/phase-02-inference.md` |
-| 3 | Desktop Telemetry Monitor (C1) | 🟨 Done except the recording — all 7 stories done, 6/7 exit criteria met with evidence; a background recording is running now for the last one (≥8h real-usage dumps), nothing else outstanding (see report §6) | 2026-09-27 | — | `reports/phase-03-monitor.md` |
-| 4 | Semantic Storage Engine (C3) | ⬜ Not started | — | — | `reports/phase-04-storage.md` |
+| 3 | Desktop Telemetry Monitor (C1) | 🟨 Merged (PR #4); done except the recording — all 7 stories done, 6/7 exit criteria met with evidence. First recording attempt stopped mid-way (found a real bug, see §8); a fresh attempt with the fixed binary is pending next session | 2026-09-27 | — | `reports/phase-03-monitor.md` |
+| 4 | Semantic Storage Engine (C3) | 🟦 In progress — P4-S01…S03 done on `p4/s01-storage` (ingest filter, domain adapters+taint, real embedder+LanceDB+hybrid query); soak-replay gate blocked on the recording | 2026-09-27 | — | `reports/phase-04-storage.md` |
 | 5 | Knowledge Engine (C5) | ⬜ Not started | — | — | `reports/phase-05-knowledge.md` |
 | 6 | Voice & Audio Pipeline (C2) | ⬜ Not started | — | — | `reports/phase-06-voice.md` |
 | 7 | SafetyGate Kernel (C6) | ⬜ Not started | — | — | `reports/phase-07-kernel.md` |
