@@ -9,7 +9,7 @@ use std::time::Duration;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 
 use crate::bus::EventBus;
-use crate::privacy::{self, PrivacyState};
+use crate::privacy::PrivacyState;
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{FileActivityEvent, FileActivityKind, RawTelemetryEvent};
 
@@ -102,11 +102,11 @@ fn run_with_stop(
             let Some(label) = label_for(watches, path) else {
                 continue;
             };
-            if !privacy.allows(None, privacy::now_ns()) {
+            if !privacy.allows(None, neuroos_common::now_ns()) {
                 continue;
             }
             bus.publish(RawTelemetryEvent {
-                observed_at_ns: privacy::now_ns(),
+                observed_at_ns: neuroos_common::now_ns(),
                 source: "folders".into(),
                 payload: Some(Payload::FileActivity(FileActivityEvent {
                     path: path.display().to_string(),

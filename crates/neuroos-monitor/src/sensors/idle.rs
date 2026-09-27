@@ -11,7 +11,7 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 };
 
 use crate::bus::EventBus;
-use crate::privacy::{self, PrivacyState};
+use crate::privacy::PrivacyState;
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{IdleEvent, RawTelemetryEvent};
 
@@ -86,12 +86,12 @@ impl IdleState {
     fn publish(&self, idle: bool) {
         let Some(bus) = &self.bus else { return };
         if let Some(privacy) = &self.privacy
-            && !privacy.allows(None, privacy::now_ns())
+            && !privacy.allows(None, neuroos_common::now_ns())
         {
             return;
         }
         bus.publish(RawTelemetryEvent {
-            observed_at_ns: privacy::now_ns(),
+            observed_at_ns: neuroos_common::now_ns(),
             source: "idle".into(),
             payload: Some(Payload::Idle(IdleEvent { idle })),
         });

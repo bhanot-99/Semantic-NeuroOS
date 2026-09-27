@@ -14,7 +14,7 @@ use wayland_client::protocol::wl_registry;
 use wayland_client::{Connection, Dispatch, QueueHandle, event_created_child};
 
 use crate::bus::EventBus;
-use crate::privacy::{self, PrivacyState};
+use crate::privacy::PrivacyState;
 use crate::sensors::proc;
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{
@@ -267,11 +267,14 @@ impl Default for PushState {
 
 impl PushState {
     fn publish(&self, toplevel_id: u64, kind: Kind, app_id_for_gate: Option<&str>) {
-        if !self.privacy.allows(app_id_for_gate, privacy::now_ns()) {
+        if !self
+            .privacy
+            .allows(app_id_for_gate, neuroos_common::now_ns())
+        {
             return;
         }
         self.bus.publish(RawTelemetryEvent {
-            observed_at_ns: privacy::now_ns(),
+            observed_at_ns: neuroos_common::now_ns(),
             source: "wayland_cosmic".into(),
             payload: Some(Payload::Window(WindowEvent {
                 toplevel_id,

@@ -4,7 +4,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Shared, cheaply-cloned handle. `0` in `paused_until_ns` means "not paused".
 #[derive(Clone)]
@@ -62,13 +61,6 @@ impl PrivacyState {
             None => true,
         }
     }
-}
-
-pub fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

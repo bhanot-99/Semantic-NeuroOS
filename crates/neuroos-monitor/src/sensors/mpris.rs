@@ -9,7 +9,7 @@ use zbus::zvariant::OwnedValue;
 use zbus::{Connection, proxy};
 
 use crate::bus::EventBus;
-use crate::privacy::{self, PrivacyState};
+use crate::privacy::PrivacyState;
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{MprisEvent, RawTelemetryEvent};
 
@@ -134,7 +134,7 @@ async fn publish_snapshot(
     bus: &EventBus,
     privacy: &PrivacyState,
 ) {
-    if !privacy.allows(None, privacy::now_ns()) {
+    if !privacy.allows(None, neuroos_common::now_ns()) {
         return;
     }
     let Ok(playback_status) = player.playback_status().await else {
@@ -144,7 +144,7 @@ async fn publish_snapshot(
     let position_us = player.position().await.unwrap_or(0);
 
     bus.publish(RawTelemetryEvent {
-        observed_at_ns: privacy::now_ns(),
+        observed_at_ns: neuroos_common::now_ns(),
         source: "mpris".into(),
         payload: Some(Payload::Mpris(MprisEvent {
             player_bus_name: bus_name.to_string(),
