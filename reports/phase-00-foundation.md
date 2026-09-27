@@ -6,9 +6,9 @@
 | Component(s) | `neuroos-common`, `neuroos-proto`, `neuroos-ipc`, `neuroos-shm`, `neuroos-health`, `neuroos-monitor` (sensor spike only), `neuroos-testkit`, `libneuroos`, systemd units, `models/manifest.toml`, `deny.toml` |
 | Sprints | 0 (all 10 stories; no separate "Sprint 0b" was needed — see memory.md §4) |
 | Dates | 2026-09-26 → 2026-09-26 |
-| Status | ✅ Passed gate (with two items flagged for owner sign-off — §3, §5) |
+| Status | ✅ Passed gate (4 deviations flagged in §3/§5, all signed off) |
 | Author | Claude (Sonnet 5), on branch `p0/s01-just-ci-green` |
-| Sign-off | _pending owner review_ |
+| Sign-off | Jatin Bhanot (owner), 2026-09-27 — approved all 4 flagged deviations (systemd unit mode / ADR-0002, `PrivateNetwork` DNS gap, memfd ring layout / ADR-0005, `cosmic-protocols` GPL-3.0 exception / ADR-0007) |
 
 ---
 
@@ -151,10 +151,10 @@ manually per that ADR's evidence section.
 
 | Item | Planned | Actual | Reason | Approved by |
 | :--- | :--- | :--- | :--- | :--- |
-| systemd unit mode | System template units (`User=%i`), per Architecture.md §8.1 | User-scope units recommended instead | Spike S-01 found the original assumption (user namespaces restricted on Ubuntu 24.04) didn't hold on the reference machine; user units also need no manual environment wiring | ADR-0002; **owner sign-off pending** |
-| `PrivateNetwork=true` hardening | Assumed to fully isolate network | Also needs `InaccessiblePaths=-/run/systemd/resolve` to block DNS | Found empirically (P0-S05) that `systemd-resolved`'s NSS module bypasses the netns via a local socket | documented inline in Architecture.md §8.1; **owner sign-off pending** |
-| memfd ring slot layout | As diagrammed in Architecture.md §5.5 | Added an explicit `seq: u64` field; every field behind `Relaxed` atomics | Two real bugs found via stress-testing and ThreadSanitizer (P0-S07) | ADR-0005; **owner sign-off pending** |
-| `cosmic-protocols` dependency | Not previously flagged | GPL-3.0-only license, needs a `deny.toml` exception | Found by wiring `cargo-deny` for real (P0-S10); no non-GPL alternative exists for `zcosmic_toplevel_info_v1` | ADR-0007; **owner sign-off pending** |
+| systemd unit mode | System template units (`User=%i`), per Architecture.md §8.1 | User-scope units recommended instead | Spike S-01 found the original assumption (user namespaces restricted on Ubuntu 24.04) didn't hold on the reference machine; user units also need no manual environment wiring | ADR-0002; **owner signed off 2026-09-27** |
+| `PrivateNetwork=true` hardening | Assumed to fully isolate network | Also needs `InaccessiblePaths=-/run/systemd/resolve` to block DNS | Found empirically (P0-S05) that `systemd-resolved`'s NSS module bypasses the netns via a local socket | documented inline in Architecture.md §8.1; **owner signed off 2026-09-27** |
+| memfd ring slot layout | As diagrammed in Architecture.md §5.5 | Added an explicit `seq: u64` field; every field behind `Relaxed` atomics | Two real bugs found via stress-testing and ThreadSanitizer (P0-S07) | ADR-0005; **owner signed off 2026-09-27** |
+| `cosmic-protocols` dependency | Not previously flagged | GPL-3.0-only license, needs a `deny.toml` exception | Found by wiring `cargo-deny` for real (P0-S10); no non-GPL alternative exists for `zcosmic_toplevel_info_v1` | ADR-0007; **owner signed off 2026-09-27** |
 | Sprint board split | Sprint 0 (S01–S06) then Sprint 0b (S07–S10) | All 10 done in one sprint/session | Owner directed building all of P0-S02…S10 in one branch, one session | owner (this session) |
 
 ### 2.7 Decisions made (ADRs)
@@ -212,7 +212,7 @@ than missing work.
 | :--- | :--- | :--- |
 | R-01 | `PrivateNetwork=true` in user units vs. Ubuntu 24.04 userns restriction; `SO_PEERCRED` under `PrivateUsers` | **Resolved** by spike S-01 (ADR-0002): premise didn't hold on the reference machine; user units recommended |
 | R-02 | BitNet decode speed on Zen 3 unverified | **First signal**: 17.89 t/s decode, 8 threads (ADR-0006). Full judgment against Phase 2's latency budget still open |
-| (new) | Is `cosmic-protocols`' GPL-3.0 license acceptable? | Opened and answered provisionally this phase (ADR-0007: yes, for a personal undistributed install) — **owner sign-off pending** |
+| (new) | Is `cosmic-protocols`' GPL-3.0 license acceptable? | Opened and answered provisionally this phase (ADR-0007: yes, for a personal undistributed install) — **owner signed off 2026-09-27** |
 | OQ-01…07 (PRD §12) | Unaffected by Phase 0 | Still open, not due until their respective phases |
 
 ---
@@ -246,4 +246,4 @@ than missing work.
 | :--- | :--- |
 | Next phase dependencies satisfied | ✅ — healthd, IPC, proto, systemd baseline, models all in place for Phase 1 (healthd) |
 | Next phase stories meet Definition of Ready | ✅ — phases.md §4 (Phase 1) stories don't depend on anything not delivered here |
-| memory.md updated (phase tracker, current phase, sprint board) | ⚠️ — sprint board / completed work log / decisions log updated throughout; §5 Phase Tracker itself (marking Phase 0 ✅) not yet updated, pending owner sign-off on §2.7/§3's open items |
+| memory.md updated (phase tracker, current phase, sprint board) | ✅ — §5 Phase Tracker marks Phase 0 ✅ Done (owner signed off 2026-09-27 on §2.7/§3's flagged deviations) |

@@ -16,11 +16,11 @@
 | Field | Value |
 | :--- | :--- |
 | Last updated | 2026-09-27 |
-| Project stage | Phase 0 passed gate (4 items still await owner sign-off, unchanged this session); Phase 1 (healthd) all 4 stories done, exit criteria verified, report written — clean pass, no sign-off items; Phase 2 (Inference) not started |
-| Current phase | **Phase 2 — Neural Inference Engine (C4)** (not started; Phase 1 complete) |
+| Project stage | Phase 0 done (owner signed off 2026-09-27 on the 4 flagged deviations); Phase 1 (healthd) done (clean gate, no sign-off items); Phase 2 (Inference) not started |
+| Current phase | **Phase 2 — Neural Inference Engine (C4)** (not started; Phases 0 and 1 complete) |
 | Current sprint | Sprint 2 (starts on Phase 2 kickoff) |
 | Current story | — (P1-S01…S04 all done; next: pick up P2-S01 per phases.md §5.2) |
-| Overall progress | Phase 0 gated (owner sign-off pending on 4 items), Phase 1 gated (no pending items), on branch `p1/s01-healthd`, not yet merged to `main` |
+| Overall progress | 2 / 11 phases done (Phase 0, Phase 1), on branch `p1/s01-healthd`, not yet merged to `main` |
 | Health | 🟢 On track |
 | Next milestone | M1 (healthd done; inference next) |
 
@@ -93,7 +93,7 @@ Columns: Backlog → Ready → In Progress → In Review → Testing → Done.
 
 | Phase | Name | Status | Started | Finished | Report |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| 0 | Foundation, Contracts & Spikes | 🟨 In gate review (all 10 stories done; 4 deviations flagged for owner sign-off — report §2.6/§4) | 2026-09-26 | — | `reports/phase-00-foundation.md` |
+| 0 | Foundation, Contracts & Spikes | ✅ Done (owner signed off 2026-09-27 on the 4 flagged deviations — report §2.6/§4) | 2026-09-26 | 2026-09-27 | `reports/phase-00-foundation.md` |
 | 1 | Health Aggregator (healthd) | ✅ Done (all exit criteria met, no owner sign-off items) | 2026-09-26 | 2026-09-27 | `reports/phase-01-healthd.md` |
 | 2 | Neural Inference Engine (C4) | ⬜ Not started | — | — | `reports/phase-02-inference.md` |
 | 3 | Desktop Telemetry Monitor (C1) | ⬜ Not started | — | — | `reports/phase-03-monitor.md` |
