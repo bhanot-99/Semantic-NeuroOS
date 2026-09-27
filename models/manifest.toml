@@ -93,3 +93,47 @@ url = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.js
 dest = "bge-small-en-v1.5/tokenizer.json"
 sha256 = "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
 license = "MIT"
+
+[[model]]
+# fastembed's "bring your own model" TokenizerFiles needs all four of these
+# alongside tokenizer.json (found wiring the real embedder, P4-S03).
+name = "bge-small-en-v1.5-tokenizer-config"
+component = "C3"
+url = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/config.json"
+dest = "bge-small-en-v1.5/config.json"
+sha256 = "fa73f90bf92c8cace1fbcb709626306f2bdbc9ea3e5b5f94b440df9b6aa56350"
+license = "MIT"
+
+[[model]]
+name = "bge-small-en-v1.5-tokenizer-tokenizer-config"
+component = "C3"
+url = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer_config.json"
+dest = "bge-small-en-v1.5/tokenizer_config.json"
+sha256 = "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3"
+license = "MIT"
+
+[[model]]
+name = "bge-small-en-v1.5-special-tokens-map"
+component = "C3"
+url = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/special_tokens_map.json"
+dest = "bge-small-en-v1.5/special_tokens_map.json"
+sha256 = "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3"
+license = "MIT"
+
+[[model]]
+# Not itself a model — the ONNX Runtime C3's FastEmbed embedder (and C2's
+# Silero/openWakeWord/Kokoro) load against. Architecture.md §12.3: "pinned
+# release tarball with SHA-256", same convention as everything else here.
+# `ort`'s ORT_DYLIB_PATH env var points at the extracted lib/libonnxruntime.so
+# (rules.md R0-5: no runtime downloads — fastembed is built with
+# `ort-load-dynamic`, never `ort-download-binaries`/`hf-hub`, so nothing
+# downloads at build or run time except this operator script).
+name = "onnxruntime-linux-x64"
+component = "C3, C2"
+url = "https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-linux-x64-1.30.0.tgz"
+dest = "onnxruntime/onnxruntime-linux-x64-1.30.0.tgz"
+sha256 = "a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd"
+license = "MIT"
+archive = true
+extract_to = "onnxruntime"
+verify_file = "onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so"

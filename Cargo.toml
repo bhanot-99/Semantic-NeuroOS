@@ -41,3 +41,27 @@ todo = "warn"
 
 [profile.release]
 lto = "thin"
+
+# lancedb 0.39.0's job.rs references Error::Http unconditionally even
+# though that variant is #[cfg(feature = "remote")]-gated in error.rs — a
+# real upstream bug that breaks the build with default-features off (which
+# neuroos-storage needs: enabling "remote" pulls reqwest/hyper into C3,
+# violating rules.md R0-1 — no HTTP client outside C7). vendor/ has the
+# same 0.39.0 source with only that function's 2 match arms fixed (see the
+# PATCHED comment in vendor/lancedb-0.39.0-patched/src/job.rs); everything
+# else, including every genuinely `remote`-gated Error::Http use, is
+# untouched. Revisit if a later release fixes this upstream.
+# rules.md R0-1: lance 12.0.0 (lancedb 0.39.0's dependency) unconditionally
+# depends on lance-namespace, which unconditionally depends on
+# lance-namespace-reqwest-client, which unconditionally links reqwest ->
+# hyper -> hyper-util -- with no upstream Cargo feature to disable it, even
+# though nothing lance/lancedb actually calls (with namespace/remote
+# features off, as neuroos-storage has them) ever reaches that crate's
+# `apis` module (the only part that uses reqwest); only its reqwest-free
+# `models` (data types) module is used. vendor/ has both crates patched to
+# make reqwest+`apis` opt-in via a new "client" feature, off by default --
+# see the PATCHED comments in each vendored Cargo.toml/lib.rs.
+[patch.crates-io]
+lancedb = { path = "vendor/lancedb-0.39.0-patched" }
+lance-namespace = { path = "vendor/lance-namespace-12.0.0-patched" }
+lance-namespace-reqwest-client = { path = "vendor/lance-namespace-reqwest-client-0.12.0-patched" }
