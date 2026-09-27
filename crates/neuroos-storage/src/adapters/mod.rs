@@ -42,31 +42,68 @@ const BUILD_TOOL_COMMS: &[&str] = &[
     "npm", "webpack", "tsc", "go",
 ];
 
-/// Runs the ingest filter on `event`, then persists whatever the matching
-/// domain adapter decides. `filter` is caller-owned so it accumulates state
-/// (transient counters, pid collapse map, toplevel tracking) across calls.
+/// A chunk of text worth embedding and storing in LanceDB, produced
+/// alongside a SQLite entity by [`ingest`]. Embedding is I/O (the ONNX
+/// Runtime call) so it stays out of this module's otherwise-synchronous
+/// SQLite path — `engine::StorageEngine::ingest` calls this, then embeds
+/// and stores each returned chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingChunk {
+    pub family: &'static str,
+    pub entity_id: i64,
+    pub domain: &'static str,
+    pub taint: TaintFlags,
+    pub t_ns: u64,
+    pub text: String,
+}
+
+fn family_for_domain(domain: &str) -> &'static str {
+    match domain {
+        DOMAIN_WINDOW_FOCUS | DOMAIN_APP_LIFECYCLE | DOMAIN_IDLE_PRESENCE => "attention",
+        DOMAIN_PROCESS_ACTIVITY | DOMAIN_BUILD_JOB | DOMAIN_GIT_ACTIVITY => "work",
+        DOMAIN_NOTES | DOMAIN_CALENDAR => "knowledge",
+        DOMAIN_MEDIA_PLAYBACK | DOMAIN_SYSTEM_RESOURCE => "system",
+        _ => "external",
+    }
+}
+
+/// Runs the ingest filter on `event`, persists whatever the matching domain
+/// adapter decides, and returns any chunks of text worth embedding into
+/// LanceDB (empty for most events — most domains have no meaningful "text"
+/// to search, or didn't cross the promotion gate this call). `filter` is
+/// caller-owned so it accumulates state (transient counters, pid collapse
+/// map, toplevel tracking) across calls.
 pub fn ingest(
     conn: &Connection,
     filter: &mut IngestFilter,
     event: &RawTelemetryEvent,
-) -> Result<(), StorageError> {
+) -> Result<Vec<PendingChunk>, StorageError> {
     let outcome = filter.process(event);
     match &event.payload {
-        Some(Payload::Window(w)) => adapt_window(conn, w, &outcome, event.observed_at_ns),
+        Some(Payload::Window(w)) => adapt_window(conn, w, &outcome, event.observed_at_ns, filter),
         Some(Payload::ProcTree(p)) => adapt_proc_tree(conn, p, &outcome, event.observed_at_ns),
         Some(Payload::FileActivity(f)) => {
             adapt_file_activity(conn, f, &outcome, event.observed_at_ns)
         }
-        Some(Payload::Idle(_)) => sqlite::touch_event_counter(
-            conn,
-            DOMAIN_IDLE_PRESENCE,
-            "transition",
-            event.observed_at_ns,
-            0,
-        ),
-        Some(Payload::Resource(r)) => adapt_resource(conn, r, event.observed_at_ns),
-        Some(Payload::Mpris(m)) => adapt_mpris(conn, m, event.observed_at_ns),
-        None => Ok(()),
+        Some(Payload::Idle(_)) => {
+            sqlite::touch_event_counter(
+                conn,
+                DOMAIN_IDLE_PRESENCE,
+                "transition",
+                event.observed_at_ns,
+                0,
+            )?;
+            Ok(Vec::new())
+        }
+        Some(Payload::Resource(r)) => {
+            adapt_resource(conn, r, event.observed_at_ns)?;
+            Ok(Vec::new())
+        }
+        Some(Payload::Mpris(m)) => {
+            adapt_mpris(conn, m, event.observed_at_ns)?;
+            Ok(Vec::new())
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -75,7 +112,8 @@ fn adapt_window(
     w: &WindowEvent,
     outcome: &FilterOutcome,
     observed_at_ns: u64,
-) -> Result<(), StorageError> {
+    filter: &IngestFilter,
+) -> Result<Vec<PendingChunk>, StorageError> {
     // app_lifecycle: open/close counted unconditionally (FR-STO-02's
     // "the right domain", not gated by the promotion filter — an
     // open/close pair is itself the whole signal this domain records).
@@ -92,12 +130,13 @@ fn adapt_window(
 
     // window_focus: only once promoted, and only a completed dwell segment
     // becomes a focus_history row.
+    let mut chunks = Vec::new();
     if let FilterOutcome::Promoted {
         key: app_id,
         segment,
     } = outcome
     {
-        sqlite::upsert_entity(
+        let entity_id = sqlite::upsert_entity(
             conn,
             DOMAIN_WINDOW_FOCUS,
             "window",
@@ -110,7 +149,7 @@ fn adapt_window(
             let dwell_ms = t_end_ns.saturating_sub(*t_start_ns) / 1_000_000;
             let title = match &w.kind {
                 Some(Kind::Opened(o)) => o.title.as_str(),
-                _ => "",
+                _ => filter.title_for(w.toplevel_id).unwrap_or(""),
             };
             sqlite::insert_focus_history(
                 conn,
@@ -124,9 +163,19 @@ fn adapt_window(
                     dwell_ms,
                 },
             )?;
+            if !title.is_empty() {
+                chunks.push(PendingChunk {
+                    family: family_for_domain(DOMAIN_WINDOW_FOCUS),
+                    entity_id,
+                    domain: DOMAIN_WINDOW_FOCUS,
+                    taint: TaintFlags::empty(),
+                    t_ns: *t_end_ns,
+                    text: format!("{app_id}: {title}"),
+                });
+            }
         }
     }
-    Ok(())
+    Ok(chunks)
 }
 
 fn adapt_proc_tree(
@@ -134,9 +183,9 @@ fn adapt_proc_tree(
     snapshot: &ProcessTreeSnapshot,
     outcome: &FilterOutcome,
     observed_at_ns: u64,
-) -> Result<(), StorageError> {
+) -> Result<Vec<PendingChunk>, StorageError> {
     let FilterOutcome::Promoted { key, .. } = outcome else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let root_comm = snapshot
         .processes
@@ -144,7 +193,7 @@ fn adapt_proc_tree(
         .find(|p| p.pid == snapshot.root_pid)
         .map(|p| p.comm.as_str())
         .unwrap_or("");
-    sqlite::upsert_entity(
+    let entity_id = sqlite::upsert_entity(
         conn,
         DOMAIN_PROCESS_ACTIVITY,
         "process",
@@ -159,10 +208,19 @@ fn adapt_proc_tree(
         .processes
         .iter()
         .any(|p| BUILD_TOOL_COMMS.iter().any(|tool| p.comm == *tool));
+    let mut chunks = Vec::new();
     if is_build_job {
         sqlite::touch_event_counter(conn, DOMAIN_BUILD_JOB, root_comm, observed_at_ns, 0)?;
+        chunks.push(PendingChunk {
+            family: family_for_domain(DOMAIN_BUILD_JOB),
+            entity_id,
+            domain: DOMAIN_BUILD_JOB,
+            taint: TaintFlags::empty(),
+            t_ns: observed_at_ns,
+            text: format!("build job under {root_comm}"),
+        });
     }
-    Ok(())
+    Ok(chunks)
 }
 
 fn adapt_file_activity(
@@ -170,9 +228,9 @@ fn adapt_file_activity(
     f: &FileActivityEvent,
     outcome: &FilterOutcome,
     observed_at_ns: u64,
-) -> Result<(), StorageError> {
+) -> Result<Vec<PendingChunk>, StorageError> {
     let FilterOutcome::Promoted { .. } = outcome else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let domain = match f.watch_label.as_str() {
         "git" => DOMAIN_GIT_ACTIVITY,
@@ -183,10 +241,10 @@ fn adapt_file_activity(
                 watch_label = other,
                 "file activity with an unrecognized watch_label; skipping"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
     };
-    sqlite::upsert_entity(
+    let entity_id = sqlite::upsert_entity(
         conn,
         domain,
         "file",
@@ -195,7 +253,18 @@ fn adapt_file_activity(
         observed_at_ns,
         true,
     )?;
-    sqlite::touch_event_counter(conn, domain, &f.path, observed_at_ns, 0)
+    sqlite::touch_event_counter(conn, domain, &f.path, observed_at_ns, 0)?;
+    // The path itself, not the file's contents — reading arbitrary watched
+    // files (size limits, encoding, binary detection) is real scope beyond
+    // what FileActivityEvent carries; tracked as a known simplification.
+    Ok(vec![PendingChunk {
+        family: family_for_domain(domain),
+        entity_id,
+        domain,
+        taint: TaintFlags::empty(),
+        t_ns: observed_at_ns,
+        text: f.path.clone(),
+    }])
 }
 
 fn adapt_resource(

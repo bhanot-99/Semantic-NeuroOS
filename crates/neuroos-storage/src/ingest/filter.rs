@@ -93,6 +93,10 @@ pub struct IngestFilter {
     /// toplevel_id -> app_id, tracked from `Opened` to `Closed` so a bare
     /// `StateChanged` (which carries no app_id) can be attributed.
     toplevel_app_ids: HashMap<u64, String>,
+    /// toplevel_id -> last-known title, tracked the same way (`Opened` /
+    /// `TitleChanged` to `Closed`) so a completed dwell segment can be
+    /// labeled with whatever was on screen, not just the app_id.
+    toplevel_titles: HashMap<u64, String>,
     /// toplevel_id -> the UTC-ns instant it last became activated, present
     /// only while currently activated.
     active_since_ns: HashMap<u64, u64>,
@@ -107,6 +111,14 @@ impl IngestFilter {
     /// seen in a `ProcessTreeSnapshot`, or is itself a root).
     pub fn collapse_pid(&self, pid: u32) -> u32 {
         self.pid_roots.get(&pid).copied().unwrap_or(pid)
+    }
+
+    /// The last-known title for a still-open toplevel (`None` if it was
+    /// never opened, was self-observation-excluded, or has since closed).
+    /// A domain adapter reads this after a dwell segment completes, since
+    /// that event (`StateChanged`) carries no title of its own.
+    pub fn title_for(&self, toplevel_id: u64) -> Option<&str> {
+        self.toplevel_titles.get(&toplevel_id).map(String::as_str)
     }
 
     pub fn process(&mut self, event: &RawTelemetryEvent) -> FilterOutcome {
@@ -149,12 +161,19 @@ impl IngestFilter {
                 }
                 self.toplevel_app_ids
                     .insert(w.toplevel_id, o.app_id.clone());
+                self.toplevel_titles.insert(w.toplevel_id, o.title.clone());
                 FilterOutcome::NotApplicable // opening isn't necessarily focusing
             }
             Some(Kind::AppIdChanged(a)) => {
                 if self.toplevel_app_ids.contains_key(&w.toplevel_id) {
                     self.toplevel_app_ids
                         .insert(w.toplevel_id, a.app_id.clone());
+                }
+                FilterOutcome::NotApplicable
+            }
+            Some(Kind::TitleChanged(t)) => {
+                if self.toplevel_app_ids.contains_key(&w.toplevel_id) {
+                    self.toplevel_titles.insert(w.toplevel_id, t.title.clone());
                 }
                 FilterOutcome::NotApplicable
             }
@@ -178,6 +197,7 @@ impl IngestFilter {
             }
             Some(Kind::Closed(_)) => {
                 self.toplevel_app_ids.remove(&w.toplevel_id);
+                self.toplevel_titles.remove(&w.toplevel_id);
                 self.active_since_ns.remove(&w.toplevel_id);
                 FilterOutcome::NotApplicable
             }
