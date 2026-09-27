@@ -1,7 +1,12 @@
 //! Strict config loading (`rules.md` §4: one `config.toml`, validated at
 //! start, fail fast on unknown keys — every struct here is
 //! `#[serde(deny_unknown_fields)]`). Each component adds its own section as
-//! it's built; only `[healthd]` exists so far (Phase 1).
+//! it's built. `[inference]` (Phase 2) is declared here even though no Rust
+//! binary reads it yet, purely so this strict parser doesn't reject a
+//! shared config.toml that also has an `[inference]` table for
+//! `neuroos-inference` (C++, its own `toml11`-based reader) — see
+//! `cpp/neuroos-inference/src/config.hpp`, which must be kept field-for-field
+//! in sync with `InferenceConfig` below.
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -27,6 +32,46 @@ pub enum ConfigError {
 pub struct Config {
     #[serde(default)]
     pub healthd: HealthdConfig,
+    #[serde(default)]
+    pub inference: InferenceConfig,
+}
+
+/// `[inference]` (Phase 2, C++ `neuroos-inference`): see the module doc
+/// comment above — no Rust code reads this yet, it exists only so the
+/// shared config.toml's `[inference]` table doesn't fail this strict parser.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceConfig {
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
+    /// models/manifest.toml's sha256 for the model file (defense-in-depth
+    /// beyond scripts/fetch-models.sh's own fetch-time verification; see
+    /// cpp/neuroos-inference/src/config.hpp).
+    #[serde(default)]
+    pub model_sha256: Option<String>,
+    #[serde(default = "default_inference_threads")]
+    pub threads: u32,
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            model_sha256: None,
+            threads: default_inference_threads(),
+            max_context_tokens: default_max_context_tokens(),
+        }
+    }
+}
+
+fn default_inference_threads() -> u32 {
+    8
+}
+
+fn default_max_context_tokens() -> u32 {
+    512
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -127,6 +172,28 @@ mod tests {
         std::fs::write(&path, "[healthd]\nnot_a_real_field = 1\n").unwrap();
         let err = load_config_from(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn parses_an_inference_section_alongside_healthd() {
+        // Proves the shared config.toml can carry both [healthd] (Rust) and
+        // [inference] (C++, cpp/neuroos-inference/src/config.cpp) without
+        // this strict parser rejecting it — see this module's doc comment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[healthd]\npoll_interval_s = 10\n[inference]\nthreads = 4\nmodel_path = \"/tmp/model.gguf\"\n",
+        )
+        .unwrap();
+        let cfg = load_config_from(&path).unwrap();
+        assert_eq!(cfg.healthd.poll_interval_s, 10);
+        assert_eq!(cfg.inference.threads, 4);
+        assert_eq!(
+            cfg.inference.model_path,
+            Some(PathBuf::from("/tmp/model.gguf"))
+        );
+        assert_eq!(cfg.inference.max_context_tokens, 512); // still default
     }
 
     #[test]

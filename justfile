@@ -32,7 +32,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf test-cpp-ipc
+test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf test-cpp-ipc test-inference
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -62,6 +62,13 @@ test-healthd-pf: build-rust
 # health server, all real UDS round trips (not mocked).
 test-cpp-ipc: build-cpp
     ./cpp/build/cpp-ipc-smoke
+
+# Phase 2 IT (phases.md §5.3): real neuroos-inference against the real
+# downloaded BitNet model — GetInfo/AttachRing/Generate/Cancel over a real
+# inference.sock, real tokens through a real memfd ring. Skips cleanly if
+# the model hasn't been fetched yet (see the script).
+test-inference: build-cpp
+    bash tests/contract/inference_smoke.sh
 
 # P0-S07 spike S-02: memfd seqlock ring, default scale + cross-language interop.
 # The 10M-message and ThreadSanitizer runs are spike evidence, not routine CI

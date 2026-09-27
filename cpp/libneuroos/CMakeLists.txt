@@ -6,9 +6,12 @@ add_library(libneuroos STATIC
     src/peercred.cpp
     src/uds.cpp
     src/health_server.cpp
+    src/sha256.cpp
+    src/paths.cpp
 )
 find_package(Threads REQUIRED)
-target_link_libraries(libneuroos PUBLIC Threads::Threads)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(libneuroos PUBLIC Threads::Threads OpenSSL::Crypto)
 target_include_directories(libneuroos PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
