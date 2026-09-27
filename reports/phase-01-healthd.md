@@ -65,7 +65,7 @@ Yes, one sprint as planned. All four user stories are done, `just ci` is green, 
 | RSS with 9 targets | ≤ 15 MiB | 9.4 MiB (9,672 KiB) | ✅ | `tests/contract/healthd_pf.sh` output, this session |
 | One scrape cycle CPU | ≤ 50 ms | cumulative CPU 0 ms since startup + 1 cycle (well within budget; script uses a generous 200 ms cumulative gate since it includes process startup, not a bare cycle) | ✅ | same |
 | Soak breach detection | RSS growth > 5% / p99 drift > 10% flagged | Verified against fixed vectors (exactly-5%/exactly-10% do not breach, one-unit-over breaches) and against a real running `neuroos-healthd --soak` process writing real CSV rows | ✅ | `soak.rs` unit tests; manual real-process run this session (CSV excerpt below) |
-| Coverage (`neuroos-healthd` + `neuroosctl`) | ≥ 80% | 84.99% region / 82.40% function / 83.35% line | ✅ | `cargo llvm-cov -p neuroos-healthd -p neuroosctl --summary-only`, this session |
+| Coverage (`neuroos-healthd` + `neuroosctl`) | ≥ 80% | 85.46% region / 82.81% function / 83.82% line | ✅ | `cargo llvm-cov -p neuroos-healthd -p neuroosctl --summary-only`, re-verified after adding the DEGRADED end-to-end test |
 
 Soak CSV evidence (real `neuroos-healthd --soak` run against the mock farm, 3 cycles, 1 s poll interval):
 ```
@@ -113,7 +113,7 @@ Carried forward from Phase 0 (unaffected by this phase's work, listed here for v
 
 | # | Exit criterion | Met | Evidence |
 | :--- | :--- | :--- | :--- |
-| 1 | healthd detects DOWN, DEGRADED and budget breaches for all mock scenarios | ✅ | `mock_components.rs` (healthy→OK, slow/crashing/malformed→DOWN); `aggregate.rs` unit tests for DEGRADED at the 90% budget boundary |
+| 1 | healthd detects DOWN, DEGRADED and budget breaches for all mock scenarios | ✅ | `mock_components.rs` (healthy→OK, slow/crashing/malformed→DOWN); `aggregate.rs` unit tests for DEGRADED at the 90% budget boundary; `scrape.rs::budget_breach_end_to_end_downgrades_ok_to_degraded` (added on re-verification) proves DEGRADED through a real `scrape_one` call against a mock reporting 95% of budget, not just the pure `apply_budget_alert` function |
 | 2 | Soak drift detection verified against synthetic growth (evidence: CSV + test log) | ✅ | `soak.rs` unit tests (exact 5%/10% boundaries); real `neuroos-healthd --soak` run this session producing real CSV rows (§2.4) |
 | 3 | RSS ≤ 15 MiB measured | ✅ | `tests/contract/healthd_pf.sh`: 9.4 MiB measured, now wired into `just ci` |
 | 4 | `neuroosctl status` works in text and JSON | ✅ | Implemented this session; manually verified against a real running healthd + 8-mock farm, both `neuroosctl status` and `neuroosctl status --json` |

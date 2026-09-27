@@ -222,6 +222,44 @@ mod tests {
         assert_eq!(record.status, neuroos_proto::v1::Status::Down);
     }
 
+    #[tokio::test]
+    async fn budget_breach_end_to_end_downgrades_ok_to_degraded() {
+        use neuroos_ipc::{read_envelope, write_envelope};
+        use neuroos_proto::v1::HealthResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("budget.health.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await
+                && let Ok(Some(req)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await
+            {
+                let resp = Envelope {
+                    schema_version: 1,
+                    trace_id: req.trace_id,
+                    request_id: req.request_id,
+                    sent_at_ns: neuroos_common::now_ns(),
+                    body: Some(envelope::Body::HealthResponse(HealthResponse {
+                        status: neuroos_proto::v1::Status::Ok as i32,
+                        // 95% of the 100 MiB budget below: past the 90%
+                        // apply_budget_alert threshold.
+                        rss_bytes: 95 * 1024 * 1024,
+                        uptime_s: 1,
+                        latency_histograms: Default::default(),
+                        error_counters: Default::default(),
+                        build_info: "budget-test".into(),
+                    })),
+                };
+                let _ = write_envelope(&mut stream, &resp, DEFAULT_MAX_FRAME).await;
+            }
+        });
+
+        let t = target("budget", sock); // budget_bytes: 100 MiB, see `target()` helper above
+        let record = scrape_one(&t, Duration::from_secs(1)).await;
+        assert_eq!(record.status, neuroos_proto::v1::Status::Degraded);
+        assert_eq!(record.rss_bytes, 95 * 1024 * 1024);
+    }
+
     fn current_uid() -> u32 {
         // SAFETY: getuid() takes no arguments and cannot fail.
         unsafe extern "C" {
