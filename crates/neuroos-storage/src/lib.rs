@@ -2,5 +2,6 @@
 //! query APIs, lifecycle jobs. Split from `main.rs` so tests can exercise
 //! real logic without a second process (mirrors `neuroos-healthd`/
 //! `neuroos-monitor`'s own lib/main split).
+pub mod adapters;
 pub mod ingest;
 pub mod sqlite;
