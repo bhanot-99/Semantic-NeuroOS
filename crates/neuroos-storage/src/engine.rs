@@ -2,7 +2,7 @@
 //! together into the one real ingest/query path (Architecture.md §6.2):
 //! `RawTelemetryEvent` -> filter -> adapter -> SQLite (always) + LanceDB
 //! (only for domains with text worth embedding).
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use neuroos_proto::v1::RawTelemetryEvent;
 
@@ -26,6 +26,7 @@ pub struct StorageEngine {
     conn: rusqlite::Connection,
     filter: IngestFilter,
     lance: LanceStore,
+    lance_dir: PathBuf,
     embedder: Embedder,
 }
 
@@ -43,6 +44,7 @@ impl StorageEngine {
             conn,
             filter: IngestFilter::new(),
             lance,
+            lance_dir: lance_path.to_path_buf(),
             embedder,
         })
     }
@@ -155,6 +157,24 @@ impl StorageEngine {
         let entity_ids = crate::sqlite::forget_since(&self.conn, since_ns)?;
         self.delete_lance_rows(&entity_ids).await?;
         Ok(entity_ids.len())
+    }
+
+    /// Architecture.md §7.5's daily GC job: expires entities/focus_history
+    /// past their domain's retention and purges the matching LanceDB rows.
+    pub async fn gc(&mut self, now_ns: u64) -> Result<crate::lifecycle::GcSummary, EngineError> {
+        let (summary, entity_ids) = crate::lifecycle::gc_expired_entities(&self.conn, now_ns)?;
+        self.delete_lance_rows(&entity_ids).await?;
+        Ok(summary)
+    }
+
+    /// Architecture.md §7.5's 6-hourly backup job.
+    pub async fn backup(
+        &self,
+        backups_root: &Path,
+        label: &str,
+        keep: usize,
+    ) -> Result<PathBuf, crate::lifecycle::BackupError> {
+        crate::lifecycle::backup(&self.conn, &self.lance_dir, backups_root, label, keep).await
     }
 
     async fn delete_lance_rows(&self, entity_ids: &[i64]) -> Result<(), EngineError> {
