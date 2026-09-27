@@ -1,10 +1,123 @@
-// C1 monitor telemetry ingest types
+// C1 monitor telemetry ingest types (Phase 3, phases.md §6).
+//
+// C1 emits raw, unfiltered sensor observations (rules.md AB-5): it never
+// computes durations, collapses subprocesses or judges relevance — that is
+// C3's job (Architecture.md §6.2). Every event carries the UTC-ns instant it
+// was observed (AB-8); focus/idle *durations* are derived downstream from
+// the start/end pairs of raw transitions.
 syntax = "proto3";
 package neuroos.v1;
 
-// first-cut envelope for sensor events; per-sensor payload schemas land in Phase 3
 message RawTelemetryEvent {
   uint64 observed_at_ns = 1;
-  string source = 2;   // "wayland_cosmic" | "wayland_wlr" | "idle" | "mpris" | "proc" | "folders"
-  bytes payload = 3;
+  string source = 2; // "wayland_cosmic" | "wayland_wlr" | "idle" | "mpris" | "proc" | "folders"
+  oneof payload {
+    WindowEvent window = 10;
+    IdleEvent idle = 11;
+    MprisEvent mpris = 12;
+    ResourceSample resource = 13;
+    ProcessTreeSnapshot proc_tree = 14;
+    FileActivityEvent file_activity = 15;
+  }
+}
+
+// FR-MON-01: one toplevel window, tracked by a monitor-assigned stable id
+// for the handle's lifetime (the Wayland object id is not stable/meaningful
+// across reconnects).
+message WindowEvent {
+  uint64 toplevel_id = 1;
+  oneof kind {
+    WindowOpened opened = 2;
+    WindowClosed closed = 3;
+    WindowTitleChanged title_changed = 4;
+    WindowAppIdChanged app_id_changed = 5;
+    WindowStateChanged state_changed = 6;
+  }
+}
+
+message WindowOpened {
+  string app_id = 1;
+  string title = 2;
+  // Best-effort only: no Wayland protocol or D-Bus interface on the
+  // reference COSMIC session exposes a toplevel's PID (verified during
+  // P3-S01's spike; see ADR-0009). 0 + pid_known=false means "not resolved".
+  uint32 pid = 3;
+  bool pid_known = 4;
+}
+
+message WindowClosed {}
+
+message WindowTitleChanged {
+  string title = 1;
+}
+
+message WindowAppIdChanged {
+  string app_id = 1;
+}
+
+enum ToplevelState {
+  TOPLEVEL_STATE_UNSPECIFIED = 0;
+  TOPLEVEL_STATE_MAXIMIZED = 1;
+  TOPLEVEL_STATE_MINIMIZED = 2;
+  TOPLEVEL_STATE_ACTIVATED = 3;
+  TOPLEVEL_STATE_FULLSCREEN = 4;
+  TOPLEVEL_STATE_STICKY = 5;
+}
+
+message WindowStateChanged {
+  repeated ToplevelState states = 1;
+}
+
+// FR-MON-02: `ext_idle_notify_v1` idle/active transitions.
+message IdleEvent {
+  bool idle = 1; // true = became idle, false = became active
+}
+
+// FR-MON-03: MPRIS playback state + metadata (D-Bus session bus, via zbus).
+message MprisEvent {
+  string player_bus_name = 1;
+  string playback_status = 2; // "Playing" | "Paused" | "Stopped"
+  string track_id = 3;
+  string title = 4;
+  string artist = 5;
+  string album = 6;
+  int64 position_us = 7;
+}
+
+// FR-MON-04: periodic system-wide CPU/memory sample.
+message ResourceSample {
+  double system_cpu_percent = 1;
+  uint64 system_mem_used_bytes = 2;
+  uint64 system_mem_total_bytes = 3;
+}
+
+// FR-MON-05: process tree rooted at the focused window's PID, so C3 can
+// collapse subprocesses (e.g. a compiler invoked by an editor) under it.
+// Empty (no `processes`) when the root PID could not be resolved.
+message ProcessTreeSnapshot {
+  uint32 root_pid = 1;
+  bool root_pid_known = 2;
+  repeated ProcessInfo processes = 3;
+}
+
+message ProcessInfo {
+  uint32 pid = 1;
+  uint32 ppid = 2;
+  string comm = 3;
+}
+
+// FR-MON-09 (P1): file activity in a configured watch folder (git repo,
+// notes vault, ICS calendar file).
+message FileActivityEvent {
+  string path = 1;
+  FileActivityKind kind = 2;
+  string watch_label = 3; // matches config.toml's [monitor.folders.*] key, e.g. "git"/"notes"/"calendar"
+}
+
+enum FileActivityKind {
+  FILE_ACTIVITY_KIND_UNSPECIFIED = 0;
+  FILE_ACTIVITY_KIND_CREATED = 1;
+  FILE_ACTIVITY_KIND_MODIFIED = 2;
+  FILE_ACTIVITY_KIND_DELETED = 3;
+  FILE_ACTIVITY_KIND_RENAMED = 4;
 }

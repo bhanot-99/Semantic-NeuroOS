@@ -34,6 +34,8 @@ pub struct Config {
     pub healthd: HealthdConfig,
     #[serde(default)]
     pub inference: InferenceConfig,
+    #[serde(default)]
+    pub monitor: MonitorConfig,
 }
 
 /// `[inference]` (Phase 2, C++ `neuroos-inference`): see the module doc
@@ -104,6 +106,101 @@ fn default_poll_interval_s() -> u64 {
 
 fn default_per_target_timeout_s() -> u64 {
     1
+}
+
+/// `[monitor]` (Phase 3, C1 `neuroos-monitor`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorConfig {
+    /// FR-MON-02: `ext_idle_notify_v1` timeout before "idle" fires.
+    #[serde(default = "default_idle_timeout_s")]
+    pub idle_timeout_s: u32,
+    /// FR-MON-04: system CPU/memory sampling period.
+    #[serde(default = "default_resource_sample_interval_s")]
+    pub resource_sample_interval_s: u32,
+    /// FR-MON-08/FR-PRV-02: app_ids never emitted, regardless of pause
+    /// state. Merged with (not replacing) `default_excluded_app_ids()`
+    /// unless `exclude_defaults` is set false.
+    #[serde(default)]
+    pub excluded_app_ids: Vec<String>,
+    /// Set false only to disable the built-in password-manager defaults
+    /// (e.g. an isolated test fixture that wants an empty list).
+    #[serde(default = "default_true")]
+    pub exclude_defaults: bool,
+    /// Event bus capacity (`RawTelemetryEvent`s buffered per subscriber
+    /// before the oldest is dropped and the drop counter increments).
+    #[serde(default = "default_bus_capacity")]
+    pub bus_capacity: usize,
+    /// FR-MON-09 (P1): folders watched for file activity, keyed by a label
+    /// that becomes `FileActivityEvent.watch_label` (e.g. "git", "notes").
+    #[serde(default)]
+    pub folders: Vec<FolderWatch>,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_s: default_idle_timeout_s(),
+            resource_sample_interval_s: default_resource_sample_interval_s(),
+            excluded_app_ids: Vec::new(),
+            exclude_defaults: default_true(),
+            bus_capacity: default_bus_capacity(),
+            folders: Vec::new(),
+        }
+    }
+}
+
+impl MonitorConfig {
+    /// The full effective exclusion list: configured `excluded_app_ids`
+    /// plus, unless disabled, the built-in defaults (FR-PRV-02: "Defaults
+    /// include common password managers").
+    pub fn effective_excluded_app_ids(&self) -> Vec<String> {
+        let mut ids = self.excluded_app_ids.clone();
+        if self.exclude_defaults {
+            ids.extend(default_excluded_app_ids().iter().map(|s| s.to_string()));
+        }
+        ids
+    }
+}
+
+/// Common Linux password-manager `app_id`s (desktop-entry / `WM_CLASS`
+/// style ids), FR-PRV-02's "sane defaults". Not exhaustive — an operator
+/// adds their own via `excluded_app_ids`.
+pub fn default_excluded_app_ids() -> &'static [&'static str] {
+    &[
+        "org.keepassxc.KeePassXC",
+        "com.bitwarden.desktop",
+        "1password",
+        "com.1password.1Password",
+        "org.gnome.World.Secrets",
+        "org.qtpass.QtPass",
+        "keepass",
+        "keepassx",
+        "keepassxc",
+    ]
+}
+
+fn default_idle_timeout_s() -> u32 {
+    60
+}
+
+fn default_resource_sample_interval_s() -> u32 {
+    5
+}
+
+fn default_bus_capacity() -> usize {
+    4096
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FolderWatch {
+    pub label: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -194,6 +291,41 @@ mod tests {
             Some(PathBuf::from("/tmp/model.gguf"))
         );
         assert_eq!(cfg.inference.max_context_tokens, 512); // still default
+    }
+
+    #[test]
+    fn monitor_defaults_include_password_managers_and_merge_with_config() {
+        let cfg = MonitorConfig {
+            excluded_app_ids: vec!["org.mozilla.firefox".into()],
+            ..MonitorConfig::default()
+        };
+        let effective = cfg.effective_excluded_app_ids();
+        assert!(effective.contains(&"org.mozilla.firefox".to_string()));
+        assert!(effective.contains(&"org.keepassxc.KeePassXC".to_string()));
+    }
+
+    #[test]
+    fn monitor_exclude_defaults_false_drops_built_ins() {
+        let cfg = MonitorConfig {
+            exclude_defaults: false,
+            ..MonitorConfig::default()
+        };
+        assert!(cfg.effective_excluded_app_ids().is_empty());
+    }
+
+    #[test]
+    fn parses_a_monitor_section_with_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[monitor]\nidle_timeout_s = 30\n[[monitor.folders]]\nlabel = \"git\"\npath = \"/home/u/proj\"\n",
+        )
+        .unwrap();
+        let cfg = load_config_from(&path).unwrap();
+        assert_eq!(cfg.monitor.idle_timeout_s, 30);
+        assert_eq!(cfg.monitor.folders.len(), 1);
+        assert_eq!(cfg.monitor.folders[0].label, "git");
     }
 
     #[test]

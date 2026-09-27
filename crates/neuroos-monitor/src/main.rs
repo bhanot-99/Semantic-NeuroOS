@@ -1,7 +1,7 @@
 // monitor entry point
 use std::path::PathBuf;
 
-mod sensors;
+use neuroos_monitor::sensors;
 
 fn runtime_socket_dir() -> PathBuf {
     // Architecture.md §5.2: $XDG_RUNTIME_DIR/neuroos/ = /run/user/$UID/neuroos/
