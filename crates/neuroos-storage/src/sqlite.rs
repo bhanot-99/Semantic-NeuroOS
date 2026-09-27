@@ -1,1 +1,255 @@
-// SQLite metadata store integration
+//! `meta.sqlite3` (Architecture.md §7.2): WAL mode, `synchronous=NORMAL`,
+//! single writer (this process). Owns `focus_history`, `event_counters`,
+//! `aggregates_daily`, `entities`, `edges`, `chunks_meta`, `index_meta`.
+use rusqlite::Connection;
+use std::path::Path;
+
+use neuroos_taint::TaintFlags;
+
+/// Every `.sql` file under `src/migrations/`, embedded at compile time
+/// (`include_str!`, not a runtime file read — this binary must work from
+/// wherever it's installed, not just a checkout).
+const MIGRATIONS: &[(&str, &str)] =
+    &[("0001_initial", include_str!("migrations/0001_initial.sql"))];
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+}
+
+/// Opens (creating if needed) `meta.sqlite3` at `path`, sets the required
+/// pragmas, and applies any migration not yet recorded in
+/// `schema_migrations`.
+pub fn open(path: &Path) -> Result<Connection, StorageError> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Same as [`open`] but in-memory, for tests that don't need a real file.
+pub fn open_in_memory() -> Result<Connection, StorageError> {
+    let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+fn migrate(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version    TEXT PRIMARY KEY,
+            applied_ns INTEGER NOT NULL
+        );",
+    )?;
+    for (version, sql) in MIGRATIONS {
+        let already_applied: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |row| row.get(0),
+        )?;
+        if already_applied {
+            continue;
+        }
+        conn.execute_batch(sql)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_ns) VALUES (?1, ?2)",
+            (version, neuroos_common::now_ns()),
+        )?;
+    }
+    Ok(())
+}
+
+/// Upserts `event_counters(domain, key)`: creates the row on first sight,
+/// otherwise bumps `count`/`last_ns`/`total_dwell_ms`.
+pub fn touch_event_counter(
+    conn: &Connection,
+    domain: &str,
+    key: &str,
+    at_ns: u64,
+    dwell_ms: u64,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO event_counters (domain, key, count, first_ns, last_ns, total_dwell_ms)
+         VALUES (?1, ?2, 1, ?3, ?3, ?4)
+         ON CONFLICT(domain, key) DO UPDATE SET
+             count = count + 1,
+             last_ns = excluded.last_ns,
+             total_dwell_ms = total_dwell_ms + excluded.total_dwell_ms",
+        (domain, key, at_ns as i64, dwell_ms as i64),
+    )?;
+    Ok(())
+}
+
+/// Inserts a new entity or, if `(domain, label)` already exists, bumps
+/// `last_seen_ns` and unions in `taint` (taint is never lowered — R0-3).
+/// Returns the entity's `id`.
+pub fn upsert_entity(
+    conn: &Connection,
+    domain: &str,
+    kind: &str,
+    label: &str,
+    taint: TaintFlags,
+    at_ns: u64,
+    permanent: bool,
+) -> Result<i64, StorageError> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM entities WHERE domain = ?1 AND label = ?2",
+            (domain, label),
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE entities SET last_seen_ns = ?1, taint = taint | ?2 WHERE id = ?3",
+            (at_ns as i64, taint.bits(), id),
+        )?;
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO entities (domain, kind, label, taint, created_ns, last_seen_ns, permanent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+        (domain, kind, label, taint.bits(), at_ns as i64, permanent),
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub struct FocusHistoryEntry<'a> {
+    pub app_id: &'a str,
+    pub title: &'a str,
+    pub pid: u32,
+    pub root_pid: u32,
+    pub t_start_ns: u64,
+    pub t_end_ns: u64,
+    pub dwell_ms: u64,
+}
+
+pub fn insert_focus_history(
+    conn: &Connection,
+    e: &FocusHistoryEntry<'_>,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO focus_history (app_id, title, pid, root_pid, t_start_ns, t_end_ns, dwell_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            e.app_id,
+            e.title,
+            e.pid,
+            e.root_pid,
+            e.t_start_ns as i64,
+            e.t_end_ns as i64,
+            e.dwell_ms as i64,
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use super::*;
+
+    #[test]
+    fn open_applies_migrations_and_is_idempotent() {
+        let conn = open_in_memory().unwrap();
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, 1);
+        // re-running migrate() on the same connection must not error or
+        // re-apply (CREATE TABLE would fail the second time if it did).
+        migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn wal_mode_and_pragmas_apply_on_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.sqlite3");
+        let conn = open(&path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        drop(conn);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn touch_event_counter_creates_then_accumulates() {
+        let conn = open_in_memory().unwrap();
+        touch_event_counter(&conn, "process_activity", "editor", 100, 50).unwrap();
+        touch_event_counter(&conn, "process_activity", "editor", 200, 30).unwrap();
+        let (count, total_dwell_ms): (i64, i64) = conn
+            .query_row(
+                "SELECT count, total_dwell_ms FROM event_counters WHERE domain = ?1 AND key = ?2",
+                ("process_activity", "editor"),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(total_dwell_ms, 80);
+    }
+
+    #[test]
+    fn upsert_entity_creates_once_then_updates_last_seen_and_unions_taint() {
+        let conn = open_in_memory().unwrap();
+        let id1 = upsert_entity(
+            &conn,
+            "external",
+            "document",
+            "doc-42",
+            TaintFlags::EXTERNAL_UNTRUSTED,
+            1,
+            false,
+        )
+        .unwrap();
+        let id2 = upsert_entity(
+            &conn,
+            "external",
+            "document",
+            "doc-42",
+            TaintFlags::MODEL_GENERATED,
+            2,
+            false,
+        )
+        .unwrap();
+        assert_eq!(id1, id2);
+        let (last_seen, taint_bits): (i64, u32) = conn
+            .query_row(
+                "SELECT last_seen_ns, taint FROM entities WHERE id = ?1",
+                [id1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_seen, 2);
+        let taint = TaintFlags::from_bits_truncate(taint_bits);
+        assert!(taint.contains(TaintFlags::EXTERNAL_UNTRUSTED));
+        assert!(taint.contains(TaintFlags::MODEL_GENERATED)); // union, not replace
+    }
+
+    #[test]
+    fn insert_focus_history_round_trips() {
+        let conn = open_in_memory().unwrap();
+        insert_focus_history(
+            &conn,
+            &FocusHistoryEntry {
+                app_id: "org.mozilla.firefox",
+                title: "Example",
+                pid: 123,
+                root_pid: 100,
+                t_start_ns: 1_000,
+                t_end_ns: 2_000,
+                dwell_ms: 1,
+            },
+        )
+        .unwrap();
+        let app_id: String = conn
+            .query_row("SELECT app_id FROM focus_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(app_id, "org.mozilla.firefox");
+    }
+}

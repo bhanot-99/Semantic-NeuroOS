@@ -3,3 +3,4 @@
 //! real logic without a second process (mirrors `neuroos-healthd`/
 //! `neuroos-monitor`'s own lib/main split).
 pub mod ingest;
+pub mod sqlite;
