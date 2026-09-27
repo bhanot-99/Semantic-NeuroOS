@@ -5,4 +5,5 @@
 pub mod adapters;
 pub mod embed;
 pub mod ingest;
+pub mod lance;
 pub mod sqlite;
