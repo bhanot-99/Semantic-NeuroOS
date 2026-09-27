@@ -33,7 +33,7 @@ build-py: proto-py
 
 # --- test ------------------------------------------------------------------
 
-test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf test-cpp-ipc test-inference
+test: test-rust test-py test-contract test-security test-shm test-sandboxed-echo test-healthd-pf test-monitor-pf test-cpp-ipc test-inference
 
 test-rust:
     cargo nextest run --workspace --no-tests=warn
@@ -57,6 +57,13 @@ test-sandboxed-echo: build-rust
 # health servers via health_mock_farm; RSS <= 15 MiB, one scrape cycle overhead low.
 test-healthd-pf: build-rust
     bash tests/contract/healthd_pf.sh
+
+# Phase 3 PF (phases.md §6.3): real neuroos-monitor release binary against
+# the live Wayland/D-Bus session; RSS <= 25 MiB, idle CPU < 0.5%. Skips
+# cleanly outside a graphical session (see the script).
+test-monitor-pf:
+    cargo build --release -p neuroos-monitor
+    bash tests/contract/monitor_pf.sh
 
 # Phase 2 prerequisite infra: libneuroos's C++ IPC framing, UDS server/client,
 # SCM_RIGHTS fd passing (used to hand the token ring fd to C2) and the C++
