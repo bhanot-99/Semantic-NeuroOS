@@ -26,3 +26,4 @@ serde_json = "1"
 neuroos-storage = { path = "../neuroos-storage", version = "0.1.0" }
 neuroos-testkit = { path = "../neuroos-testkit", version = "0.1.0" }
 tempfile = "3"
+proptest = "1"
