@@ -507,6 +507,85 @@ mod tests {
         assert_eq!(entities, 0);
     }
 
+    /// Live proof (P4-S09 / phases.md §7.4 "Forget verified (rows,
+    /// vectors, next backup)"): the third leg -- a backup taken *after* a
+    /// forget must not resurrect the forgotten row. Needs the real model +
+    /// onnxruntime fetched, so `#[ignore]`d like this crate's other
+    /// real-download-dependent tests.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn forgotten_rows_do_not_reappear_in_the_next_backup() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::Opened(WindowOpened {
+                    app_id: "org.mozilla.firefox".into(),
+                    title: "quarterly revenue dashboard".into(),
+                    pid: 0,
+                    pid_known: false,
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::StateChanged(WindowStateChanged {
+                    states: vec![ToplevelState::Activated as i32],
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                6_000_000_000,
+                Kind::StateChanged(WindowStateChanged { states: vec![] }),
+            ))
+            .await
+            .unwrap();
+
+        let forgotten = engine.forget_by_app("org.mozilla.firefox").await.unwrap();
+        assert_eq!(forgotten, 1);
+
+        let backups_root = tempfile::tempdir().unwrap();
+        let backup_dest = crate::lifecycle::backup(
+            &engine.conn,
+            &engine.lance_dir,
+            backups_root.path(),
+            "after-forget",
+            8,
+        )
+        .await
+        .unwrap();
+
+        let restored = crate::sqlite::open(&backup_dest.join("meta.sqlite3")).unwrap();
+        let entities: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE label = 'org.mozilla.firefox'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entities, 0,
+            "a backup taken after forget must not contain the forgotten entity"
+        );
+    }
+
     /// Live proof (P4-S08/FR-STO-11): ingesting records `index_meta`, and
     /// running the background re-index function directly (rather than
     /// waiting for a spawned task) re-embeds the existing chunk in place
