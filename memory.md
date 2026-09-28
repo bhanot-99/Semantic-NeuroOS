@@ -235,7 +235,7 @@ Mirror of [PRD.md](PRD.md) §12. Close here and in the PRD at the same time.
 | OQ-01 | Wake phrase ("hey jarvis" or custom)? | "hey jarvis" | Phase 6 | Open |
 | OQ-02 | Final list of 13 domain adapters? | Architecture.md §7.3 proposal | Phase 4 | Open |
 | OQ-03 | Does a NeuroOS v1 SQLite DB exist to migrate? | Drop migrator unless a sample DB is provided | Phase 4 | Open |
-| OQ-04 | Neural (PyTorch) or parametric Hawkes? | Parametric | Phase 5 | Open |
+| OQ-04 | Neural (PyTorch) or parametric Hawkes? | Parametric | Phase 5 | **Closed 2026-09-28** — parametric exponential-kernel Hawkes implemented (`neuroos_bg.hawkes`, P5-S07), no PyTorch. PRD.md's own default already says "Parametric"; no PRD edit needed, just recorded here that the default was actually taken. |
 | OQ-05 | Calendar source: ICS files or Evolution Data Server? | ICS | Phase 7 | Open |
 | OQ-06 | Personal install or public distribution? | Personal | Phase 10 | Open |
 | OQ-07 | Notes vault path? | `~/Notes` (configurable) | Phase 3 | Open |
