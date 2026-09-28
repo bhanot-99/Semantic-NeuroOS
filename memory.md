@@ -245,6 +245,8 @@ Mirror of [PRD.md](PRD.md) §12. Close here and in the PRD at the same time.
 
 ## 8. Blockers, Risks to Watch, Known Issues
 
+**As of 2026-09-28, every real bug/blocker found during execution is tracked in [BUGS.md](BUGS.md), the dedicated registry — add new ones there going forward, not just here. This section keeps the pre-existing history and the tech-debt table below; BUGS.md is the canonical current-state list for "what's broken right now."**
+
 | Date | Type | Item | Owner | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | 2026-09-26 | Risk | R-01: `PrivateNetwork=true` in systemd user units vs Ubuntu 24.04 userns restriction and `SO_PEERCRED` under `PrivateUsers`. | Architect | **Resolved** — spike S-01 (P0-S06, ADR-0002): premise didn't hold on the reference machine; user units work and are now the recommended mode (D-11). |
