@@ -4,6 +4,8 @@
 //! BitNet's GGUF has no separate tokenizer file for C5a to load locally,
 //! and FR-KNO-09 excludes C3/C4 call latency from C5's own-compute budget
 //! precisely so this is allowed.
+use std::time::{Duration, Instant};
+
 use neuroos_proto::v1::ChunkMatch;
 use neuroos_taint::TaintFlags;
 
@@ -26,6 +28,11 @@ pub struct AssembledPrompt {
     pub text: String,
     /// FR-KNO-07: union of every evidence chunk's taint.
     pub taint: TaintFlags,
+    /// FR-KNO-09: wall-clock time spent in this function's own CPU-bound
+    /// work only -- every `inference.count_tokens` `.await` inside
+    /// [`truncate_evidence`] is C4-call latency and is excluded, timed
+    /// separately from the taint/formatting work around it.
+    pub own_compute: Duration,
 }
 
 /// Truncates `evidence` to fit `EVIDENCE_BUDGET_TOKENS`, wraps tainted
@@ -37,11 +44,24 @@ pub async fn assemble(
     window: Option<&WindowContext>,
     evidence: &[ChunkMatch],
 ) -> Result<AssembledPrompt, InferenceClientError> {
+    let t0 = Instant::now();
     let taint = taint_wrap::union_taint(evidence);
     let deictic_text = format_deictic(window, question);
-    let evidence_text = truncate_evidence(inference, evidence, EVIDENCE_BUDGET_TOKENS).await?;
+    let mut own_compute = t0.elapsed();
+
+    let (evidence_text, truncate_own_compute) =
+        truncate_evidence(inference, evidence, EVIDENCE_BUDGET_TOKENS).await?;
+    own_compute += truncate_own_compute;
+
+    let t1 = Instant::now();
     let text = format!("{SYSTEM_PREAMBLE}\n\n{deictic_text}\n\nEvidence:\n{evidence_text}");
-    Ok(AssembledPrompt { text, taint })
+    own_compute += t1.elapsed();
+
+    Ok(AssembledPrompt {
+        text,
+        taint,
+        own_compute,
+    })
 }
 
 fn format_deictic(window: Option<&WindowContext>, question: &str) -> String {
@@ -65,9 +85,11 @@ async fn truncate_evidence(
     inference: &InferenceClient,
     chunks: &[ChunkMatch],
     budget_tokens: u32,
-) -> Result<String, InferenceClientError> {
+) -> Result<(String, Duration), InferenceClientError> {
     let mut text = String::new();
+    let mut own_compute = Duration::ZERO;
     for chunk in chunks {
+        let t = Instant::now();
         let taint = TaintFlags::from_bits_truncate(chunk.taint.as_ref().map_or(0, |t| t.flags));
         let wrapped = taint_wrap::wrap_if_tainted(&chunk.text, taint);
         let candidate = if text.is_empty() {
@@ -75,13 +97,17 @@ async fn truncate_evidence(
         } else {
             format!("{text}\n---\n{wrapped}")
         };
+        own_compute += t.elapsed();
+
+        // C4 call (`GetInfoRequest.tokenize_text`), excluded from
+        // FR-KNO-09's own-compute budget -- timed separately, above.
         let count = inference.count_tokens(&candidate).await?;
         if count > budget_tokens {
             break;
         }
         text = candidate;
     }
-    Ok(text)
+    Ok((text, own_compute))
 }
 
 #[cfg(test)]
@@ -115,5 +141,70 @@ mod tests {
     fn deictic_text_falls_back_to_the_bare_question_without_a_window() {
         let text = format_deictic(None, "what's the weather");
         assert_eq!(text, "The user asked: what's the weather");
+    }
+
+    /// FR-KNO-09 (phases.md §8.3 PF: "Own compute p99 < 5 ms, instrumented
+    /// spans"): a fast, deterministic, no-IPC measurement of exactly the
+    /// operations `assemble()`/`truncate_evidence()` time as `own_compute`
+    /// (taint union, deictic formatting, per-chunk taint wrapping + string
+    /// building) -- `assemble()` itself can't be called without a real
+    /// `InferenceClient` (every chunk needs a real `GetInfoRequest`), so
+    /// this exercises the identical non-IPC code paths directly, n=200,
+    /// for a real p99 rather than trusting a single sample.
+    /// `tests/ask_end_to_end.rs`'s live test additionally confirms one real
+    /// `own_compute` sample from the actual full C3+C4 path stays this low.
+    #[test]
+    fn own_compute_for_the_non_ipc_portions_of_assembly_is_well_under_budget() {
+        use neuroos_health::Histogram;
+        use neuroos_proto::v1::Taint;
+
+        let evidence: Vec<ChunkMatch> = (0..5)
+            .map(|i| ChunkMatch {
+                chunk_id: format!("chunk-{i}"),
+                entity_id: i,
+                text: "some real-looking evidence text ".repeat(40),
+                taint: Some(Taint {
+                    flags: if i % 2 == 0 { 0 } else { 1 },
+                }),
+                t_ns: 0,
+                domain: "notes".to_string(),
+                distance: 0.1,
+            })
+            .collect();
+        let window = WindowContext {
+            app_id: "org.mozilla.firefox".into(),
+            title: "quarterly revenue dashboard".into(),
+            pid: 0,
+            root_pid: 0,
+            t_start_ns: 0,
+            t_end_ns: 0,
+            dwell_ms: 0,
+        };
+
+        let hist = Histogram::new();
+        for _ in 0..200 {
+            let t = Instant::now();
+            let taint = taint_wrap::union_taint(&evidence);
+            let _deictic = format_deictic(Some(&window), "what does the revenue dashboard say");
+            let mut text = String::new();
+            for chunk in &evidence {
+                let chunk_taint =
+                    TaintFlags::from_bits_truncate(chunk.taint.as_ref().map_or(0, |t| t.flags));
+                let wrapped = taint_wrap::wrap_if_tainted(&chunk.text, chunk_taint);
+                text = if text.is_empty() {
+                    wrapped
+                } else {
+                    format!("{text}\n---\n{wrapped}")
+                };
+            }
+            let _final = format!("{SYSTEM_PREAMBLE}\n\nx\n\nEvidence:\n{text}");
+            hist.record(t.elapsed());
+            std::hint::black_box(&taint);
+        }
+        let p99 = neuroos_health::p99_ns(&hist.to_proto()).expect("200 samples must yield a p99");
+        assert!(
+            p99 < 5_000_000,
+            "FR-KNO-09: own-compute p99 must be < 5ms, measured {p99}ns over 200 samples"
+        );
     }
 }

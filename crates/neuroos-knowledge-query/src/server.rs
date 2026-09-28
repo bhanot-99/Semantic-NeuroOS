@@ -3,7 +3,9 @@
 //! calls in). Wraps [`crate::orchestrate::ask`] behind a real IPC server,
 //! same shape as `neuroos-storage::server`.
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use neuroos_health::HealthServer;
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
 use neuroos_proto::v1::{
     AskResponse, Envelope, Error, ErrorCode, RenderGraphViewResponse, Taint, envelope,
@@ -18,6 +20,12 @@ use crate::orchestrate;
 use crate::storage_client::StorageClient;
 use crate::voice_client::VoiceClient;
 
+/// FR-KNO-09's own-compute measurement lives under this name in `ask`'s
+/// `HealthResponse.latency_histograms` -- `neuroosctl status`-style
+/// tooling (or a direct `HealthRequest`) reads `p99_ns` off it the same
+/// way it already does for every other component's histograms.
+pub const OWN_COMPUTE_HISTOGRAM: &str = "ask_own_compute_ns";
+
 /// Every downstream client `ask()` needs, bundled so `serve()` has one
 /// cheap-to-clone value per connection instead of five. Each client is
 /// just a socket `PathBuf` wrapper -- cloning opens no new connection.
@@ -28,6 +36,10 @@ pub struct Clients {
     pub inference: InferenceClient,
     pub kernel: KernelClient,
     pub distill_cache: DistillationCache,
+    /// Shared with the `component_health_sock` endpoint (`main.rs`) so
+    /// FR-KNO-09's own-compute figure is visible the same way every other
+    /// component's latency histograms already are.
+    pub health: Arc<HealthServer>,
 }
 
 pub async fn serve(clients: Clients, path: PathBuf, allowed_uids: Vec<u32>) {
@@ -102,13 +114,20 @@ async fn handle_request(env: Envelope, clients: &Clients) -> Envelope {
             )
             .await
             {
-                Ok(result) => envelope::Body::AskResponse(AskResponse {
-                    answer: result.answer,
-                    taint: Some(Taint {
-                        flags: result.taint.bits(),
-                    }),
-                    degraded: result.degraded,
-                }),
+                Ok(result) => {
+                    // FR-KNO-09: recorded regardless of degraded/approved
+                    // outcome -- own-compute is spent either way.
+                    clients
+                        .health
+                        .record_latency(OWN_COMPUTE_HISTOGRAM, result.own_compute);
+                    envelope::Body::AskResponse(AskResponse {
+                        answer: result.answer,
+                        taint: Some(Taint {
+                            flags: result.taint.bits(),
+                        }),
+                        degraded: result.degraded,
+                    })
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "ask() failed, answering degraded");
                     degraded_response()
@@ -221,6 +240,7 @@ mod tests {
             inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
             kernel: KernelClient::new(kernel_sock),
             distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
         };
 
         tokio::spawn(serve(clients, knowledge_sock.clone(), vec![my_uid]));
@@ -266,6 +286,7 @@ mod tests {
             inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
             kernel: KernelClient::new(dir.path().join("kernel-nonexistent.sock")),
             distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
         };
         tokio::spawn(serve(clients, knowledge_sock.clone(), vec![my_uid]));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -335,6 +356,7 @@ mod tests {
             inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
             kernel: KernelClient::new(dir.path().join("kernel-nonexistent.sock")),
             distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
         };
         tokio::spawn(serve(clients, knowledge_sock.clone(), vec![my_uid]));
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -582,6 +582,7 @@ mod tests {
             inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
             kernel: KernelClient::new(kernel_sock),
             distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
         };
         tokio::spawn(server::serve(clients, knowledge_sock, vec![my_uid]));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -634,6 +635,7 @@ mod tests {
             inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
             kernel: KernelClient::new(dir.path().join("kernel-nonexistent.sock")),
             distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
         };
         tokio::spawn(server::serve(clients, knowledge_sock, vec![my_uid]));
         tokio::time::sleep(Duration::from_millis(50)).await;

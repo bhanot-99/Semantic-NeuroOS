@@ -27,7 +27,7 @@ async fn main() {
         "neuroos-knowledge-query v",
         env!("CARGO_PKG_VERSION")
     ));
-    tokio::spawn(health.serve(
+    tokio::spawn(health.clone().serve(
         neuroos_common::paths::component_health_sock("neuroos-knowledge-query"),
         vec![my_uid],
     ));
@@ -41,6 +41,7 @@ async fn main() {
         inference: InferenceClient::new(neuroos_common::paths::inference_sock()),
         kernel: KernelClient::new(neuroos_common::paths::kernel_sock()),
         distill_cache: DistillationCache::new(),
+        health,
     };
 
     server::serve(

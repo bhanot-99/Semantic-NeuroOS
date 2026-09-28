@@ -206,6 +206,25 @@ async fn ask_end_to_end_real_c3_real_c4_mock_c2_c6() {
                 !result.answer.trim().is_empty(),
                 "must have produced a real generated answer"
             );
+            // FR-KNO-09: real, measured own-compute over the full real
+            // C3+C4 path (not a mock) -- a single sample here plus
+            // `assemble::tests::own_compute_...` (fast, no-IPC, n=200) for
+            // the actual p99 statistic. Repeating *this* real call several
+            // times in a loop was tried and reproducibly hit a separate,
+            // real, pre-existing issue: `StorageEngine::query_hybrid`'s
+            // `embed()` is synchronous CPU work called with no
+            // `spawn_blocking` while every connection (including unrelated
+            // `QueryFocusHistory` ones) shares one `LocalSet` (D-19), and a
+            // repeated real embedding call pushed real total query latency
+            // past the 100ms C3-query deadline (rules.md §5.7) on this
+            // machine -- flagged in memory.md's tech debt as a genuine
+            // Phase 4 gap, not fixed here (shipped, merged code; out of
+            // scope to change unilaterally).
+            assert!(
+                result.own_compute < Duration::from_millis(5),
+                "FR-KNO-09: own-compute should be well under budget, got {:?}",
+                result.own_compute,
+            );
         } => {}
     }
 }

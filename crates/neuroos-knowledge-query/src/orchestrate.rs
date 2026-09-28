@@ -2,6 +2,8 @@
 //! (Architecture.md §6.1) -- preamble first, then deictic snap + evidence
 //! retrieval in parallel, prompt assembly with taint wrapping, a C6
 //! capability check, and finally a real C4 generation.
+use std::time::{Duration, Instant};
+
 use neuroos_taint::TaintFlags;
 
 use crate::assemble;
@@ -76,6 +78,11 @@ pub struct AskResult {
     /// than a grounded answer (rules.md §5.6), not an error, since a
     /// denial is an expected, correctly-handled outcome, not a failure.
     pub degraded: bool,
+    /// FR-KNO-09: total C5-owned compute for this call, excluding every
+    /// C3/C4/C6 IPC round trip (`voice`/`storage`/`kernel`/`inference`
+    /// `.await`s are never included) -- see [`assemble::AssembledPrompt`]'s
+    /// own doc comment for how `assemble`'s share of this is measured.
+    pub own_compute: Duration,
 }
 
 /// The full hot path: preamble, parallel deictic snap + evidence
@@ -107,14 +114,21 @@ pub async fn ask(
         },
     )?;
 
+    let mut own_compute = Duration::ZERO;
+
     // FR-KNO-05: fire-and-forget, never on the critical path to the
     // answer below (rules.md AB-11).
     if !chunks.is_empty() {
+        let t = Instant::now();
         let raw_evidence_text = chunks
             .iter()
             .map(|c| c.text.as_str())
             .collect::<Vec<_>>()
             .join("\n---\n");
+        own_compute += t.elapsed();
+
+        // C4 call (`GetInfoRequest.tokenize_text`), excluded from
+        // FR-KNO-09's own-compute budget.
         if let Ok(raw_tokens) = inference.count_tokens(&raw_evidence_text).await {
             distill::maybe_spawn_distillation(
                 inference.clone(),
@@ -127,7 +141,9 @@ pub async fn ask(
     }
 
     let prompt = assemble::assemble(inference, question, window.as_ref(), &chunks).await?;
+    own_compute += prompt.own_compute;
 
+    // C6 call, excluded from FR-KNO-09's own-compute budget.
     let approved = kernel
         .evaluate_capability(CAPABILITY_GENERATE, prompt.taint)
         .await?;
@@ -136,9 +152,11 @@ pub async fn ask(
             answer: "I can't do that right now.".to_string(),
             taint: prompt.taint,
             degraded: true,
+            own_compute,
         });
     }
 
+    // C4 call, excluded from FR-KNO-09's own-compute budget.
     let answer = inference
         .generate(TEXT_RING_NAME, &prompt.text, GENERATE_MAX_TOKENS)
         .await?;
@@ -146,5 +164,6 @@ pub async fn ask(
         answer,
         taint: prompt.taint,
         degraded: false,
+        own_compute,
     })
 }
