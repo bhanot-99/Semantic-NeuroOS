@@ -3960,6 +3960,7 @@ dependencies = [
  "neuroos-common",
  "neuroos-health",
  "neuroos-ipc",
+ "neuroos-monitor",
  "neuroos-proto",
  "neuroos-taint",
  "notify",

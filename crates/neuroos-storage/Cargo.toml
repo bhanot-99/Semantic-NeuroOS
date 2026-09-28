@@ -30,3 +30,4 @@ notify = "6"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+neuroos-monitor = { path = "../neuroos-monitor", version = "0.1.0" }
