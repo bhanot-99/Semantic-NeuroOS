@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::index::vector::IvfHnswFlatIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::{CompactionOptions, OptimizeAction};
 use lancedb::{Connection, Table};
 use neuroos_health::{Histogram, p99_ns};
 
@@ -170,7 +171,24 @@ fn decode_batch(batch: &RecordBatch, has_distance: bool) -> Result<Vec<ChunkMatc
 }
 
 pub struct LanceStore {
-    conn: Connection,
+    /// BUG-002: opened once in `open()` and reused for every call. LanceDB's
+    /// own `Table` is meant to be long-lived (its `DatasetConsistencyWrapper`
+    /// tracks the dataset's version internally, and its own test suite --
+    /// `table/dataset.rs`'s `test_iops_open_strong_consistency`/
+    /// `test_reload_resets_consistency_timer` -- measures real read IOPS to
+    /// prove repeated calls on the *same* handle cost ~0 extra I/O). Calling
+    /// `conn.table_names()` (a directory listing) + `conn.open_table()` (a
+    /// manifest read) on every `query`/`insert`/etc. call instead, as this
+    /// used to, re-pays that I/O on every single request -- measured as the
+    /// dominant cost of the 4-8x-over-budget flat-scan latency (phases.md
+    /// §7.3 PF). Safe to hold across writes: every write here goes through
+    /// this same connection's own `Table` handles (no other process/writer
+    /// touches this LanceDB directory), and `Table::add`/`delete`/
+    /// `merge_insert` all call the wrapper's own `update()` on success, so a
+    /// query issued right after a write on the *same* handle always sees
+    /// that write -- confirmed directly in `table/dataset.rs`'s
+    /// `test_update_stores_newer_version`.
+    tables: HashMap<&'static str, Table>,
     /// FR-STO-07: per-family query-latency histogram driving HNSW
     /// promotion (not persisted — resets on restart, which just means the
     /// promotion decision re-measures fresh instead of carrying over a
@@ -182,24 +200,24 @@ pub struct LanceStore {
 }
 
 impl LanceStore {
-    /// Opens (creating if needed) the LanceDB database at `path` and
-    /// ensures every domain-family table exists (empty tables are cheap and
-    /// this keeps `insert`/`query` from needing a "does the table exist yet"
-    /// branch on every call).
+    /// Opens (creating if needed) the LanceDB database at `path` and opens
+    /// every domain-family table exactly once, caching the handles in
+    /// `tables` (BUG-002) — every other method looks them up there instead
+    /// of re-opening.
     pub async fn open(path: &Path) -> Result<Self, LanceError> {
         let uri = path
             .to_str()
             .ok_or_else(|| LanceError::InvalidPath(path.to_path_buf()))?;
         let conn = lancedb::connect(uri).execute().await?;
-        let store = Self {
-            conn,
+        let mut tables = HashMap::with_capacity(FAMILIES.len());
+        for family in FAMILIES {
+            tables.insert(*family, Self::open_or_create_table(&conn, family).await?);
+        }
+        Ok(Self {
+            tables,
             query_latencies: Mutex::new(HashMap::new()),
             promoted: Mutex::new(HashSet::new()),
-        };
-        for family in FAMILIES {
-            store.ensure_table(family).await?;
-        }
-        Ok(store)
+        })
     }
 
     fn check_family(family: &str) -> Result<(), LanceError> {
@@ -210,15 +228,26 @@ impl LanceStore {
         }
     }
 
-    async fn ensure_table(&self, family: &str) -> Result<Table, LanceError> {
-        Self::check_family(family)?;
-        let names = self.conn.table_names().execute().await?;
+    /// One-time (per family, called only from `open()`) open-or-create; the
+    /// real disk I/O this used to pay on every hot-path call (BUG-002).
+    async fn open_or_create_table(conn: &Connection, family: &str) -> Result<Table, LanceError> {
+        let names = conn.table_names().execute().await?;
         if names.iter().any(|n| n == family) {
-            Ok(self.conn.open_table(family).execute().await?)
+            Ok(conn.open_table(family).execute().await?)
         } else {
             let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(empty_reader());
-            Ok(self.conn.create_table(family, reader).execute().await?)
+            Ok(conn.create_table(family, reader).execute().await?)
         }
+    }
+
+    /// O(1) lookup of `family`'s already-open table — no I/O (BUG-002).
+    /// Every `FAMILIES` entry is opened eagerly in `open()`, so a missing
+    /// entry here can only mean an invalid family name.
+    fn table(&self, family: &str) -> Result<&Table, LanceError> {
+        Self::check_family(family)?;
+        self.tables
+            .get(family)
+            .ok_or_else(|| LanceError::UnknownFamily(family.to_string()))
     }
 
     /// FR-STO-04: batched insert (the ingest path's batching requirement —
@@ -227,7 +256,7 @@ impl LanceStore {
         if chunks.is_empty() {
             return Ok(());
         }
-        let table = self.ensure_table(family).await?;
+        let table = self.table(family)?;
         let batch = records_to_batch(chunks)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema()),
@@ -246,7 +275,7 @@ impl LanceStore {
         vector: &[f32],
         top_k: usize,
     ) -> Result<Vec<ChunkMatch>, LanceError> {
-        let table = self.ensure_table(family).await?;
+        let table = self.table(family)?;
         let start = Instant::now();
         let batches = table
             .query()
@@ -263,7 +292,7 @@ impl LanceStore {
             .collect::<Result<Vec<_>, _>>()
             .map(|nested| nested.into_iter().flatten().collect());
         if self.record_query_latency(family, elapsed) {
-            self.promote_to_hnsw(family, &table).await;
+            self.promote_to_hnsw(family, table).await;
         }
         results
     }
@@ -326,15 +355,29 @@ impl LanceStore {
 
     /// FR-STO-05's `QueryHybridVectorText`: search every family (a question
     /// isn't scoped to one domain) and merge by distance.
+    ///
+    /// BUG-002: each family is an independent LanceDB table (its own files,
+    /// its own `Table` handle in `self.tables`), so there's no correctness
+    /// reason to query them one at a time -- structurally correct to run
+    /// concurrently. Note: this alone did not measurably reduce real
+    /// end-to-end latency in this session's own testing (see BUGS.md's
+    /// BUG-002 write-up); `storage.sock`'s connection handling is pinned to
+    /// one `LocalSet` thread (`server.rs`), so the real win here depends on
+    /// whether LanceDB's query execution yields control back to the
+    /// executor mid-poll, which wasn't confirmed. Kept as a correct,
+    /// zero-risk improvement, not a proven fix on its own.
     pub async fn query_all_families(
         &self,
         vector: &[f32],
         top_k: usize,
     ) -> Result<Vec<ChunkMatch>, LanceError> {
-        let mut all = Vec::new();
-        for family in FAMILIES {
-            all.extend(self.query(family, vector, top_k).await?);
-        }
+        let per_family = futures::future::try_join_all(
+            FAMILIES
+                .iter()
+                .map(|family| self.query(family, vector, top_k)),
+        )
+        .await?;
+        let mut all: Vec<ChunkMatch> = per_family.into_iter().flatten().collect();
         all.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         all.truncate(top_k);
         Ok(all)
@@ -346,7 +389,7 @@ impl LanceStore {
     /// meaningless here (no query vector); callers doing a re-index never
     /// look at it.
     pub async fn all_chunks(&self, family: &str) -> Result<Vec<ChunkMatch>, LanceError> {
-        let table = self.ensure_table(family).await?;
+        let table = self.table(family)?;
         let batches = table
             .query()
             .execute()
@@ -372,7 +415,7 @@ impl LanceStore {
         if chunks.is_empty() {
             return Ok(());
         }
-        let table = self.ensure_table(family).await?;
+        let table = self.table(family)?;
         let batch = records_to_batch(chunks)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema()),
@@ -387,7 +430,7 @@ impl LanceStore {
     /// LanceDB SQL-like filter, e.g. `"entity_id IN (1,2,3)"`) from one
     /// family.
     pub async fn delete(&self, family: &str, predicate: &str) -> Result<(), LanceError> {
-        let table = self.ensure_table(family).await?;
+        let table = self.table(family)?;
         table.delete(predicate).await?;
         Ok(())
     }
@@ -396,6 +439,37 @@ impl LanceStore {
     pub async fn delete_all_families(&self, predicate: &str) -> Result<(), LanceError> {
         for family in FAMILIES {
             self.delete(family, predicate).await?;
+        }
+        Ok(())
+    }
+
+    /// BUG-002: real telemetry ingest calls `insert` one chunk at a time
+    /// (`store_chunk`'s own doc comment: "fine at telemetry ingest rates" --
+    /// batching is only the spool/replay path's concern), and Lance's
+    /// on-disk format is append-only, so every single-row insert becomes
+    /// its own fragment *file*. A flat/KNN scan has to open every fragment
+    /// in a table, so file *count* (not row count) drives its cost. Real
+    /// measurement against this machine's own ~8h recording found a family
+    /// with real-world-typical ingest volume had accumulated 192 fragment
+    /// files (`attention.lance/data/`), and that alone accounted for
+    /// essentially the entire ~170-190ms `query_all_families` was costing
+    /// -- the other four (still-empty) families cost next to nothing.
+    /// `lance`'s own docs describe exactly this ("small files can hurt read
+    /// and write performance... if writes are run frequently, compaction
+    /// should run frequently too") and `optimize(Compact)` is its answer:
+    /// merge small fragments into fewer, larger ones. Not on the hot
+    /// ingest path (that would trade ingest latency for query latency,
+    /// rules.md AB-11) -- called from `StorageEngine::backup` instead,
+    /// riding the existing 6-hourly maintenance cadence (Architecture.md
+    /// §7.5).
+    pub async fn compact_all_families(&self) -> Result<(), LanceError> {
+        for family in FAMILIES {
+            self.table(family)?
+                .optimize(OptimizeAction::Compact {
+                    options: CompactionOptions::default(),
+                    remap_options: None,
+                })
+                .await?;
         }
         Ok(())
     }
