@@ -32,6 +32,7 @@ pub enum KernelClientError {
     UnexpectedResponse,
 }
 
+#[derive(Clone)]
 pub struct KernelClient {
     socket_path: PathBuf,
 }

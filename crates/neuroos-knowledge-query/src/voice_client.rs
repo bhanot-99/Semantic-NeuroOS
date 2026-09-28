@@ -30,6 +30,7 @@ pub enum VoiceClientError {
     UnexpectedResponse,
 }
 
+#[derive(Clone)]
 pub struct VoiceClient {
     socket_path: PathBuf,
 }

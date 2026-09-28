@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
 use neuroos_proto::v1::{
-    ChunkMatch, Envelope, FocusHistoryRow, QueryFocusHistoryRequest, QueryHybridRequest, envelope,
+    ChunkMatch, EdgeRow, EntityRow, Envelope, FocusHistoryRow, ListEdgesRequest,
+    ListEntitiesRequest, QueryFocusHistoryRequest, QueryHybridRequest, envelope,
 };
 
 /// rules.md §5.7: every C3 query gets a 100 ms deadline.
@@ -31,6 +32,7 @@ pub enum StorageClientError {
     UnexpectedResponse,
 }
 
+#[derive(Clone)]
 pub struct StorageClient {
     socket_path: PathBuf,
 }
@@ -106,6 +108,30 @@ impl StorageClient {
             .await?;
         match body {
             envelope::Body::QueryHybridResponse(r) => Ok(r.matches),
+            _ => Err(StorageClientError::UnexpectedResponse),
+        }
+    }
+
+    /// FR-KNO-11: every entity, for the graph view (P5-S08).
+    pub async fn list_entities(&self, since_ns: u64) -> Result<Vec<EntityRow>, StorageClientError> {
+        let body = self
+            .round_trip(envelope::Body::ListEntitiesRequest(ListEntitiesRequest {
+                since_ns,
+            }))
+            .await?;
+        match body {
+            envelope::Body::ListEntitiesResponse(r) => Ok(r.entities),
+            _ => Err(StorageClientError::UnexpectedResponse),
+        }
+    }
+
+    /// FR-KNO-11: every edge, for the graph view (P5-S08).
+    pub async fn list_edges(&self) -> Result<Vec<EdgeRow>, StorageClientError> {
+        let body = self
+            .round_trip(envelope::Body::ListEdgesRequest(ListEdgesRequest {}))
+            .await?;
+        match body {
+            envelope::Body::ListEdgesResponse(r) => Ok(r.edges),
             _ => Err(StorageClientError::UnexpectedResponse),
         }
     }

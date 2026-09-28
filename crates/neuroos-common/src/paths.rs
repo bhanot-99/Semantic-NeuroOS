@@ -58,6 +58,13 @@ pub fn actions_log_file() -> PathBuf {
     data_dir().join("actions.jsonl")
 }
 
+/// `~/.local/share/neuroos/graph_view.html` (design.md §6, FR-KNO-11):
+/// written on demand by `neuroosctl graph open`, never served over a
+/// socket or network -- opened directly from disk by the browser.
+pub fn graph_view_html_file() -> PathBuf {
+    data_dir().join("graph_view.html")
+}
+
 /// `$XDG_RUNTIME_DIR/neuroos/` = `/run/user/$UID/neuroos/` (Architecture.md
 /// §5.2), mode 0700.
 pub fn runtime_dir() -> PathBuf {

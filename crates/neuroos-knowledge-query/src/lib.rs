@@ -11,6 +11,7 @@ pub mod graph_view;
 pub mod inference_client;
 pub mod kernel_client;
 pub mod orchestrate;
+pub mod server;
 pub mod storage_client;
 pub mod taint_wrap;
 pub mod voice_client;
