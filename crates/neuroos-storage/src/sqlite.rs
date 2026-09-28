@@ -860,4 +860,68 @@ mod tests {
         assert!(remaining.contains(&"old_but_confirmed".to_string()));
         assert!(!remaining.contains(&"stale_hypothesis".to_string()));
     }
+
+    // phases.md §7.3 SC: "SQL injection attempts via titles are inert
+    // (parameterised)." Every query in this module already binds values
+    // via rusqlite's `?N` placeholders (never string-formatted SQL), so
+    // this is a real proof of that, not a synthetic worry -- a malicious
+    // title/app_id is stored as inert data, never executed.
+    #[test]
+    fn sql_injection_via_focus_history_title_is_inert() {
+        let conn = open_in_memory().unwrap();
+        let payload = "'; DROP TABLE focus_history; --";
+        insert_focus_history(
+            &conn,
+            &FocusHistoryEntry {
+                app_id: payload,
+                title: payload,
+                pid: 0,
+                root_pid: 0,
+                t_start_ns: 0,
+                t_end_ns: 1,
+                dwell_ms: 1,
+            },
+        )
+        .unwrap();
+
+        // The table must still exist (a real DROP would make this query fail).
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM focus_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // The payload must be stored as inert literal text, not executed.
+        let (stored_app_id, stored_title): (String, String) = conn
+            .query_row("SELECT app_id, title FROM focus_history LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored_app_id, payload);
+        assert_eq!(stored_title, payload);
+    }
+
+    #[test]
+    fn sql_injection_via_entity_label_is_inert() {
+        let conn = open_in_memory().unwrap();
+        let payload = "x'; DROP TABLE entities; --";
+        upsert_entity(
+            &conn,
+            "notes",
+            "note",
+            payload,
+            TaintFlags::empty(),
+            0,
+            false,
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let stored_label: String = conn
+            .query_row("SELECT label FROM entities LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored_label, payload);
+    }
 }
