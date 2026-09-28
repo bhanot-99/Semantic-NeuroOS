@@ -66,3 +66,67 @@ message ForgetRequest {
 message ForgetResponse {
   uint64 forgotten = 1;
 }
+
+// FR-KNO-10 / Architecture.md §7.2: the Python cold worker's read/write
+// surface onto `entities`/`edges` -- AB-1 forbids it linking
+// `neuroos-storage` (or even SQLite) directly, so this is the only way it
+// reaches the graph.
+message EntityRow {
+  int64 id = 1;
+  string domain = 2;
+  string kind = 3;
+  string label = 4;
+  uint32 taint = 5;
+  uint64 created_ns = 6;
+  uint64 last_seen_ns = 7;
+  bool permanent = 8;
+}
+
+// since_ns = 0 means "every entity"; otherwise only entities last seen at
+// or after this instant (the cold worker only needs recently-active ones
+// to build co-occurrence candidates each job run).
+message ListEntitiesRequest {
+  uint64 since_ns = 1;
+}
+
+message ListEntitiesResponse {
+  repeated EntityRow entities = 1;
+}
+
+message EdgeRow {
+  int64 src = 1;
+  int64 dst = 2;
+  string kind = 3;
+  float weight = 4;
+  uint64 reinforced_ns = 5;
+  bool hypothesis = 6;
+}
+
+message ListEdgesRequest {}
+
+message ListEdgesResponse {
+  repeated EdgeRow edges = 1;
+}
+
+// Creates `(src, dst, kind)` if absent, otherwise replaces its
+// weight/reinforced_ns/hypothesis -- re-writing an edge the cold worker
+// still believes in is exactly how it resets the 72h TTL (Architecture.md
+// §7.2's "hypotheses: 72h TTL unless reinforced").
+message UpsertEdgeRequest {
+  EdgeRow edge = 1;
+}
+
+message UpsertEdgeResponse {
+  bool ok = 1;
+}
+
+// FR-KNO-10: "prune unreinforced edges after 72h" -- deletes every
+// hypothesis edge whose reinforced_ns is older than `older_than_ns`.
+// Non-hypothesis (confirmed) edges are never pruned by this call.
+message PruneEdgesRequest {
+  uint64 older_than_ns = 1;
+}
+
+message PruneEdgesResponse {
+  uint64 pruned = 1;
+}
