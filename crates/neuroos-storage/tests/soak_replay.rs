@@ -98,13 +98,14 @@ async fn replay_and_gate(dump_path: &Path) -> GateResult {
     let mut events_replayed = 0u64;
     let mut compiler_subprocesses = 0u64;
     while let Some(event) = reader.read_event().await.unwrap() {
-        if let Some(Payload::ProcTree(snapshot)) = &event.payload {
-            if snapshot.root_pid_known {
-                let root_is_cc1 = snapshot.processes.iter().any(|p| {
-                    p.pid == snapshot.root_pid && (p.comm == "cc1" || p.comm == "cc1plus")
-                });
-                compiler_subprocesses += u64::from(root_is_cc1);
-            }
+        if let Some(Payload::ProcTree(snapshot)) = &event.payload
+            && snapshot.root_pid_known
+        {
+            let root_is_cc1 = snapshot
+                .processes
+                .iter()
+                .any(|p| p.pid == snapshot.root_pid && (p.comm == "cc1" || p.comm == "cc1plus"));
+            compiler_subprocesses += u64::from(root_is_cc1);
         }
         engine
             .ingest(&event)
