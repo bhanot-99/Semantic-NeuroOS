@@ -86,10 +86,13 @@ class Context {
     // PRD FR-INF-05/FR-INF-06).
     //
     // `grammar_gbnf` empty => unconstrained sampling. `temperature` 0.0 =>
-    // greedy. `seed` 0 => a random seed.
+    // greedy. `seed` 0 => a random seed. `repetition_penalty` 1.0 =>
+    // disabled (BUG-005: penalizes the last kRepetitionPenaltyLastN sampled
+    // tokens so decoding on real, longer prompts doesn't degenerate into a
+    // repeated-token loop).
     neuroos::Expected<void, EngineError>
     generate(const std::string& prompt, std::uint32_t max_tokens, float temperature,
-             std::uint64_t seed, const std::string& grammar_gbnf,
+             std::uint64_t seed, const std::string& grammar_gbnf, float repetition_penalty,
              const std::function<void(const GeneratedToken&)>& on_token,
              const std::function<bool()>& should_cancel);
 

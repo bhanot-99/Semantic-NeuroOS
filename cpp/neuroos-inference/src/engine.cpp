@@ -152,9 +152,15 @@ Context::create(std::shared_ptr<Model> model, std::uint32_t n_ctx, std::uint32_t
     return Context(std::move(model), ctx, n_ctx);
 }
 
+namespace {
+// llama.cpp's own CLI default (repeat_last_n): how far back the repetition
+// penalty (BUG-005) looks when deciding a token is a repeat.
+constexpr std::int32_t kRepetitionPenaltyLastN = 64;
+} // namespace
+
 neuroos::Expected<void, EngineError>
 Context::generate(const std::string& prompt, std::uint32_t max_tokens, float temperature,
-                  std::uint64_t seed, const std::string& grammar_gbnf,
+                  std::uint64_t seed, const std::string& grammar_gbnf, float repetition_penalty,
                   const std::function<void(const GeneratedToken&)>& on_token,
                   const std::function<bool()>& should_cancel) {
     const llama_vocab* vocab = model_->vocab();
@@ -209,6 +215,18 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
     }
     if (grammar != nullptr) {
         llama_sampler_chain_add(chain.get(), grammar); // chain now owns it
+    }
+    if (repetition_penalty != 1.0F) {
+        // llama.h's own note on llama_sampler_init_penalties: searching for
+        // repeats over the full vocabulary is slow, so narrow to the top-k
+        // candidates first (BUG-005's fix doesn't need to change sampling
+        // quality beyond breaking loops, so a generous k is fine).
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(chain.get(),
+                                llama_sampler_init_penalties(kRepetitionPenaltyLastN,
+                                                             repetition_penalty,
+                                                             /*penalty_freq=*/0.0F,
+                                                             /*penalty_present=*/0.0F));
     }
     if (temperature <= 0.0F) {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());

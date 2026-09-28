@@ -50,10 +50,19 @@ void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envel
         return;
     }
     auto writer = rings.get_or_create(req.ring_name(), 0, 0);
-    std::uint64_t generation_id = writer.generation_id();
+    // BUG-004: fence this job's slots off from whatever a prior job on this
+    // same (likely reused) ring_name already wrote -- see
+    // RingWriter::next_generation's doc comment.
+    std::uint64_t generation_id = writer.next_generation();
 
-    Job job{generation_id, req.prompt(),       req.max_tokens(), req.temperature(),
-            req.seed(),    req.grammar_gbnf(), req.ring_name()};
+    // proto3 float fields default to 0.0, not 1.0, so a caller that never
+    // sets repetition_penalty (every caller predating BUG-005's fix) must
+    // not be read as "penalize with strength 0.0" -- that's not a real
+    // disabled value (1.0 is), just an unset field; treat it as disabled.
+    float repetition_penalty = req.repetition_penalty() > 0.0F ? req.repetition_penalty() : 1.0F;
+    Job job{generation_id,       req.prompt(),  req.max_tokens(),
+            req.temperature(),   req.seed(),    req.grammar_gbnf(),
+            req.ring_name(),     repetition_penalty};
     bool accepted =
         lanes.submit(req.lane() == neuroos::v1::LANE_BACKGROUND ? neuroos::v1::LANE_BACKGROUND
                                                                 : neuroos::v1::LANE_INTERACTIVE,
@@ -78,10 +87,12 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
         prompt << chunk << "\n";
     }
     auto writer = rings.get_or_create(req.ring_name(), 0, 0);
-    std::uint64_t generation_id = writer.generation_id();
+    // BUG-004: same fencing as handle_generate, above.
+    std::uint64_t generation_id = writer.next_generation();
 
-    Job job{generation_id, prompt.str(), req.max_tokens(), /*temperature=*/0.7F,
-            /*seed=*/0,    "",           req.ring_name()};
+    Job job{generation_id,      prompt.str(), req.max_tokens(), /*temperature=*/0.7F,
+            /*seed=*/0,         "",           req.ring_name(),
+            /*repetition_penalty=*/1.1F};
     bool accepted = lanes.submit(neuroos::v1::LANE_BACKGROUND, std::move(job));
     out->set_generation_id(generation_id);
     out->set_accepted(accepted);

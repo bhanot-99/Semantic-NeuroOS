@@ -22,6 +22,15 @@ use tokio::net::UnixStream;
 /// 250ms; C4 generation gets 30s.
 pub const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
 pub const GENERATE_DEADLINE: Duration = Duration::from_secs(30);
+/// BUG-005: pure greedy decoding (the old hardcoded `0.0`) reliably
+/// degenerates into a repeated-token loop on real, longer BitNet 2B
+/// prompts. Non-zero but still low: FR-KNO-03's answers should stay close
+/// to the grounded evidence, not get creative.
+pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// BUG-005: llama.cpp's own CLI default (`--repeat-penalty`) for the same
+/// reason -- 1.0 disables it; the old hardcoded call passed no penalty at
+/// all.
+pub const DEFAULT_REPETITION_PENALTY: f32 = 1.1;
 /// FR-KNO-05: distillation has a "≈6.0 s budget"; this leaves slack above
 /// that rather than matching it exactly.
 pub const DISTILL_DEADLINE: Duration = Duration::from_secs(15);
@@ -136,6 +145,27 @@ impl InferenceClient {
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String, InferenceClientError> {
+        self.generate_with_sampling(
+            ring_name,
+            prompt,
+            max_tokens,
+            DEFAULT_TEMPERATURE,
+            DEFAULT_REPETITION_PENALTY,
+        )
+        .await
+    }
+
+    /// Same as [`Self::generate`], but with `temperature`/`repetition_penalty`
+    /// configurable per call (BUG-005) instead of `generate`'s sane BitNet
+    /// 2B defaults.
+    pub async fn generate_with_sampling(
+        &self,
+        ring_name: &str,
+        prompt: &str,
+        max_tokens: u32,
+        temperature: f32,
+        repetition_penalty: f32,
+    ) -> Result<String, InferenceClientError> {
         let ring = self.attach_ring(ring_name).await?;
         let mut stream = self.connect().await?;
         let req = envelope_req(envelope::Body::GenerateRequest(GenerateRequest {
@@ -143,9 +173,10 @@ impl InferenceClient {
             max_tokens,
             lane: Lane::Interactive as i32,
             ring_name: ring_name.to_string(),
-            temperature: 0.0,
+            temperature,
             seed: 0,
             grammar_gbnf: String::new(),
+            repetition_penalty,
         }));
         write_envelope_deadline(&mut stream, &req, DEFAULT_MAX_FRAME, CONTROL_DEADLINE).await?;
         let resp = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, CONTROL_DEADLINE)

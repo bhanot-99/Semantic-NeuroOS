@@ -123,7 +123,7 @@ void LaneScheduler::worker_loop(std::deque<QueueEntry>& queue, std::mutex& queue
 
         auto result = ctx.generate(
             entry.job.prompt, entry.job.max_tokens, entry.job.temperature, entry.job.seed,
-            entry.job.grammar_gbnf,
+            entry.job.grammar_gbnf, entry.job.repetition_penalty,
             [&sink, &tokens_produced](const GeneratedToken& token) {
                 ++tokens_produced;
                 std::uint16_t flags = token.is_eos ? neuroos::shm::kFlagEos : 0;
@@ -140,16 +140,17 @@ void LaneScheduler::worker_loop(std::deque<QueueEntry>& queue, std::mutex& queue
         }
 
         {
-            // generation_id is the target ring's own generation counter
-            // (Architecture.md §5.5), not a job-unique id: two jobs on the
-            // same ring without an intervening cancel share the same value.
-            // A blind `erase(generation_id)` here could delete a *different*,
-            // still-running job's cancel flag if it was submitted (and
-            // inserted into `generations_`) between this job finishing and
-            // this cleanup running — found via cpp_inference_smoke's real
-            // Cancel test racing a real interactive job's tail latency
-            // against a background job on the same ring. Only erase the
-            // entry if it's still exactly the one this job registered.
+            // generation_id is now bumped per-job (server.cpp's
+            // `RingWriter::next_generation`, BUG-004), so this collision is
+            // rare rather than routine, but still defensive: a blind
+            // `erase(generation_id)` here could delete a *different*,
+            // still-running job's cancel flag if one happened to reuse this
+            // id (e.g. after the counter wraps) and was inserted into
+            // `generations_` between this job finishing and this cleanup
+            // running — found via cpp_inference_smoke's real Cancel test
+            // racing a real interactive job's tail latency against a
+            // background job on the same ring. Only erase the entry if it's
+            // still exactly the one this job registered.
             std::lock_guard<std::mutex> lock(generations_mutex_);
             auto it = generations_.find(entry.job.generation_id);
             if (it != generations_.end() && it->second == entry.cancelled) {

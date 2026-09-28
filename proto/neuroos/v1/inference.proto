@@ -19,6 +19,11 @@ message GenerateRequest {
   float temperature = 5;     // 0.0 = greedy
   uint64 seed = 6;           // 0 = engine picks a random seed
   string grammar_gbnf = 7;   // empty = unconstrained; GBNF text (P2-S05)
+  // BUG-005: 1.0 = disabled (no penalty). Penalizes the last
+  // kRepetitionPenaltyLastN (engine.cpp) sampled tokens so greedy/low-temp
+  // decoding on BitNet 2B doesn't degenerate into a repeated-token loop on
+  // long, substantive prompts.
+  float repetition_penalty = 8;
 }
 
 message GenerateResponse {

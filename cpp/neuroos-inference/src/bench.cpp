@@ -60,6 +60,7 @@ BenchResult bench_one(const std::shared_ptr<Model>& model, std::uint32_t n_ctx,
 
     auto gen_result = ctx.generate(
         prompt, kGenerateTokens, /*temperature=*/0.0F, /*seed=*/0, /*grammar_gbnf=*/"",
+        /*repetition_penalty=*/1.0F,
         [&timestamps](const GeneratedToken&) {
             timestamps.push_back(std::chrono::steady_clock::now());
         },
