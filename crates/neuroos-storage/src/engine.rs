@@ -180,6 +180,34 @@ impl StorageEngine {
         )?)
     }
 
+    /// FR-KNO-10: entities the Python cold worker builds co-occurrence
+    /// candidates from. `since_ns = 0` means every entity.
+    pub fn list_entities(
+        &self,
+        since_ns: u64,
+    ) -> Result<Vec<crate::sqlite::EntityRow>, EngineError> {
+        Ok(crate::sqlite::list_entities(&self.conn, since_ns)?)
+    }
+
+    /// FR-KNO-10: every edge, for the cold worker's APPNP propagation input.
+    pub fn list_edges(&self) -> Result<Vec<crate::sqlite::EdgeRow>, EngineError> {
+        Ok(crate::sqlite::list_edges(&self.conn)?)
+    }
+
+    /// FR-KNO-10: create/reinforce one edge the cold worker computed.
+    pub fn upsert_edge(&self, edge: &crate::sqlite::EdgeRow) -> Result<(), EngineError> {
+        Ok(crate::sqlite::upsert_edge(&self.conn, edge)?)
+    }
+
+    /// FR-KNO-10: "prune unreinforced edges after 72h" -- returns how many
+    /// hypothesis edges were deleted.
+    pub fn prune_hypothesis_edges(&self, older_than_ns: u64) -> Result<u64, EngineError> {
+        Ok(crate::sqlite::prune_hypothesis_edges(
+            &self.conn,
+            older_than_ns,
+        )?)
+    }
+
     /// FR-STO-08 (P4-S06): ingests one already-parsed spool document as
     /// `external_documents`, always tagged `EXTERNAL_UNTRUSTED` — taint is
     /// never lowered from here on (R0-3). Deleting the spool file on

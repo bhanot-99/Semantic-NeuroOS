@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
 use neuroos_proto::v1::{
-    ChunkMatch, Envelope, Error, ErrorCode, FocusHistoryRow, ForgetResponse,
-    QueryFocusHistoryResponse, QueryHybridResponse, Taint, envelope, forget_request,
+    ChunkMatch, EdgeRow, EntityRow, Envelope, Error, ErrorCode, FocusHistoryRow, ForgetResponse,
+    ListEdgesResponse, ListEntitiesResponse, PruneEdgesResponse, QueryFocusHistoryResponse,
+    QueryHybridResponse, Taint, UpsertEdgeResponse, envelope, forget_request,
 };
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -140,6 +141,71 @@ async fn handle_request(env: Envelope, engine: &Arc<Mutex<StorageEngine>>) -> En
                     forgotten: forgotten as u64,
                 }),
                 Err(e) => internal_error(format!("Forget failed: {e}")),
+            }
+        }
+        Some(envelope::Body::ListEntitiesRequest(req)) => {
+            let engine = engine.lock().await;
+            match engine.list_entities(req.since_ns) {
+                Ok(rows) => envelope::Body::ListEntitiesResponse(ListEntitiesResponse {
+                    entities: rows
+                        .into_iter()
+                        .map(|e| EntityRow {
+                            id: e.id,
+                            domain: e.domain,
+                            kind: e.kind,
+                            label: e.label,
+                            taint: e.taint,
+                            created_ns: e.created_ns,
+                            last_seen_ns: e.last_seen_ns,
+                            permanent: e.permanent,
+                        })
+                        .collect(),
+                }),
+                Err(e) => internal_error(format!("ListEntities failed: {e}")),
+            }
+        }
+        Some(envelope::Body::ListEdgesRequest(_)) => {
+            let engine = engine.lock().await;
+            match engine.list_edges() {
+                Ok(rows) => envelope::Body::ListEdgesResponse(ListEdgesResponse {
+                    edges: rows
+                        .into_iter()
+                        .map(|e| EdgeRow {
+                            src: e.src,
+                            dst: e.dst,
+                            kind: e.kind,
+                            weight: e.weight,
+                            reinforced_ns: e.reinforced_ns,
+                            hypothesis: e.hypothesis,
+                        })
+                        .collect(),
+                }),
+                Err(e) => internal_error(format!("ListEdges failed: {e}")),
+            }
+        }
+        Some(envelope::Body::UpsertEdgeRequest(req)) => {
+            let engine = engine.lock().await;
+            let result = match req.edge {
+                Some(e) => engine.upsert_edge(&crate::sqlite::EdgeRow {
+                    src: e.src,
+                    dst: e.dst,
+                    kind: e.kind,
+                    weight: e.weight,
+                    reinforced_ns: e.reinforced_ns,
+                    hypothesis: e.hypothesis,
+                }),
+                None => Ok(()),
+            };
+            match result {
+                Ok(()) => envelope::Body::UpsertEdgeResponse(UpsertEdgeResponse { ok: true }),
+                Err(e) => internal_error(format!("UpsertEdge failed: {e}")),
+            }
+        }
+        Some(envelope::Body::PruneEdgesRequest(req)) => {
+            let engine = engine.lock().await;
+            match engine.prune_hypothesis_edges(req.older_than_ns) {
+                Ok(pruned) => envelope::Body::PruneEdgesResponse(PruneEdgesResponse { pruned }),
+                Err(e) => internal_error(format!("PruneEdges failed: {e}")),
             }
         }
         _ => internal_error("unsupported request on storage.sock"),
@@ -336,6 +402,206 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert!(matches!(resp.body, Some(envelope::Body::Error(_))));
+            } => {}
+        }
+    }
+
+    /// FR-KNO-10 (P5-S07 prereq): the Python cold worker's real
+    /// read/write/prune surface, proved end to end over a real
+    /// `storage.sock` -- not just the pure `sqlite.rs` unit tests.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn graph_rpcs_round_trip_over_a_real_storage_sock_server() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        // `edges` has a real `FOREIGN KEY REFERENCES entities(id)` -- seed
+        // two real entities via the normal ingest path so UpsertEdge below
+        // references ids that actually exist (in real use the cold worker
+        // always gets its ids from a prior ListEntities call).
+        use neuroos_proto::v1::raw_telemetry_event::Payload;
+        use neuroos_proto::v1::window_event::Kind;
+        use neuroos_proto::v1::{RawTelemetryEvent, ToplevelState, WindowEvent, WindowOpened};
+        let window_event = |toplevel_id: u64, at_ns: u64, kind: Kind| RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "wayland_cosmic".into(),
+            payload: Some(Payload::Window(WindowEvent {
+                toplevel_id,
+                kind: Some(kind),
+            })),
+        };
+        for (toplevel_id, app_id) in [
+            (1u64, "org.mozilla.firefox"),
+            (2u64, "org.gnome.TextEditor"),
+        ] {
+            engine
+                .ingest(&window_event(
+                    toplevel_id,
+                    0,
+                    Kind::Opened(WindowOpened {
+                        app_id: app_id.into(),
+                        title: "test window".into(),
+                        pid: 0,
+                        pid_known: false,
+                    }),
+                ))
+                .await
+                .unwrap();
+            engine
+                .ingest(&window_event(
+                    toplevel_id,
+                    0,
+                    Kind::StateChanged(neuroos_proto::v1::WindowStateChanged {
+                        states: vec![ToplevelState::Activated as i32],
+                    }),
+                ))
+                .await
+                .unwrap();
+            engine
+                .ingest(&window_event(
+                    toplevel_id,
+                    6_000_000_000,
+                    Kind::StateChanged(neuroos_proto::v1::WindowStateChanged { states: vec![] }),
+                ))
+                .await
+                .unwrap();
+        }
+        let seeded_entity_ids: Vec<i64> = engine
+            .list_entities(0)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            seeded_entity_ids.len(),
+            2,
+            "both windows must have become entities"
+        );
+
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("storage.sock");
+        let my_uid = current_uid();
+        tokio::select! {
+            _ = serve(Arc::new(Mutex::new(engine)), sock_path.clone(), vec![my_uid]) => {
+                panic!("storage.sock server exited unexpectedly");
+            }
+            _ = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut stream = connect(&sock_path, Duration::from_secs(1)).await.unwrap();
+
+                async fn roundtrip(
+                    stream: &mut tokio::net::UnixStream,
+                    body: envelope::Body,
+                ) -> envelope::Body {
+                    let req = Envelope {
+                        schema_version: 1,
+                        trace_id: "test".into(),
+                        request_id: 1,
+                        sent_at_ns: neuroos_common::now_ns(),
+                        body: Some(body),
+                    };
+                    write_envelope_deadline(stream, &req, DEFAULT_MAX_FRAME, Duration::from_secs(1))
+                        .await
+                        .unwrap();
+                    read_envelope_deadline(stream, DEFAULT_MAX_FRAME, Duration::from_secs(1))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .body
+                        .unwrap()
+                }
+
+                // The two seeded windows must come back over the real
+                // socket, not just via the in-process `engine` call used
+                // to seed them.
+                match roundtrip(
+                    &mut stream,
+                    envelope::Body::ListEntitiesRequest(neuroos_proto::v1::ListEntitiesRequest {
+                        since_ns: 0,
+                    }),
+                )
+                .await
+                {
+                    envelope::Body::ListEntitiesResponse(r) => assert_eq!(r.entities.len(), 2),
+                    other => panic!("unexpected response: {other:?}"),
+                }
+
+                // No edges exist yet -- ListEdges must answer empty, not
+                // error, before the UpsertEdge below creates one.
+                match roundtrip(
+                    &mut stream,
+                    envelope::Body::ListEdgesRequest(neuroos_proto::v1::ListEdgesRequest {}),
+                )
+                .await
+                {
+                    envelope::Body::ListEdgesResponse(r) => assert!(r.edges.is_empty()),
+                    other => panic!("unexpected response: {other:?}"),
+                }
+
+                match roundtrip(
+                    &mut stream,
+                    envelope::Body::UpsertEdgeRequest(neuroos_proto::v1::UpsertEdgeRequest {
+                        edge: Some(EdgeRow {
+                            src: seeded_entity_ids[0],
+                            dst: seeded_entity_ids[1],
+                            kind: "co_occurs".into(),
+                            weight: 1.5,
+                            reinforced_ns: 1_000,
+                            hypothesis: true,
+                        }),
+                    }),
+                )
+                .await
+                {
+                    envelope::Body::UpsertEdgeResponse(r) => assert!(r.ok),
+                    other => panic!("unexpected response: {other:?}"),
+                }
+
+                match roundtrip(
+                    &mut stream,
+                    envelope::Body::ListEdgesRequest(neuroos_proto::v1::ListEdgesRequest {}),
+                )
+                .await
+                {
+                    envelope::Body::ListEdgesResponse(r) => {
+                        assert_eq!(r.edges.len(), 1);
+                        assert_eq!(r.edges[0].weight, 1.5);
+                        assert!(r.edges[0].hypothesis);
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+
+                match roundtrip(
+                    &mut stream,
+                    envelope::Body::PruneEdgesRequest(neuroos_proto::v1::PruneEdgesRequest {
+                        older_than_ns: 2_000,
+                    }),
+                )
+                .await
+                {
+                    envelope::Body::PruneEdgesResponse(r) => assert_eq!(r.pruned, 1),
+                    other => panic!("unexpected response: {other:?}"),
+                }
+
+                match roundtrip(
+                    &mut stream,
+                    envelope::Body::ListEdgesRequest(neuroos_proto::v1::ListEdgesRequest {}),
+                )
+                .await
+                {
+                    envelope::Body::ListEdgesResponse(r) => {
+                        assert!(r.edges.is_empty(), "pruned edge must be gone");
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
             } => {}
         }
     }
