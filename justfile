@@ -15,7 +15,7 @@ cpp_build_glob := "cpp/build*"
 proto: proto-py
 
 proto-py:
-    protoc --proto_path=proto --python_out={{py_src_dir}} proto/neuroos/v1/*.proto
+    protoc --proto_path=proto --python_out={{py_src_dir}} --pyi_out={{py_src_dir}} proto/neuroos/v1/*.proto
 
 # --- build ---------------------------------------------------------------
 
