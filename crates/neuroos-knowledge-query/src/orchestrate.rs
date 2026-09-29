@@ -37,6 +37,10 @@ pub const TEXT_RING_NAME: &str = "knowledge-text";
 /// the typical one), not a value derived from either FR.
 pub const GENERATE_MAX_TOKENS: u32 = 128;
 
+/// Answer when retrieval finds no relevant evidence and there is no
+/// deictic window to anchor on (C4 is not called).
+pub const NO_EVIDENCE_ANSWER: &str = "I don't know. Nothing in your recorded activity covers that.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AskError {
     #[error("preamble request failed: {0}")]
@@ -138,6 +142,18 @@ pub async fn ask(
                 raw_tokens,
             );
         }
+    }
+
+    // KPI-1 diagnosis: with nothing relevant retrieved and no deictic
+    // anchor, the small model rambles instead of declining. Decline
+    // without calling C4.
+    if chunks.is_empty() && window.is_none() {
+        return Ok(AskResult {
+            answer: NO_EVIDENCE_ANSWER.to_string(),
+            taint: TaintFlags::empty(),
+            degraded: false,
+            own_compute,
+        });
     }
 
     let prompt = assemble::assemble(inference, question, window.as_ref(), &chunks).await?;

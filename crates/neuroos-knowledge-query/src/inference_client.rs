@@ -24,9 +24,9 @@ pub const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
 pub const GENERATE_DEADLINE: Duration = Duration::from_secs(30);
 /// BUG-005: pure greedy decoding (the old hardcoded `0.0`) reliably
 /// degenerates into a repeated-token loop on real, longer BitNet 2B
-/// prompts. Non-zero but still low: FR-KNO-03's answers should stay close
-/// to the grounded evidence, not get creative.
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// prompts. Non-zero but low: FR-KNO-03's answers must stay close to the
+/// grounded evidence, not get creative.
+pub const DEFAULT_TEMPERATURE: f32 = 0.2;
 /// BUG-005: llama.cpp's own CLI default (`--repeat-penalty`) for the same
 /// reason -- 1.0 disables it; the old hardcoded call passed no penalty at
 /// all.

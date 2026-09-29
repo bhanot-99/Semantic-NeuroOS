@@ -6,7 +6,7 @@
 //! whole point of this eval is asking real questions about real
 //! remembered content, which the anonymised `tests/fixtures/telemetry/`
 //! copies can't support since their titles are hashed placeholders), runs
-//! >=50 real questions through the real full hot path (real C3 + real C4,
+//! at least 50 real questions through the real full hot path (real C3 + real C4,
 //! mock C2/C6, same as `ask_end_to_end.rs`), and writes a transcript for
 //! grading.
 //!
@@ -19,26 +19,11 @@
 //! committed, since the real answers can quote real personal browsing
 //! history.
 //!
-//! **First real run, 2026-09-28 (0/51 usable answers -- KPI-1 measured,
-//! not met)**: over this machine's real ~8h/17,000-event recording, every
-//! single one of the 51 scripted questions either (a) errored with
-//! `inference.sock returned an error: lane queue is full` -- C4's
-//! interactive lane (`kMaxQueueDepth = 4`, `cpp/neuroos-inference/src/
-//! lanes.hpp`) reported itself full under a merely-sequential, 500ms-apart
-//! real workload, a real resource-accounting bug, not contention -- or
-//! (b) when generation did run, produced a degenerate repeated-token loop
-//! (e.g. `"---\nbrave-browser: 0\n"` over and over to the 128-token cap)
-//! instead of a real answer. `InferenceClient::generate` hardcodes
-//! `temperature: 0.0, seed: 0` (greedy decoding, `src/
-//! inference_client.rs`) with no repetition penalty -- a well-known small-
-//! model failure mode that this session's earlier, much shorter
-//! synthetic-prompt tests never had enough context length to trigger. The
-//! first run (before a diagnostic `STORAGE_QUERY_DEADLINE` bump, reverted
-//! after) also hit real `storage.sock` timeouts on every question,
-//! corroborating this session's other query-latency finding at real data
-//! scale (see memory.md tech debt). None of the three are fixed here --
-//! all are real bugs in already-shipped Phase 2/4 code, out of scope to
-//! patch unilaterally mid-Phase-5-closure; recorded in memory.md.
+//! **Questions are machine-local too**: they are read one per line from
+//! `.dev-cache/telemetry-raw/questions.txt` (blank lines and `#` comments
+//! skipped), written by the owner against what this machine's own recording
+//! actually contains, plus a few negative controls (nothing recorded, expect
+//! a decline). They are not committed since they name real browsing history.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -130,75 +115,16 @@ fn spawn_real_inference() -> Option<InferenceProcess> {
     Some(InferenceProcess { child, tmp })
 }
 
-/// 50 real questions about the real content in this machine's own
-/// `.dev-cache/telemetry-raw/*.bin` (see that dump's real window titles --
-/// hardware research, general browsing, this very project's own work
-/// sessions, and media playback that the ingest filter's MPRIS demotion
-/// should make correctly *un*-answerable). A `t_ns` of 0 means "now"
-/// (no deictic anchor needed -- these are lookup questions, not "what's
-/// this" pointing questions, which P5-S01's own fixture suite already
-/// covers separately).
-fn scripted_questions() -> Vec<&'static str> {
-    vec![
-        // Hardware research (transparent/small displays, robots)
-        "what transparent display products was I researching",
-        "what did I find about the 2.4-inch transparent SSD1309 display",
-        "what was the StackChan robot I was looking at",
-        "what M5Stack products did I look up",
-        "what did I search for about Otto DIY robot",
-        "what Waveshare display products did I view",
-        "what did I find about the 1.51 inch transparent OLED display",
-        "what small HDMI touchscreen displays was I comparing",
-        "what did I look up about the Elecrow 5 inch touchscreen",
-        "what hologram cube display product did I see",
-        "what did I search for about a mini transparent display robot",
-        "what CNC aluminum USB display did I research",
-        "what AIDA64 sensor panel displays did I look at",
-        "did I look up anything about a GeekMagic Hello Cube",
-        "what DFRobot display product did I view",
-        // General browsing
-        "what did I search for about iPhone mini screen size",
-        "did I look up a Bitcoin price tracker",
-        "what phone did I look up on Amazon",
-        "did I visit AliExpress",
-        "what currency conversion did I search for",
-        "what OnePlus phone specs did I look at",
-        // This project's own work sessions
-        "what was I doing with memory.md and phase 4",
-        "what phase 5 work was I completing",
-        "did I open a pull request",
-        "what command did I run to install cloc",
-        "was I using the COSMIC terminal",
-        "what was in the file manager",
-        // Notes / Gemini Notebook
-        "what is in my Semantic Matrix notebook",
-        "what autonomous data architecture notes do I have",
-        // Media playback (expected: no evidence, since MPRIS is always demoted -- never becomes a persistent entity)
-        "what show was I watching in VLC",
-        "what episode of Bloodhounds did I watch last",
-        "summarize what happened in the TV show I was watching",
-        "what music was playing",
-        "what was playing in my media player an hour ago",
-        // Generic / no-evidence-expected sanity checks
-        "what is the capital of France",
-        "what did I have for lunch",
-        "what is my bank account password",
-        "did I email anyone today",
-        "what meetings do I have tomorrow",
-        // Broader lookups over the same real content, phrased differently
-        "summarize what I was researching about small displays for a project",
-        "what kind of desktop robot companion was I interested in",
-        "give me a list of the display products I was comparing",
-        "what was the last thing I searched for related to M5Stack",
-        "was I comparing prices for any electronics",
-        "what programming or development tools was I using",
-        "what website was I browsing the most",
-        "did I look at any Google search results about robots",
-        "what did I learn about the CoreS3 module",
-        "what secondary display options for a PC did I consider",
-        "what was open in my browser related to hardware",
-        "did I look up anything about a smart keychain robot",
-    ]
+/// Reads the machine-local scripted questions (see the file header).
+fn scripted_questions() -> Vec<String> {
+    let path = raw_dump_dir().join("questions.txt");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Live proof (P5's own KPI-1 harness), needs the real BitNet model, built
@@ -215,6 +141,10 @@ async fn kpi1_scripted_questions_over_real_recorded_telemetry() {
             "skipping: {} not found (raw recording already cleaned up on this machine? this eval is machine-local by nature)",
             dump_dir.display()
         );
+        return;
+    }
+    if !dump_dir.join("questions.txt").exists() {
+        eprintln!("skipping: {}/questions.txt not found", dump_dir.display());
         return;
     }
     let Some(inference_proc) = spawn_real_inference() else {

@@ -187,6 +187,16 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
     }
     resident_tokens_.resize(common);
 
+    // A fully cached prompt still needs its last token decoded: sampling
+    // reads the logits of the most recent llama_decode, which otherwise
+    // belong to a stale position (e.g. the previous request's last
+    // generated token).
+    if (common == prompt_tokens.size() && common > 0) {
+        --common;
+        llama_memory_seq_rm(mem, /*seq_id=*/0, static_cast<llama_pos>(common), -1);
+        resident_tokens_.resize(common);
+    }
+
     if (prompt_tokens.size() > common) {
         std::vector<llama_token> suffix(prompt_tokens.begin() + static_cast<long>(common),
                                         prompt_tokens.end());
