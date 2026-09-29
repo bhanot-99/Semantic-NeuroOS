@@ -17,7 +17,7 @@ neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
 neuroos-shm = { path = "../neuroos-shm", version = "0.1.0" }
 thiserror = "2"
 tracing = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

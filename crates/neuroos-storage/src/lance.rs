@@ -195,8 +195,11 @@ pub struct LanceStore {
     /// stale one; already-created indexes stay on disk regardless).
     query_latencies: Mutex<HashMap<String, Histogram>>,
     /// Families already promoted to HNSW this session, so a slow query
-    /// doesn't retry `create_index` every time.
-    promoted: Mutex<HashSet<String>>,
+    /// doesn't retry `create_index` every time. `Arc`-wrapped (not just
+    /// `Mutex`) so BUG-003's fix can clone a handle into the detached
+    /// `tokio::spawn`ed task that actually builds the index, without
+    /// needing `self: Arc<Self>` on every `LanceStore` method.
+    promoted: Arc<Mutex<HashSet<String>>>,
 }
 
 impl LanceStore {
@@ -216,7 +219,7 @@ impl LanceStore {
         Ok(Self {
             tables,
             query_latencies: Mutex::new(HashMap::new()),
-            promoted: Mutex::new(HashSet::new()),
+            promoted: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -292,7 +295,16 @@ impl LanceStore {
             .collect::<Result<Vec<_>, _>>()
             .map(|nested| nested.into_iter().flatten().collect());
         if self.record_query_latency(family, elapsed) {
-            self.promote_to_hnsw(family, table).await;
+            // BUG-003: `create_index` was previously `.await`ed right here,
+            // inside the query call that crossed the promotion threshold —
+            // that one query paid the *entire* index-build cost as its own
+            // latency (measured: 118 real seconds on a 20k-item corpus).
+            // Spawned as its own detached task instead: LanceDB serves flat
+            // scans for `family` until the index actually exists (no
+            // "index in progress" state to check — `create_index` just
+            // hasn't returned yet), so every other query keeps working at
+            // flat-scan latency while this builds in the background.
+            Self::spawn_hnsw_promotion(family.to_string(), table.clone(), self.promoted.clone());
         }
         results
     }
@@ -324,27 +336,33 @@ impl LanceStore {
         lock(&self.promoted).insert(family.to_string())
     }
 
-    /// Creates an `IVF_HNSW_FLAT` index on `table`'s `vector` column.
+    /// BUG-003: spawns `create_index` (`IVF_HNSW_FLAT` on `table`'s `vector`
+    /// column) as its own detached background task instead of running it
+    /// inline in the triggering query. Takes owned/`Arc`-cloned arguments
+    /// (not `&self`) because a `tokio::spawn`ed future must be `'static`.
     /// Best-effort: a training failure (e.g. too little data yet) logs and
-    /// un-marks `family` so the next qualifying query retries, rather than
-    /// failing the query that triggered it.
-    async fn promote_to_hnsw(&self, family: &str, table: &Table) {
-        let result = table
-            .create_index(
-                &["vector"],
-                Index::IvfHnswFlat(IvfHnswFlatIndexBuilder::default()),
-            )
-            .execute()
-            .await;
-        if let Err(err) = result {
-            tracing::warn!(family, error = %err, "FR-STO-07 HNSW promotion failed, will retry on a future slow query");
-            lock(&self.promoted).remove(family);
-        } else {
-            tracing::info!(
-                family,
-                "FR-STO-07: promoted family to HNSW index (p99 > 5ms)"
-            );
-        }
+    /// un-marks `family` in `promoted` so the next qualifying query's
+    /// `record_query_latency` retries, instead of leaving it permanently
+    /// stuck un-promoted.
+    fn spawn_hnsw_promotion(family: String, table: Table, promoted: Arc<Mutex<HashSet<String>>>) {
+        tokio::spawn(async move {
+            let result = table
+                .create_index(
+                    &["vector"],
+                    Index::IvfHnswFlat(IvfHnswFlatIndexBuilder::default()),
+                )
+                .execute()
+                .await;
+            if let Err(err) = result {
+                tracing::warn!(family, error = %err, "FR-STO-07 HNSW promotion failed, will retry on a future slow query");
+                lock(&promoted).remove(&family);
+            } else {
+                tracing::info!(
+                    family,
+                    "FR-STO-07: promoted family to HNSW index (p99 > 5ms)"
+                );
+            }
+        });
     }
 
     /// Test/introspection hook: whether `family` has been promoted to HNSW
@@ -678,6 +696,57 @@ mod tests {
         assert!(store.is_promoted("attention"));
         // Already promoted: further slow queries must not report again.
         assert!(!store.record_query_latency("attention", Duration::from_millis(50)));
+    }
+
+    // BUG-003: promotion must not block the triggering query on
+    // `create_index` — `query()` should return as soon as its own search
+    // completes, with the index build happening in a detached background
+    // task. Can't reproduce the real 118s stall on tiny test data (index
+    // build is near-instant there), but this proves the *shape* of the
+    // fix: `query()`'s own return isn't gated on `is_promoted` flipping,
+    // and it does eventually flip once the spawned task runs.
+    #[tokio::test]
+    async fn promotion_does_not_block_the_triggering_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        store
+            .insert(
+                "attention",
+                &[chunk("a", vec![1.0; EMBEDDING_DIM as usize])],
+            )
+            .await
+            .unwrap();
+        for _ in 0..MIN_SAMPLES_BEFORE_PROMOTION_CHECK - 1 {
+            store.record_query_latency("attention", Duration::from_millis(50));
+        }
+
+        // This call's own `record_query_latency` crosses the threshold and
+        // fires promotion — if it were still `.await`ed inline (the old
+        // bug), this query call itself would pay `create_index`'s cost.
+        let results = store
+            .query("attention", &[1.0; EMBEDDING_DIM as usize], 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "flat scan still serves results immediately"
+        );
+
+        // The spawned background task should complete shortly after,
+        // without the query call above having waited for it.
+        let mut promoted = store.is_promoted("attention");
+        for _ in 0..50 {
+            if promoted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            promoted = store.is_promoted("attention");
+        }
+        assert!(
+            promoted,
+            "background task should promote family to HNSW eventually"
+        );
     }
 
     #[tokio::test]
