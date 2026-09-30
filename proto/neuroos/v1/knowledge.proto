@@ -2,11 +2,33 @@
 syntax = "proto3";
 package neuroos.v1;
 
-// first-cut; full deictic/evidence/graph-view set lands in Phase 5
+import "neuroos/v1/common.proto";
+
+// FR-CLI-01 (`neuroosctl ask`) and the text half of the hot path
+// (Architecture.md §6.1) share this request; `t_ns` is the deictic-snap
+// anchor ("this" at the moment of asking) — 0 means "use now" (the text
+// CLI path has no real utterance start time the way a voice command does).
 message AskRequest {
   string question = 1;
+  uint64 t_ns = 2;
 }
 
 message AskResponse {
   string answer = 1;
+  // FR-KNO-07: union of every evidence chunk's taint flags that went into
+  // this answer, so a caller/test can verify tier decisions without
+  // re-deriving it.
+  Taint taint = 2;
+  // Set when C4/C3 was unavailable or timed out and this is a fail-soft
+  // apology rather than a grounded answer (rules.md §5.6).
+  bool degraded = 3;
+}
+
+// FR-KNO-11 (`neuroosctl graph open`, P5-S08): renders a self-contained
+// `graph_view.html` (inline D3, no network) from the current entities/edges
+// and writes it to `~/.local/share/neuroos/graph_view.html`.
+message RenderGraphViewRequest {}
+
+message RenderGraphViewResponse {
+  string path = 1;
 }

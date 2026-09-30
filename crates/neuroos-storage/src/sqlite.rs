@@ -118,6 +118,107 @@ pub fn upsert_entity(
     Ok(conn.last_insert_rowid())
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityRow {
+    pub id: i64,
+    pub domain: String,
+    pub kind: String,
+    pub label: String,
+    pub taint: u32,
+    pub created_ns: u64,
+    pub last_seen_ns: u64,
+    pub permanent: bool,
+}
+
+/// FR-KNO-10: entities the cold worker can build co-occurrence candidates
+/// from. `since_ns = 0` means every entity; otherwise only those last seen
+/// at or after `since_ns`.
+pub fn list_entities(conn: &Connection, since_ns: u64) -> Result<Vec<EntityRow>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain, kind, label, taint, created_ns, last_seen_ns, permanent
+         FROM entities WHERE last_seen_ns >= ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([since_ns as i64], |row| {
+            Ok(EntityRow {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                kind: row.get(2)?,
+                label: row.get(3)?,
+                taint: row.get::<_, i64>(4)? as u32,
+                created_ns: row.get::<_, i64>(5)? as u64,
+                last_seen_ns: row.get::<_, i64>(6)? as u64,
+                permanent: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeRow {
+    pub src: i64,
+    pub dst: i64,
+    pub kind: String,
+    pub weight: f32,
+    pub reinforced_ns: u64,
+    pub hypothesis: bool,
+}
+
+/// FR-KNO-10: every edge, for the cold worker's APPNP propagation input.
+pub fn list_edges(conn: &Connection) -> Result<Vec<EdgeRow>, StorageError> {
+    let mut stmt =
+        conn.prepare("SELECT src, dst, kind, weight, reinforced_ns, hypothesis FROM edges")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(EdgeRow {
+                src: row.get(0)?,
+                dst: row.get(1)?,
+                kind: row.get(2)?,
+                weight: row.get(3)?,
+                reinforced_ns: row.get::<_, i64>(4)? as u64,
+                hypothesis: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Creates `(src, dst, kind)` if absent, otherwise replaces its
+/// weight/reinforced_ns/hypothesis. Re-upserting an edge the cold worker
+/// still believes in is exactly how its 72h hypothesis TTL gets reset
+/// (Architecture.md §7.2).
+pub fn upsert_edge(conn: &Connection, edge: &EdgeRow) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO edges (src, dst, kind, weight, reinforced_ns, hypothesis)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(src, dst, kind) DO UPDATE SET
+             weight = excluded.weight,
+             reinforced_ns = excluded.reinforced_ns,
+             hypothesis = excluded.hypothesis",
+        (
+            edge.src,
+            edge.dst,
+            &edge.kind,
+            edge.weight,
+            edge.reinforced_ns as i64,
+            edge.hypothesis,
+        ),
+    )?;
+    Ok(())
+}
+
+/// FR-KNO-10: "prune unreinforced edges after 72h" -- deletes hypothesis
+/// edges whose `reinforced_ns` predates `older_than_ns`. Confirmed
+/// (non-hypothesis) edges are never pruned by this call.
+pub fn prune_hypothesis_edges(conn: &Connection, older_than_ns: u64) -> Result<u64, StorageError> {
+    let pruned = conn.execute(
+        "DELETE FROM edges WHERE hypothesis = 1 AND reinforced_ns < ?1",
+        [older_than_ns as i64],
+    )?;
+    Ok(pruned as u64)
+}
+
 pub struct FocusHistoryEntry<'a> {
     pub app_id: &'a str,
     pub title: &'a str,
@@ -607,5 +708,220 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM index_meta", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn two_entities(conn: &Connection) -> (i64, i64) {
+        let a = upsert_entity(
+            conn,
+            "window_focus",
+            "window",
+            "a",
+            TaintFlags::empty(),
+            1,
+            false,
+        )
+        .unwrap();
+        let b = upsert_entity(
+            conn,
+            "window_focus",
+            "window",
+            "b",
+            TaintFlags::empty(),
+            1,
+            false,
+        )
+        .unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn list_entities_since_ns_filters_out_stale_entities() {
+        let conn = open_in_memory().unwrap();
+        upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "old",
+            TaintFlags::empty(),
+            100,
+            false,
+        )
+        .unwrap();
+        upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "new",
+            TaintFlags::empty(),
+            500,
+            false,
+        )
+        .unwrap();
+        let rows = list_entities(&conn, 300).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "new");
+    }
+
+    #[test]
+    fn list_entities_zero_since_ns_returns_everything() {
+        let conn = open_in_memory().unwrap();
+        two_entities(&conn);
+        assert_eq!(list_entities(&conn, 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn upsert_edge_creates_then_updates_in_place() {
+        let conn = open_in_memory().unwrap();
+        let (a, b) = two_entities(&conn);
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: a,
+                dst: b,
+                kind: "co_occurs".into(),
+                weight: 1.0,
+                reinforced_ns: 100,
+                hypothesis: true,
+            },
+        )
+        .unwrap();
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: a,
+                dst: b,
+                kind: "co_occurs".into(),
+                weight: 2.5,
+                reinforced_ns: 200,
+                hypothesis: false,
+            },
+        )
+        .unwrap();
+        let edges = list_edges(&conn).unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "same (src,dst,kind) must update, not duplicate"
+        );
+        assert_eq!(edges[0].weight, 2.5);
+        assert_eq!(edges[0].reinforced_ns, 200);
+        assert!(!edges[0].hypothesis);
+    }
+
+    #[test]
+    fn prune_hypothesis_edges_only_removes_stale_hypotheses() {
+        let conn = open_in_memory().unwrap();
+        let (a, b) = two_entities(&conn);
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: a,
+                dst: b,
+                kind: "stale_hypothesis".into(),
+                weight: 1.0,
+                reinforced_ns: 0,
+                hypothesis: true,
+            },
+        )
+        .unwrap();
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: a,
+                dst: b,
+                kind: "fresh_hypothesis".into(),
+                weight: 1.0,
+                reinforced_ns: 1_000,
+                hypothesis: true,
+            },
+        )
+        .unwrap();
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: a,
+                dst: b,
+                kind: "old_but_confirmed".into(),
+                weight: 1.0,
+                reinforced_ns: 0,
+                hypothesis: false,
+            },
+        )
+        .unwrap();
+
+        let pruned = prune_hypothesis_edges(&conn, 500).unwrap();
+        assert_eq!(pruned, 1);
+        let remaining: Vec<String> = list_edges(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(remaining.contains(&"fresh_hypothesis".to_string()));
+        assert!(remaining.contains(&"old_but_confirmed".to_string()));
+        assert!(!remaining.contains(&"stale_hypothesis".to_string()));
+    }
+
+    // phases.md §7.3 SC: "SQL injection attempts via titles are inert
+    // (parameterised)." Every query in this module already binds values
+    // via rusqlite's `?N` placeholders (never string-formatted SQL), so
+    // this is a real proof of that, not a synthetic worry -- a malicious
+    // title/app_id is stored as inert data, never executed.
+    #[test]
+    fn sql_injection_via_focus_history_title_is_inert() {
+        let conn = open_in_memory().unwrap();
+        let payload = "'; DROP TABLE focus_history; --";
+        insert_focus_history(
+            &conn,
+            &FocusHistoryEntry {
+                app_id: payload,
+                title: payload,
+                pid: 0,
+                root_pid: 0,
+                t_start_ns: 0,
+                t_end_ns: 1,
+                dwell_ms: 1,
+            },
+        )
+        .unwrap();
+
+        // The table must still exist (a real DROP would make this query fail).
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM focus_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // The payload must be stored as inert literal text, not executed.
+        let (stored_app_id, stored_title): (String, String) = conn
+            .query_row("SELECT app_id, title FROM focus_history LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored_app_id, payload);
+        assert_eq!(stored_title, payload);
+    }
+
+    #[test]
+    fn sql_injection_via_entity_label_is_inert() {
+        let conn = open_in_memory().unwrap();
+        let payload = "x'; DROP TABLE entities; --";
+        upsert_entity(
+            &conn,
+            "notes",
+            "note",
+            payload,
+            TaintFlags::empty(),
+            0,
+            false,
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let stored_label: String = conn
+            .query_row("SELECT label FROM entities LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored_label, payload);
     }
 }

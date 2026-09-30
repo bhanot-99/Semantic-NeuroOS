@@ -161,6 +161,24 @@ class RingWriter {
         return view_.generation_id()->fetch_add(1, std::memory_order_acq_rel) + 1;
     }
 
+    // BUG-004: same bump as `cancel()`, called when a *new* (non-cancelled)
+    // job is assigned to this ring. A ring's name is reused across many
+    // logical requests (e.g. `knowledge-text`), so without this, every job
+    // on it shares the same `generation_id`; a reader that attaches after a
+    // prior job already started writing (its own request raced ahead of
+    // that prior job's still-running decode) can't tell those older slots
+    // apart from its own and reads them as if they were its own answer,
+    // finishing in milliseconds instead of waiting for its actual job to
+    // run -- the client then races ahead and over-submits, which is what
+    // actually fills `LaneScheduler`'s queue under "sequential" load, not a
+    // slot leak in the scheduler itself. Bumping here makes every job's
+    // slots distinguishable so a fresh reader correctly skips stale ones
+    // (`RingReader::try_read`'s existing "stale generation" check) instead
+    // of misattributing them.
+    std::uint64_t next_generation() {
+        return cancel();
+    }
+
     // Returns false if `payload` exceeds the slot's max payload size.
     bool write(std::uint32_t token_id, std::uint16_t flags, const std::uint8_t* payload,
                std::size_t len) {

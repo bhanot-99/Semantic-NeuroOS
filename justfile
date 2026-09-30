@@ -15,7 +15,7 @@ cpp_build_glob := "cpp/build*"
 proto: proto-py
 
 proto-py:
-    protoc --proto_path=proto --python_out={{py_src_dir}} proto/neuroos/v1/*.proto
+    protoc --proto_path=proto --python_out={{py_src_dir}} --pyi_out={{py_src_dir}} proto/neuroos/v1/*.proto
 
 # --- build ---------------------------------------------------------------
 
@@ -47,6 +47,7 @@ test-contract: build-rust build-cpp build-py
 # SC (phases.md §3.3): PrivateNetwork-style isolation blocks curl/DNS/TCP, UDS still works.
 test-security:
     bash scripts/check-egress.sh
+    bash tests/contract/storage_landlock.sh
 
 # Phase 0 exit criterion (phases.md §3.4): a real systemd --user unit with
 # PrivateNetwork=true proves no network / UDS works / peer UID enforced, together.

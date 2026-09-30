@@ -3,7 +3,7 @@
 //! `RawTelemetryEvent` -> filter -> adapter -> SQLite (always) + LanceDB
 //! (only for domains with text worth embedding).
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use neuroos_proto::v1::RawTelemetryEvent;
 
@@ -31,7 +31,13 @@ pub struct StorageEngine {
     sqlite_path: PathBuf,
     models_dir: PathBuf,
     onnxruntime_dylib: PathBuf,
-    embedder: Embedder,
+    /// BUG-001: `Arc<Mutex<_>>`, not a plain field, so `embed_blocking` can
+    /// move a handle to it into `spawn_blocking` — see that fn's doc
+    /// comment for why. The `std::sync::Mutex` here is uncontended in
+    /// practice (the *async* `Mutex<StorageEngine>` in `server.rs` already
+    /// serializes every request before this is ever touched); it exists
+    /// only so the embedder can be shared with the blocking-pool thread.
+    embedder: Arc<StdMutex<Embedder>>,
 }
 
 impl StorageEngine {
@@ -43,7 +49,10 @@ impl StorageEngine {
     ) -> Result<Self, EngineError> {
         let conn = crate::sqlite::open(sqlite_path)?;
         let lance = Arc::new(LanceStore::open(lance_path).await?);
-        let embedder = Embedder::load(models_dir, onnxruntime_dylib)?;
+        let embedder = Arc::new(StdMutex::new(Embedder::load(
+            models_dir,
+            onnxruntime_dylib,
+        )?));
         let engine = Self {
             conn,
             filter: IngestFilter::new(),
@@ -116,9 +125,8 @@ impl StorageEngine {
     }
 
     async fn store_chunk(&mut self, chunk: PendingChunk) -> Result<(), EngineError> {
-        let vector = self
-            .embedder
-            .embed(&[chunk.text.as_str()])?
+        let vector = embed_blocking(&self.embedder, vec![chunk.text.clone()])
+            .await?
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -160,9 +168,8 @@ impl StorageEngine {
         text: &str,
         top_k: usize,
     ) -> Result<Vec<crate::lance::ChunkMatch>, EngineError> {
-        let vector = self
-            .embedder
-            .embed(&[text])?
+        let vector = embed_blocking(&self.embedder, vec![text.to_string()])
+            .await?
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -177,6 +184,34 @@ impl StorageEngine {
     ) -> Result<Option<crate::sqlite::FocusHistoryRow>, EngineError> {
         Ok(crate::sqlite::query_focus_history(
             &self.conn, t_ns, window_ns,
+        )?)
+    }
+
+    /// FR-KNO-10: entities the Python cold worker builds co-occurrence
+    /// candidates from. `since_ns = 0` means every entity.
+    pub fn list_entities(
+        &self,
+        since_ns: u64,
+    ) -> Result<Vec<crate::sqlite::EntityRow>, EngineError> {
+        Ok(crate::sqlite::list_entities(&self.conn, since_ns)?)
+    }
+
+    /// FR-KNO-10: every edge, for the cold worker's APPNP propagation input.
+    pub fn list_edges(&self) -> Result<Vec<crate::sqlite::EdgeRow>, EngineError> {
+        Ok(crate::sqlite::list_edges(&self.conn)?)
+    }
+
+    /// FR-KNO-10: create/reinforce one edge the cold worker computed.
+    pub fn upsert_edge(&self, edge: &crate::sqlite::EdgeRow) -> Result<(), EngineError> {
+        Ok(crate::sqlite::upsert_edge(&self.conn, edge)?)
+    }
+
+    /// FR-KNO-10: "prune unreinforced edges after 72h" -- returns how many
+    /// hypothesis edges were deleted.
+    pub fn prune_hypothesis_edges(&self, older_than_ns: u64) -> Result<u64, EngineError> {
+        Ok(crate::sqlite::prune_hypothesis_edges(
+            &self.conn,
+            older_than_ns,
         )?)
     }
 
@@ -244,6 +279,15 @@ impl StorageEngine {
         label: &str,
         keep: usize,
     ) -> Result<PathBuf, crate::lifecycle::BackupError> {
+        // BUG-002: ride the existing 6-hourly backup cadence to keep
+        // fragment count (and therefore query latency) down -- see
+        // `LanceStore::compact_all_families`'s doc comment. Best-effort,
+        // same policy as HNSW promotion: a compaction failure (e.g. a
+        // concurrent writer) shouldn't block the backup itself, which is
+        // more safety-critical than this maintenance step.
+        if let Err(err) = self.lance.compact_all_families().await {
+            tracing::warn!(error = %err, "BUG-002: LanceDB compaction failed before backup, continuing");
+        }
         crate::lifecycle::backup(&self.conn, &self.lance_dir, backups_root, label, keep).await
     }
 
@@ -261,6 +305,40 @@ impl StorageEngine {
             .await?;
         Ok(())
     }
+}
+
+/// BUG-001: `Embedder::embed` runs real, synchronous, CPU-bound ONNX
+/// inference (~10ms/call per `embed.rs`'s own doc comment). `StorageEngine`
+/// is reached only through one `Arc<Mutex<StorageEngine>>` (`server.rs`),
+/// so every request is already serialized by design -- the bug was never
+/// that serialization, it's that running that ~10ms of real CPU work
+/// *inline* on the async runtime's own thread freezes the whole reactor for
+/// that duration: no other task (another connection's cheap SQL-only
+/// query, the accept loop, a timer) can make any progress at all until it
+/// returns, not just callers waiting on the same mutex. `ort::Session`
+/// (`fastembed::TextEmbedding`'s own field, wrapping it) is `unsafe impl
+/// Send + Sync` as of `ort` 2.0.0-rc.13 (confirmed directly in its vendored
+/// source, `session/mod.rs`), so `Embedder` is `Send` and Tokio's own
+/// documented fix for CPU-bound work applies directly: hand it to
+/// `spawn_blocking`'s dedicated thread pool and `.await` the result, which
+/// is a real yield point -- the runtime keeps servicing everything else
+/// while the real inference call runs elsewhere.
+async fn embed_blocking(
+    embedder: &Arc<StdMutex<Embedder>>,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, EmbedError> {
+    let embedder = Arc::clone(embedder);
+    tokio::task::spawn_blocking(move || {
+        let mut embedder = embedder.lock().unwrap_or_else(|e| e.into_inner());
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        embedder.embed(&refs)
+    })
+    .await
+    // rules.md §5: no naked `.unwrap()/.expect()`. A `JoinError` here means
+    // the blocking closure itself panicked (it never calls `.await`, so it
+    // can't be cancelled) -- propagate that original panic rather than
+    // manufacturing a new message, the standard `spawn_blocking` idiom.
+    .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
 /// FR-STO-11's actual re-index work: loads its own `Embedder` (a second,
@@ -284,23 +362,32 @@ async fn reindex_family(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        let vector = embedder
-            .embed(&[row.text.as_str()])?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        records.push(ChunkRecord {
-            chunk_id: row.chunk_id,
-            entity_id: row.entity_id,
-            text: row.text,
-            vector,
-            taint: row.taint,
-            t_ns: row.t_ns,
-            domain: row.domain,
-        });
-    }
+    // BUG-001: same fix as `embed_blocking` -- this background task's own
+    // embedder is never shared, so the whole per-chunk loop can move into
+    // one `spawn_blocking` call instead of freezing the async runtime for
+    // however long re-embedding every chunk in `family` takes.
+    let records = tokio::task::spawn_blocking(move || -> Result<Vec<ChunkRecord>, EmbedError> {
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let vector = embedder
+                .embed(&[row.text.as_str()])?
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            records.push(ChunkRecord {
+                chunk_id: row.chunk_id,
+                entity_id: row.entity_id,
+                text: row.text,
+                vector,
+                taint: row.taint,
+                t_ns: row.t_ns,
+                domain: row.domain,
+            });
+        }
+        Ok(records)
+    })
+    .await
+    .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))?;
     let reindexed = records.len();
     lance.upsert_vectors(family, &records).await?;
 
@@ -477,6 +564,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entities, 0);
+    }
+
+    /// Live proof (P4-S09 / phases.md §7.4 "Forget verified (rows,
+    /// vectors, next backup)"): the third leg -- a backup taken *after* a
+    /// forget must not resurrect the forgotten row. Needs the real model +
+    /// onnxruntime fetched, so `#[ignore]`d like this crate's other
+    /// real-download-dependent tests.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn forgotten_rows_do_not_reappear_in_the_next_backup() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::Opened(WindowOpened {
+                    app_id: "org.mozilla.firefox".into(),
+                    title: "quarterly revenue dashboard".into(),
+                    pid: 0,
+                    pid_known: false,
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                0,
+                Kind::StateChanged(WindowStateChanged {
+                    states: vec![ToplevelState::Activated as i32],
+                }),
+            ))
+            .await
+            .unwrap();
+        engine
+            .ingest(&window_event(
+                1,
+                6_000_000_000,
+                Kind::StateChanged(WindowStateChanged { states: vec![] }),
+            ))
+            .await
+            .unwrap();
+
+        let forgotten = engine.forget_by_app("org.mozilla.firefox").await.unwrap();
+        assert_eq!(forgotten, 1);
+
+        let backups_root = tempfile::tempdir().unwrap();
+        let backup_dest = crate::lifecycle::backup(
+            &engine.conn,
+            &engine.lance_dir,
+            backups_root.path(),
+            "after-forget",
+            8,
+        )
+        .await
+        .unwrap();
+
+        let restored = crate::sqlite::open(&backup_dest.join("meta.sqlite3")).unwrap();
+        let entities: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE label = 'org.mozilla.firefox'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entities, 0,
+            "a backup taken after forget must not contain the forgotten entity"
+        );
     }
 
     /// Live proof (P4-S08/FR-STO-11): ingesting records `index_meta`, and

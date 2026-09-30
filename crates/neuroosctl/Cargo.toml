@@ -21,4 +21,6 @@ thiserror = "2"
 
 [dev-dependencies]
 neuroos-healthd = { path = "../neuroos-healthd", version = "0.1.0" }
+neuroos-knowledge-query = { path = "../neuroos-knowledge-query", version = "0.1.0" }
+neuroos-testkit = { path = "../neuroos-testkit", version = "0.1.0" }
 tempfile = "3"

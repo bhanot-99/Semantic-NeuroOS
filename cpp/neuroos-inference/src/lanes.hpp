@@ -29,6 +29,7 @@ struct Job {
     std::uint64_t seed;
     std::string grammar_gbnf;
     std::string ring_name;
+    float repetition_penalty; // BUG-005: 1.0 = disabled
 };
 
 constexpr std::size_t kMaxQueueDepth = 4;

@@ -35,9 +35,24 @@ message Envelope {
 
     VoiceCommand         voice_command   = 30;
     PreambleRequest      preamble        = 31;
+    PreambleResponse     preamble_response = 32;
 
     IngestRequest        ingest_request  = 40;
     IngestResponse       ingest_response = 41;
+    QueryFocusHistoryRequest  query_focus_history_request  = 42;
+    QueryFocusHistoryResponse query_focus_history_response = 43;
+    QueryHybridRequest        query_hybrid_request         = 44;
+    QueryHybridResponse       query_hybrid_response        = 45;
+    ForgetRequest              forget_request  = 46;
+    ForgetResponse             forget_response = 47;
+    ListEntitiesRequest        list_entities_request  = 48;
+    ListEntitiesResponse       list_entities_response = 49;
+    ListEdgesRequest           list_edges_request  = 50;
+    ListEdgesResponse          list_edges_response = 51;
+    UpsertEdgeRequest          upsert_edge_request  = 52;
+    UpsertEdgeResponse         upsert_edge_response = 53;
+    PruneEdgesRequest          prune_edges_request  = 54;
+    PruneEdgesResponse         prune_edges_response = 55;
 
     GenerateRequest      generate_request     = 60;
     GenerateResponse     generate_response    = 61;
@@ -52,6 +67,8 @@ message Envelope {
 
     AskRequest           ask_request     = 70;
     AskResponse          ask_response    = 71;
+    RenderGraphViewRequest  render_graph_view_request  = 72;
+    RenderGraphViewResponse render_graph_view_response = 73;
 
     ActionRequest        action_request  = 90;
     ActionResponse       action_response = 91;

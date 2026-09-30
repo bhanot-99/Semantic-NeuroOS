@@ -5,8 +5,8 @@
 | Phase | 3 — Desktop Telemetry Monitor (C1 `neuroos-monitor`) |
 | Component(s) | `neuroos-monitor`, `neuroosctl` (pause/resume/monitor-status) |
 | Sprints | 3 (of 2 planned; see §2.6) |
-| Dates | 2026-09-27 → (open) |
-| Status | 🟨 Done except the recording — 6 of 7 exit criteria met with evidence; a background recording is running now for the 7th (≥ 8h real-usage dumps), nothing else outstanding (see §3, §6) |
+| Dates | 2026-09-27 → 2026-09-28 |
+| Status | ✅ Passed gate — all 6 exit criteria met with evidence, including the ≥8h anonymised recording (4 dumps, 8.008h total, committed to `tests/fixtures/telemetry/`) |
 | Author | AI assistant |
 | Sign-off | pending |
 
@@ -34,18 +34,20 @@ monitor-status`, `neuroosctl resume` all work against a running
 demo in this session used a raw socket client and saw a real "VLC now
 playing" event and real window-open events arrive live.
 
-**Is it on track?** Yes — everything in this phase is done except one item
-that can't be finished in a single sitting: the exit criteria call for
-committing ≥ 8 hours of real, anonymised recordings of actual desktop use as
-fixtures for Phase 4. The owner chose to start that recording as a
-background process now rather than record it manually later (see §6); it
-keeps running independently of this code being merged.
+**Is it on track?** Yes — everything in this phase is done, including the
+last outstanding item: ≥ 8 hours of real, anonymised recordings of actual
+desktop use, committed to `tests/fixtures/telemetry/` as Phase 4's input.
+The recording ran across two sessions (interrupted once by an unplanned
+laptop shutdown, restarted rather than discarded) and finished at 8.008h
+across 4 dumps.
 
 **Risks or concerns in plain words:**
 - A window's process ID (PID) is a best-effort guess (see §2.7, ADR-0009) —
   Wayland doesn't give any app a real way to know another app's PID.
-- The recorded dumps this phase's data depends on for Phase 4 don't exist
-  yet.
+- The recording never captured any file-activity events (the git/notes/ICS
+  folder watcher) — either no watched folder saw real writes during the
+  ~8h window, or `[monitor.folders]` isn't configured on this machine; worth
+  checking before treating the fixture set as covering every domain.
 
 ---
 
@@ -148,7 +150,8 @@ special case invented for this measurement.
 | Sprint count | 2 | 3 (this session) | Full sensor set + control channel + neuroosctl integration + live verification took longer than a 2-sprint estimate; no scope was cut | — |
 | `neuroosctl replay` | Implied by P3-S06's story text | Not built | phases.md §7.1 item 10 assigns "Replay harness: `neuroosctl replay <dump>` → ingest → gate assertions" to **Phase 4** (C3's ingest pipeline doesn't exist yet); this phase built the write side (`--record`) and the read primitive (`DumpReader`, used by the anonymiser) that Phase 4 will build on | — |
 | wlroots foreign-toplevel fallback | phases.md §6.1 item 1 (tagged P1) | Not built | Reference machine is COSMIC-only; no way to test it live here, and P3-S07 (folders, also tagged P1) was prioritized since it was directly testable. Tracked as tech debt (§2.8) | — |
-| ≥ 8h anonymised real dumps | Required exit criterion | In progress (background recording running, not yet ≥8h) | Needs real elapsed hours of the owner's actual desktop use across ≥ 3 work styles; privacy-sensitive enough (real window titles/paths/media titles) that it needed explicit consent before recording for hours, not just the capability. See §6 | Owner (chose to start it now, 2026-09-27) |
+| ≥ 8h anonymised real dumps | Required exit criterion | **Done 2026-09-28**: 4 dumps, 8.008h total, committed to `tests/fixtures/telemetry/` | Needed real elapsed hours of the owner's actual desktop use; privacy-sensitive enough (real window titles/paths/media titles) that it needed explicit consent before recording for hours, not just the capability. Interrupted once mid-recording by an unplanned laptop shutdown; resumed rather than restarted from scratch. Verified anonymisation for real (`comm -23` diff of raw vs. anonymised `strings` output confirms real titles/paths are absent, only `title-<hash>`/`/anon/<hash>` placeholders and non-personal `app_id`s remain) before committing. See §6 | Owner (chose to start it, 2026-09-27); AI assistant closed it out 2026-09-28 |
+| ≥ 3 distinct real work styles in the recording (phases.md §6.3 MS) | "coding with builds, browsing docs, media playing" | Partially confirmed: `mpris` events present (578 total, media playback did occur) and `process_tree` events include build-tool `comm`s; not independently verified per-dump which work style each segment represents | Recording ran unattended in the background across the owner's normal use, not a scripted "do these 3 things" session — reasonable under FR-MON-10/§6.3's real-use intent, but the exact "≥3 distinct styles" claim rests on the aggregate event mix, not a per-segment breakdown | — |
 
 ### 2.7 Decisions made (ADRs)
 
@@ -175,7 +178,7 @@ special case invented for this measurement.
 | 1 | All sensors emit correct events on the reference machine (COSMIC) | ✅ | Live proofs: real WindowOpened (brave-browser, real PID), real MPRIS "Playing" event over `monitor.sock`, real inotify FileActivityEvent, idle sensor connects+binds live |
 | 2 | Capture p99 < 1.5 ms and RSS ≤ 25 MiB measured | ✅ | §2.4: p99 = 0.008 ms, RSS ≈ 8.9 MiB, idle CPU 0% |
 | 3 | Exclusion and pause proven by property tests | ✅ | `privacy::tests::proptests::excluded_app_id_is_never_allowed`; live `neuroosctl pause/resume/monitor-status` round trip |
-| 4 | ≥ 3 anonymised real dumps committed (≥ 8h total) — required input for Phase 4 | 🟨 | Background recording running (owner authorized 2026-09-27); not yet ≥8h. Only remaining item in this phase — see §6 |
+| 4 | ≥ 3 anonymised real dumps committed (≥ 8h total) — required input for Phase 4 | ✅ | 4 dumps (2.999h, 0.912h, 2.999h, 1.099h = 8.008h total), `tests/fixtures/telemetry/dump-*.bin`, anonymisation verified by diffing raw vs. anonymised `strings` output |
 | 5 | Coverage ≥ 80% | ✅ | 82.29% line / 81.56% region / 89.59% function (`cargo llvm-cov nextest --run-ignored all`) |
 | 6 | Phase report written; memory.md updated | ✅ (this report; memory.md update in the same commit) | — |
 
@@ -210,24 +213,23 @@ special case invented for this measurement.
 
 | Check | Status |
 | :--- | :--- |
-| Next phase dependencies satisfied | ❌ — Phase 4 (`phases.md` §7, "Depends on: P0, **P3 dumps**") needs the ≥ 8h anonymised recordings this phase didn't produce |
-| Next phase stories meet Definition of Ready | ✅ otherwise — everything else Phase 4 needs from C1 (the real proto schema, `--record`, the anonymiser) exists and works |
+| Next phase dependencies satisfied | ✅ — Phase 4 (`phases.md` §7, "Depends on: P0, **P3 dumps**") now has its ≥ 8h anonymised recordings |
+| Next phase stories meet Definition of Ready | ✅ — everything Phase 4 needs from C1 (the real proto schema, `--record`, the anonymiser, and now the fixtures themselves) exists and works |
 | memory.md updated (phase tracker, current phase, sprint board) | ✅ |
 
-**On the ≥ 8h recording:** this needs the owner's own real desktop use
-across ≥ 3 different work styles (coding with builds, browsing docs, media
-playing). Recording captures real window titles, file paths and media
-metadata from the owner's actual session for hours at a time — genuinely
-sensitive enough that it needed the owner's explicit go-ahead before it
-could start, even though the anonymiser strips personal content before
-anything is committed.
-
-**Decision:** the owner chose to start a background recording immediately
-rather than record it manually later. `.dev-cache/telemetry-raw/record-loop.sh`
-runs `neuroos-monitor --record` against the real desktop session (gitignored
-raw output, rotating to a fresh dump file every 3h). When stopped, each
-`dump-*.bin` worth keeping goes through `neuroos-monitor anonymize <in>
-tests/fixtures/telemetry/<name>.bin` before committing; once ≥ 3 dumps
-totaling ≥ 8h are committed, this row flips to ✅ and this phase's status
-to Passed. Everything else in this report already stands as-is — this is
-the only remaining action.
+**The ≥ 8h recording, closed out:** ran across two sessions
+(`.dev-cache/telemetry-raw/record-loop.sh`, rotating `neuroos-monitor
+--record` every 3h) totaling 8.008h across 4 segments — one interrupted
+mid-segment by an unplanned laptop shutdown (resumed, not discarded), one
+still short of a full 3h rotation when the owner asked to close the phase
+out (stopped deliberately once the ≥8h target was confirmed reached via a
+real read of every dump's header and event timestamps, not an estimate).
+Each was anonymised (`neuroos-monitor anonymize <raw> tests/fixtures/
+telemetry/<name>.bin`) and the anonymisation was verified for real before
+committing: `comm -23` between `strings` output of the raw and anonymised
+versions of the same dump confirms real window titles ("COSMIC Files",
+real Brave tab titles, etc.) are present only in the raw file, while the
+anonymised file carries `title-<hash>`/`/anon/<hash>` placeholders and
+non-personal `app_id`s (`org.mozilla.firefox`, `com.system76.CosmicFiles`,
+...) only. This phase is now fully closed; Phase 4's soak-replay gate can
+proceed against real data.

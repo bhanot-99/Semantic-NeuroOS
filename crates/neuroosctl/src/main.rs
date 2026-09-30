@@ -4,12 +4,22 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
 use neuroos_proto::v1::{
-    AggregateStatusRequest, ComponentStatus, Envelope, MonitorPauseRequest, MonitorStatusRequest,
-    Status, envelope,
+    AggregateStatusRequest, AskRequest, ComponentStatus, Envelope, MonitorPauseRequest,
+    MonitorStatusRequest, RenderGraphViewRequest, Status, envelope,
 };
 use serde::Serialize;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// `ask` waits on a real C4 generation (measured 55.9-72.1 ms/token,
+/// ADR-0008), not just a control round trip -- 128 tokens' worst case is
+/// under 10s, but a cold model load on the very first request can be
+/// slower, so this gets its own generous deadline instead of
+/// `REQUEST_TIMEOUT`.
+const ASK_TIMEOUT: Duration = Duration::from_secs(60);
+/// `graph open` lists every entity/edge (no LLM call) -- generous compared
+/// to `REQUEST_TIMEOUT` since a large personal graph can still take a
+/// moment to serialize, but nowhere near `ASK_TIMEOUT`'s generation budget.
+const GRAPH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "neuroosctl", about = "NeuroOS operator CLI")]
@@ -36,6 +46,26 @@ enum Commands {
     Resume,
     /// Show C1's pause state, exclusion list and event-bus counters.
     MonitorStatus,
+    /// Ask a question by text (FR-CLI-01, P5-S06) -- the full C5a hot path
+    /// (preamble, grounded evidence, a real C4 generation), printed once
+    /// the answer comes back.
+    Ask {
+        /// The question text.
+        question: String,
+    },
+    /// Knowledge graph view (FR-KNO-11, P5-S08).
+    Graph {
+        #[command(subcommand)]
+        action: GraphCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphCommand {
+    /// Render `graph_view.html` from the current entities/edges and open
+    /// it in the default browser (best-effort -- the path is always
+    /// printed even if no browser launcher is available).
+    Open,
 }
 
 #[derive(Serialize, Debug)]
@@ -65,6 +95,10 @@ async fn main() {
         Commands::Pause { duration } => run_pause(duration, false).await,
         Commands::Resume => run_pause(None, true).await,
         Commands::MonitorStatus => run_monitor_status().await,
+        Commands::Ask { question } => run_ask(&question).await,
+        Commands::Graph {
+            action: GraphCommand::Open,
+        } => run_graph_open().await,
     };
     std::process::exit(exit_code);
 }
@@ -154,6 +188,123 @@ async fn run_monitor_status() -> i32 {
         }
         Err(e) => {
             eprintln!("neuroosctl: could not reach neuroos-monitor: {e}");
+            1
+        }
+    }
+}
+
+async fn run_graph_open() -> i32 {
+    let socket_path = neuroos_common::paths::knowledge_sock();
+    let mut stream = match connect(&socket_path, GRAPH_TIMEOUT).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "neuroosctl: could not reach neuroos-knowledge-query at {}: {e}",
+                socket_path.display()
+            );
+            return 1;
+        }
+    };
+    let request = Envelope {
+        schema_version: 1,
+        trace_id: String::new(),
+        request_id: 0,
+        sent_at_ns: neuroos_common::now_ns(),
+        body: Some(envelope::Body::RenderGraphViewRequest(
+            RenderGraphViewRequest {},
+        )),
+    };
+    if let Err(e) =
+        write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, GRAPH_TIMEOUT).await
+    {
+        eprintln!("neuroosctl: failed to send RenderGraphView request: {e}");
+        return 1;
+    }
+    let response = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, GRAPH_TIMEOUT).await
+    {
+        Ok(Some(env)) => env,
+        Ok(None) => {
+            eprintln!("neuroosctl: neuroos-knowledge-query closed the connection with no response");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("neuroosctl: failed to read response: {e}");
+            return 1;
+        }
+    };
+    match response.body {
+        Some(envelope::Body::RenderGraphViewResponse(r)) => {
+            println!("{}", r.path);
+            // Best-effort: `neuroosctl` runs fine over SSH/headless too, so
+            // a missing/failing browser launcher is not itself an error --
+            // the path was already printed above either way.
+            let _ = std::process::Command::new("xdg-open").arg(&r.path).spawn();
+            0
+        }
+        Some(envelope::Body::Error(e)) => {
+            eprintln!("neuroosctl: {}", e.message);
+            1
+        }
+        other => {
+            eprintln!("neuroosctl: unexpected response: {other:?}");
+            1
+        }
+    }
+}
+
+async fn run_ask(question: &str) -> i32 {
+    let socket_path = neuroos_common::paths::knowledge_sock();
+    let mut stream = match connect(&socket_path, ASK_TIMEOUT).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "neuroosctl: could not reach neuroos-knowledge-query at {}: {e}",
+                socket_path.display()
+            );
+            return 1;
+        }
+    };
+    let request = Envelope {
+        schema_version: 1,
+        trace_id: String::new(),
+        request_id: 0,
+        sent_at_ns: neuroos_common::now_ns(),
+        body: Some(envelope::Body::AskRequest(AskRequest {
+            question: question.to_string(),
+            t_ns: 0, // text path has no real utterance start; knowledge.sock treats 0 as "now"
+        })),
+    };
+    if let Err(e) =
+        write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, ASK_TIMEOUT).await
+    {
+        eprintln!("neuroosctl: failed to send question: {e}");
+        return 1;
+    }
+    let response = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, ASK_TIMEOUT).await {
+        Ok(Some(env)) => env,
+        Ok(None) => {
+            eprintln!("neuroosctl: neuroos-knowledge-query closed the connection with no response");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("neuroosctl: failed to read answer: {e}");
+            return 1;
+        }
+    };
+    match response.body {
+        Some(envelope::Body::AskResponse(r)) => {
+            println!("{}", r.answer);
+            if r.degraded {
+                eprintln!("(degraded: evidence or generation was unavailable)");
+            }
+            0
+        }
+        Some(envelope::Body::Error(e)) => {
+            eprintln!("neuroosctl: {}", e.message);
+            1
+        }
+        other => {
+            eprintln!("neuroosctl: unexpected response: {other:?}");
             1
         }
     }
@@ -395,6 +546,130 @@ mod tests {
         assert_eq!(report.components.len(), 1);
         assert_eq!(report.components[0].name, "neuroos-monitor");
         assert_eq!(report.components[0].status, "UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn run_ask_round_trips_against_a_real_knowledge_sock_server() {
+        use neuroos_knowledge_query::distill::DistillationCache;
+        use neuroos_knowledge_query::inference_client::InferenceClient;
+        use neuroos_knowledge_query::kernel_client::KernelClient;
+        use neuroos_knowledge_query::server::{self, Clients};
+        use neuroos_knowledge_query::storage_client::StorageClient;
+        use neuroos_knowledge_query::voice_client::VoiceClient;
+        use neuroos_testkit::{kernel_mocks, voice_mocks};
+
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test process (nextest runs each test in
+        // its own process); no other thread reads env vars concurrently.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        }
+        let knowledge_sock = neuroos_common::paths::knowledge_sock();
+        std::fs::create_dir_all(knowledge_sock.parent().unwrap()).unwrap();
+        let voice_sock = dir.path().join("voice.sock");
+        let kernel_sock = dir.path().join("kernel.sock");
+        let my_uid = current_uid();
+        voice_mocks::spawn_preamble_recorder(&voice_sock, my_uid);
+        kernel_mocks::spawn_always_approve(&kernel_sock, my_uid);
+
+        // No real C3/C4 -- `ask()` fails and knowledge.sock answers
+        // degraded, matching `server.rs`'s own test; this proves
+        // `neuroosctl ask` treats that as a successful round trip (exit 0,
+        // not an error), only surfacing the degraded flag as a warning.
+        let clients = Clients {
+            voice: VoiceClient::new(voice_sock),
+            storage: StorageClient::new(dir.path().join("storage-nonexistent.sock")),
+            inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
+            kernel: KernelClient::new(kernel_sock),
+            distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
+        };
+        tokio::spawn(server::serve(clients, knowledge_sock, vec![my_uid]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let exit_code = run_ask("what does this say").await;
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn run_graph_open_round_trips_and_writes_the_html_file() {
+        use neuroos_knowledge_query::distill::DistillationCache;
+        use neuroos_knowledge_query::inference_client::InferenceClient;
+        use neuroos_knowledge_query::kernel_client::KernelClient;
+        use neuroos_knowledge_query::server::{self, Clients};
+        use neuroos_knowledge_query::storage_client::StorageClient;
+        use neuroos_knowledge_query::voice_client::VoiceClient;
+        use neuroos_testkit::storage_mocks;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test process (nextest runs each test in
+        // its own process); no other thread reads env vars concurrently.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+            std::env::set_var("XDG_DATA_HOME", data_dir.path());
+        }
+        let knowledge_sock = neuroos_common::paths::knowledge_sock();
+        std::fs::create_dir_all(knowledge_sock.parent().unwrap()).unwrap();
+        let storage_sock = dir.path().join("storage.sock");
+        let my_uid = current_uid();
+        storage_mocks::spawn_fixed_graph(
+            &storage_sock,
+            my_uid,
+            vec![neuroos_proto::v1::EntityRow {
+                id: 1,
+                domain: "window_focus".into(),
+                kind: "window".into(),
+                label: "firefox".into(),
+                taint: 0,
+                created_ns: 0,
+                last_seen_ns: 0,
+                permanent: false,
+            }],
+            vec![],
+        );
+
+        let clients = Clients {
+            voice: VoiceClient::new(dir.path().join("voice-nonexistent.sock")),
+            storage: StorageClient::new(storage_sock),
+            inference: InferenceClient::new(dir.path().join("inference-nonexistent.sock")),
+            kernel: KernelClient::new(dir.path().join("kernel-nonexistent.sock")),
+            distill_cache: DistillationCache::new(),
+            health: neuroos_health::HealthServer::new("test"),
+        };
+        tokio::spawn(server::serve(clients, knowledge_sock, vec![my_uid]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let exit_code = run_graph_open().await;
+        assert_eq!(exit_code, 0);
+        let html = std::fs::read_to_string(neuroos_common::paths::graph_view_html_file()).unwrap();
+        assert!(html.contains("firefox"));
+    }
+
+    #[tokio::test]
+    async fn run_graph_open_reports_a_clear_error_when_knowledge_query_is_unreachable() {
+        // SAFETY: single-threaded test process.
+        unsafe {
+            std::env::set_var(
+                "XDG_RUNTIME_DIR",
+                "/tmp/neuroosctl-test-nonexistent-runtime-dir-graph",
+            );
+        }
+        let exit_code = run_graph_open().await;
+        assert_eq!(exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn run_ask_reports_a_clear_error_when_knowledge_query_is_unreachable() {
+        // SAFETY: single-threaded test process.
+        unsafe {
+            std::env::set_var(
+                "XDG_RUNTIME_DIR",
+                "/tmp/neuroosctl-test-nonexistent-runtime-dir",
+            );
+        }
+        let exit_code = run_ask("anything").await;
+        assert_eq!(exit_code, 1);
     }
 
     #[tokio::test]

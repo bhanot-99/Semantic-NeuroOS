@@ -3865,8 +3865,10 @@ name = "neuroos-ipc"
 version = "0.1.0"
 dependencies = [
  "neuroos-proto",
+ "neuroos-shm",
  "proptest",
  "prost 0.13.5",
+ "rustix 1.1.5",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3880,6 +3882,25 @@ version = "0.1.0"
 [[package]]
 name = "neuroos-knowledge-query"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "neuroos-common",
+ "neuroos-health",
+ "neuroos-ipc",
+ "neuroos-monitor",
+ "neuroos-proto",
+ "neuroos-shm",
+ "neuroos-storage",
+ "neuroos-taint",
+ "neuroos-testkit",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "neuroos-monitor"
@@ -3940,6 +3961,7 @@ dependencies = [
  "neuroos-common",
  "neuroos-health",
  "neuroos-ipc",
+ "neuroos-monitor",
  "neuroos-proto",
  "neuroos-taint",
  "notify",
@@ -3980,7 +4002,9 @@ dependencies = [
  "neuroos-health",
  "neuroos-healthd",
  "neuroos-ipc",
+ "neuroos-knowledge-query",
  "neuroos-proto",
+ "neuroos-testkit",
  "serde",
  "serde_json",
  "tempfile",

@@ -8,6 +8,15 @@ message VoiceCommand {
   uint64 spoken_at_ns = 2;
 }
 
+// FR-KNO-02 / Architecture.md §6.1: C5 requests this before any retrieval
+// work begins. `clip_id` is the preamble phrase text itself (design.md
+// §9.3's catalogue, e.g. "Checking your files…") -- C2 (Phase 6) will
+// eventually map known phrases to pre-rendered Kokoro clips; until then
+// (and for Phase 5's mock C2), the exact string is what's exchanged.
 message PreambleRequest {
   string clip_id = 1;
+}
+
+message PreambleResponse {
+  bool played = 1;
 }
