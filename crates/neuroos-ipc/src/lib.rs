@@ -6,7 +6,7 @@ pub mod framing;
 pub mod peercred;
 pub mod server;
 
-pub use client::{Backoff, ReconnectPolicy, connect, connect_with_reconnect};
+pub use client::{Backoff, ReconnectPolicy, connect, connect_retrying, connect_with_reconnect};
 pub use deadline::{read_envelope_deadline, write_envelope_deadline};
 pub use fd_framing::{
     read_envelope_with_fd, read_envelope_with_fd_deadline, write_envelope_with_fd,

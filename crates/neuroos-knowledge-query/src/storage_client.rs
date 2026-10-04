@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
+use neuroos_ipc::{
+    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, write_envelope_deadline,
+};
 use neuroos_proto::v1::{
     ChunkMatch, EdgeRow, EntityRow, Envelope, FocusHistoryRow, ListEdgesRequest,
     ListEntitiesRequest, QueryActivityRequest, QueryActivityResponse, QueryFocusHistoryRequest,
@@ -44,7 +46,7 @@ impl StorageClient {
     }
 
     async fn round_trip(&self, body: envelope::Body) -> Result<envelope::Body, StorageClientError> {
-        let mut stream = connect(&self.socket_path, STORAGE_QUERY_DEADLINE)
+        let mut stream = connect_retrying(&self.socket_path, STORAGE_QUERY_DEADLINE)
             .await
             .map_err(|source| StorageClientError::Connect {
                 path: self.socket_path.clone(),
@@ -163,6 +165,41 @@ impl StorageClient {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+
+    fn current_uid() -> u32 {
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        unsafe extern "C" {
+            fn getuid() -> u32;
+        }
+        unsafe { getuid() }
+    }
+
+    /// M20 / AB-10: C3 restarting (systemd, a GC crash) left its socket
+    /// file behind with nothing listening, and every C5a call in that
+    /// window failed outright -- no client in the workspace retried a
+    /// connect. The restart is now invisible as long as it fits inside
+    /// the call's own deadline.
+    #[tokio::test]
+    async fn a_storage_restart_inside_the_deadline_is_invisible() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("storage.sock");
+        // C3 has been up and is now down, socket file still in place.
+        drop(tokio::net::UnixListener::bind(&sock).unwrap());
+
+        let restart = sock.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::remove_file(&restart).ok();
+            neuroos_testkit::storage_mocks::spawn_empty(&restart, current_uid());
+        });
+
+        let client = StorageClient::new(sock);
+        let rows = client
+            .query_focus_history(0, 0)
+            .await
+            .expect("a restart within the 100ms deadline must not fail the query");
+        assert!(rows.is_none(), "the restarted mock has no focus history");
+    }
 
     #[tokio::test]
     async fn connect_failure_is_a_clear_error_not_a_hang() {

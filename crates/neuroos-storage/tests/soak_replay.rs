@@ -53,7 +53,13 @@ fn dev_models_dir() -> PathBuf {
 }
 
 fn dev_onnxruntime_dylib() -> PathBuf {
-    dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so")
+    // M16: a test is its own `main`, so it pins the ONNX Runtime
+    // dylib the way `main` does, before `Embedder::load` can be
+    // reached; harmless to repeat, an error only on a conflict.
+    let path =
+        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
+    let _ = neuroos_storage::embed::Embedder::set_dylib_path(&path);
+    path
 }
 
 fn fixture_dumps() -> Vec<PathBuf> {

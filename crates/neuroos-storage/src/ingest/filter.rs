@@ -39,6 +39,21 @@ const PROMOTION_DWELL_THRESHOLD: Duration = Duration::from_secs(5);
 const SELF_APP_IDS: &[&str] = &["org.neuroos.Confirm"];
 const SELF_COMM_PREFIX: &str = "neuroos-";
 
+/// M13: an upper bound on the transient state this filter keeps in memory.
+/// Every `/proc` snapshot introduces a fresh `proc:<pid>` key and every
+/// window a fresh `app_id`, none of which were ever removed, so a filter
+/// living as long as C3 does grew without limit. 4096 is far above the
+/// number of apps and build trees a desktop session really has (so the cap
+/// is never reached in normal use) and small enough to be bounded memory.
+const MAX_TRACKED_KEYS: usize = 4096;
+/// A key untouched for this long is transient state nobody is accumulating
+/// towards a promotion any more; see [`IngestFilter::prune`].
+const COUNTER_TTL: Duration = Duration::from_secs(60 * 60);
+/// M13: the same chunk text (notably "build job under make", re-derived
+/// from every 5 s `/proc` snapshot for the whole length of a build) is
+/// embedded at most once per this window.
+const CHUNK_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
 /// Strips leading status glyphs from a window title: terminals animate a
 /// spinner (`◐`/`◑`/`✳`) and editors prefix unsaved files with `*`, which
 /// otherwise turn one window into several near-duplicate chunks (BUG-007).
@@ -80,6 +95,8 @@ struct Counter {
     occurrences: u32,
     dwell: Duration,
     promoted: bool,
+    /// Event time of the last touch, for [`IngestFilter::prune`].
+    last_touch_ns: u64,
 }
 
 impl Counter {
@@ -115,6 +132,10 @@ pub struct IngestFilter {
     /// after `process` (the triggering event may already carry the *next*
     /// title).
     last_segment_title: Option<String>,
+    /// M13: chunk text -> the event time it was last accepted, so a domain
+    /// adapter can ask whether an identical chunk is worth embedding again
+    /// ([`Self::accept_chunk`]).
+    recent_chunks: HashMap<String, u64>,
 }
 
 impl IngestFilter {
@@ -126,6 +147,39 @@ impl IngestFilter {
     /// seen in a `ProcessTreeSnapshot`, or is itself a root).
     pub fn collapse_pid(&self, pid: u32) -> u32 {
         self.pid_roots.get(&pid).copied().unwrap_or(pid)
+    }
+
+    /// How many transient counters are currently tracked (M13's bound).
+    pub fn tracked_keys(&self) -> usize {
+        self.counters.len()
+    }
+
+    /// How many chunk texts [`Self::accept_chunk`] currently remembers.
+    pub fn recent_chunk_count(&self) -> usize {
+        self.recent_chunks.len()
+    }
+
+    /// M13: whether `text` is worth embedding, i.e. whether an identical
+    /// chunk has *not* been accepted within [`CHUNK_COOLDOWN`]. A domain
+    /// adapter calls this for chunks it re-derives from periodic
+    /// observations ("build job under make", a file path touched over and
+    /// over) rather than from a one-off event; the text carries no new
+    /// information on the repeats, but each copy costs an embedding, a
+    /// LanceDB row and an FTS row.
+    pub fn accept_chunk(&mut self, text: &str, now_ns: u64) -> bool {
+        if let Some(last_ns) = self.recent_chunks.get(text)
+            && now_ns.saturating_sub(*last_ns) <= CHUNK_COOLDOWN.as_nanos() as u64
+        {
+            return false;
+        }
+        self.recent_chunks.insert(text.to_string(), now_ns);
+        prune(
+            &mut self.recent_chunks,
+            |last_ns| *last_ns,
+            |_| false,
+            now_ns,
+        );
+        true
     }
 
     /// The last-known title for a still-open toplevel (`None` if it was
@@ -145,10 +199,35 @@ impl IngestFilter {
     pub fn process(&mut self, event: &RawTelemetryEvent) -> FilterOutcome {
         match &event.payload {
             Some(Payload::ProcTree(snapshot)) => {
+                // M13: stage 2 for processes, which this filter's own doc
+                // comment has always described ("any process comm starting
+                // with `neuroos-`") but only ever applied to window
+                // app_ids -- so C1's /proc sampler promoted neuroos's own
+                // services as `process_activity` entities.
+                let root_comm = snapshot
+                    .processes
+                    .iter()
+                    .find(|p| p.pid == snapshot.root_pid)
+                    .map(|p| p.comm.as_str())
+                    .unwrap_or_default();
+                if is_self_observation(root_comm) {
+                    return FilterOutcome::Excluded;
+                }
                 // Stage 1: record the collapse mapping for later /proc-derived
                 // events; the snapshot itself is keyed on its root pid.
+                // M13: this snapshot is the current truth about *this*
+                // root's tree, so children that have since exited are
+                // dropped -- the map used to keep every pid that ever
+                // appeared under it, and the kernel reuses pids.
+                self.pid_roots.retain(|_, root| *root != snapshot.root_pid);
                 for p in &snapshot.processes {
                     self.pid_roots.insert(p.pid, snapshot.root_pid);
+                }
+                if self.pid_roots.len() > MAX_TRACKED_KEYS {
+                    // A last-resort bound: a pathological stream of
+                    // short-lived roots. Identity collapse (the `unwrap_or`
+                    // in `collapse_pid`) is the safe fallback.
+                    self.pid_roots.clear();
                 }
                 if !snapshot.root_pid_known {
                     return FilterOutcome::NotApplicable;
@@ -158,6 +237,7 @@ impl IngestFilter {
                     true,
                     Duration::ZERO,
                     None,
+                    event.observed_at_ns,
                 )
             }
             Some(Payload::Window(w)) => self.process_window(w, event.observed_at_ns),
@@ -167,6 +247,7 @@ impl IngestFilter {
                 true,
                 Duration::ZERO,
                 None,
+                event.observed_at_ns,
             ),
             Some(Payload::Idle(_)) | Some(Payload::Resource(_)) | None => {
                 FilterOutcome::NotApplicable
@@ -212,7 +293,13 @@ impl IngestFilter {
                 self.active_since_ns.insert(w.toplevel_id, observed_at_ns);
                 self.last_segment_title = Some(old);
                 let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
-                self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
+                self.touch(
+                    app_id,
+                    false,
+                    dwell,
+                    Some((started_ns, observed_at_ns)),
+                    observed_at_ns,
+                )
             }
             Some(Kind::StateChanged(s)) => {
                 let Some(app_id) = self.toplevel_app_ids.get(&w.toplevel_id).cloned() else {
@@ -224,11 +311,17 @@ impl IngestFilter {
                     // One occurrence per focus session (Architecture.md §6.2's
                     // "N >= 3 occurrences" — 3 separate times focused, not 3
                     // raw wire events).
-                    self.touch(app_id, true, Duration::ZERO, None)
+                    self.touch(app_id, true, Duration::ZERO, None, observed_at_ns)
                 } else if let Some(started_ns) = self.active_since_ns.remove(&w.toplevel_id) {
                     self.last_segment_title = self.toplevel_titles.get(&w.toplevel_id).cloned();
                     let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
-                    self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
+                    self.touch(
+                        app_id,
+                        false,
+                        dwell,
+                        Some((started_ns, observed_at_ns)),
+                        observed_at_ns,
+                    )
                 } else {
                     FilterOutcome::NotApplicable
                 }
@@ -243,7 +336,13 @@ impl IngestFilter {
                     (Some(app_id), Some(started_ns)) => {
                         self.last_segment_title = title;
                         let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
-                        self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
+                        self.touch(
+                            app_id,
+                            false,
+                            dwell,
+                            Some((started_ns, observed_at_ns)),
+                            observed_at_ns,
+                        )
                     }
                     _ => FilterOutcome::NotApplicable,
                 }
@@ -262,21 +361,64 @@ impl IngestFilter {
         add_occurrence: bool,
         extra_dwell: Duration,
         segment: Option<(u64, u64)>,
+        now_ns: u64,
     ) -> FilterOutcome {
         let counter = self.counters.entry(key.clone()).or_default();
         if add_occurrence {
             counter.occurrences += 1;
         }
         counter.dwell += extra_dwell;
-        if counter.promoted {
-            return FilterOutcome::Promoted { key, segment };
-        }
-        if counter.gate() {
-            counter.promoted = true;
+        counter.last_touch_ns = now_ns;
+        let promoted = counter.promoted || counter.gate();
+        counter.promoted = promoted;
+        // M13: the map is pruned on the way out, so the bound holds no
+        // matter how many distinct keys the event stream invents.
+        prune(
+            &mut self.counters,
+            |c| c.last_touch_ns,
+            |c| c.promoted,
+            now_ns,
+        );
+        if promoted {
             FilterOutcome::Promoted { key, segment }
         } else {
             FilterOutcome::NotYetPromoted { key }
         }
+    }
+}
+
+/// M13: keeps `map` within [`MAX_TRACKED_KEYS`] entries. Entries untouched
+/// for [`COUNTER_TTL`] of *event* time go first (they are transient state
+/// nobody is accumulating towards anything any more); if that is not
+/// enough, the oldest-touched entries go, except that `keep` entries (a key
+/// that already crossed the promotion gate, and so names a persisted
+/// entity) are evicted only once nothing else is left to drop -- losing one
+/// would re-gate an entity C3 has already written.
+fn prune<V>(
+    map: &mut HashMap<String, V>,
+    last_touch_ns: impl Fn(&V) -> u64,
+    keep: impl Fn(&V) -> bool,
+    now_ns: u64,
+) {
+    if map.len() <= MAX_TRACKED_KEYS {
+        return;
+    }
+    let ttl = COUNTER_TTL.as_nanos() as u64;
+    map.retain(|_, v| keep(v) || now_ns.saturating_sub(last_touch_ns(v)) <= ttl);
+    if map.len() <= MAX_TRACKED_KEYS {
+        return;
+    }
+    // Oldest-first, non-`keep` entries before `keep` ones.
+    let mut order: Vec<(String, bool, u64)> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), keep(v), last_touch_ns(v)))
+        .collect();
+    order.sort_by_key(|(_, keep, last)| (*keep, *last));
+    // Prune down to three quarters of the cap, so this doesn't run on
+    // every single touch once the cap is reached.
+    let target = MAX_TRACKED_KEYS * 3 / 4;
+    for (key, _, _) in order.into_iter().take(map.len() - target) {
+        map.remove(&key);
     }
 }
 
@@ -666,6 +808,164 @@ mod tests {
                 segment: None,
             }
         );
+    }
+
+    fn proc_tree(at_ns: u64, root_pid: u32, procs: &[(u32, u32, &str)]) -> RawTelemetryEvent {
+        RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "proc".into(),
+            payload: Some(Payload::ProcTree(ProcessTreeSnapshot {
+                root_pid,
+                root_pid_known: true,
+                processes: procs
+                    .iter()
+                    .map(|(pid, ppid, comm)| ProcessInfo {
+                        pid: *pid,
+                        ppid: *ppid,
+                        comm: (*comm).to_string(),
+                    })
+                    .collect(),
+            })),
+        }
+    }
+
+    /// M13: stage 2's doc comment has always claimed "any process comm
+    /// starting with `neuroos-`" is excluded, but only window `app_id`s
+    /// were ever checked -- so C1's own `/proc` sampler promoted
+    /// `neuroos-monitor`, `neuroos-storage` and friends as
+    /// `process_activity` entities, i.e. neuroos observing itself.
+    #[test]
+    fn a_neuroos_process_tree_is_self_observation() {
+        let mut f = IngestFilter::new();
+        for session in 0..5u64 {
+            assert_eq!(
+                f.process(&proc_tree(session * S, 100, &[(100, 1, "neuroos-storage")])),
+                FilterOutcome::Excluded
+            );
+        }
+    }
+
+    #[test]
+    fn an_excluded_process_tree_is_not_recorded_in_the_collapse_map() {
+        let mut f = IngestFilter::new();
+        f.process(&proc_tree(
+            0,
+            100,
+            &[(100, 1, "neuroos-monitor"), (101, 100, "sh")],
+        ));
+        assert_eq!(f.collapse_pid(101), 101, "identity: never recorded");
+    }
+
+    #[test]
+    fn an_ordinary_process_tree_is_still_counted() {
+        let mut f = IngestFilter::new();
+        assert_eq!(
+            f.process(&proc_tree(0, 100, &[(100, 1, "cargo")])),
+            FilterOutcome::NotYetPromoted {
+                key: "proc:100".into()
+            }
+        );
+    }
+
+    const S: u64 = 1_000_000_000;
+
+    /// M13: `pid_roots` only ever grew. A long-lived root (a shell, a
+    /// build tool) whose children come and go left one entry per child
+    /// that ever existed, and a pid the kernel later reused for an
+    /// unrelated process was then collapsed onto a root it has nothing to
+    /// do with.
+    #[test]
+    fn a_new_snapshot_replaces_that_roots_previous_children() {
+        let mut f = IngestFilter::new();
+        f.process(&proc_tree(0, 100, &[(100, 1, "make"), (101, 100, "cc1")]));
+        assert_eq!(f.collapse_pid(101), 100);
+        // the compiler exited; the next snapshot of the same tree has only
+        // the root left
+        f.process(&proc_tree(S, 100, &[(100, 1, "make")]));
+        assert_eq!(
+            f.collapse_pid(101),
+            101,
+            "a child that is gone must not stay mapped to its old root"
+        );
+    }
+
+    #[test]
+    fn a_new_snapshot_leaves_other_roots_children_alone() {
+        let mut f = IngestFilter::new();
+        f.process(&proc_tree(0, 100, &[(100, 1, "make"), (101, 100, "cc1")]));
+        f.process(&proc_tree(S, 200, &[(200, 1, "ninja")]));
+        assert_eq!(f.collapse_pid(101), 100);
+    }
+
+    /// M13: the transient-counter map had no bound at all: one key per
+    /// `proc:<pid>` the sampler ever saw, for the life of the process.
+    #[test]
+    fn transient_counters_are_bounded() {
+        let mut f = IngestFilter::new();
+        for pid in 0..(MAX_TRACKED_KEYS as u32 * 3) {
+            f.process(&proc_tree(
+                u64::from(pid) * S,
+                pid + 1,
+                &[(pid + 1, 1, "sh")],
+            ));
+        }
+        assert!(
+            f.tracked_keys() <= MAX_TRACKED_KEYS,
+            "{} keys tracked, cap is {MAX_TRACKED_KEYS}",
+            f.tracked_keys()
+        );
+    }
+
+    /// Eviction must not cost a key that is actually being used its
+    /// promotion: the gate is "N >= 3 occurrences", not "3 in a row".
+    #[test]
+    fn a_promoted_key_survives_eviction_pressure() {
+        let mut f = IngestFilter::new();
+        f.process(&opened(1, "cosmic-term"));
+        f.process(&activated(1, 0, true));
+        f.process(&activated(1, 6 * S, false)); // promotes by dwell
+        for pid in 0..(MAX_TRACKED_KEYS as u32 * 3) {
+            f.process(&proc_tree(
+                (10 + u64::from(pid)) * S,
+                pid + 1,
+                &[(pid + 1, 1, "sh")],
+            ));
+        }
+        assert_eq!(
+            f.process(&activated(1, 100_000 * S, true)),
+            FilterOutcome::Promoted {
+                key: "cosmic-term".into(),
+                segment: None,
+            }
+        );
+    }
+
+    /// M13: during a build, C1 re-samples the same process tree every 5 s
+    /// and C3 embedded an identical "build job under make" chunk each
+    /// time. The text carries no new information, and every copy costs an
+    /// embedding plus a LanceDB row.
+    #[test]
+    fn an_identical_chunk_is_not_accepted_twice_in_a_row() {
+        let mut f = IngestFilter::new();
+        assert!(f.accept_chunk("build job under make", 0));
+        assert!(!f.accept_chunk("build job under make", 5 * S));
+        assert!(f.accept_chunk("build job under ninja", 5 * S));
+    }
+
+    #[test]
+    fn an_identical_chunk_is_accepted_again_after_the_cooldown() {
+        let mut f = IngestFilter::new();
+        assert!(f.accept_chunk("build job under make", 0));
+        assert!(f.accept_chunk("build job under make", CHUNK_COOLDOWN.as_nanos() as u64 + 1));
+    }
+
+    #[test]
+    fn the_recent_chunk_memory_is_bounded() {
+        let mut f = IngestFilter::new();
+        for i in 0..(MAX_TRACKED_KEYS * 3) {
+            assert!(f.accept_chunk(&format!("chunk {i}"), i as u64));
+        }
+        assert!(f.recent_chunk_count() <= MAX_TRACKED_KEYS);
     }
 
     // PT (phases.md §7.3): the filter never promotes an excluded app_id,

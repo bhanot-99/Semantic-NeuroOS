@@ -4024,6 +4024,7 @@ dependencies = [
  "neuroos-health",
  "neuroos-ipc",
  "neuroos-proto",
+ "neuroos-shm",
  "prost 0.13.5",
  "tokio",
 ]

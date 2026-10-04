@@ -106,6 +106,65 @@ void corrupt_len_is_not_read() {
     ::munmap(peer, size);
 }
 
+// M12: a token piece wider than one slot's payload used to be dropped
+// silently (`write_as` returns false and lanes.cpp ignored it), so the
+// client's answer was missing a chunk of text with nothing in the log.
+// `write_split` spreads it over consecutive slots instead; the reader (and
+// C5's `read_all_tokens`, M11) concatenates payload bytes, so the split is
+// invisible to it.
+void an_oversize_piece_is_split_not_dropped() {
+    neuroos::shm::Ring ring = neuroos::shm::Ring::create("oversize", 32, 64);
+    auto writer = ring.writer();
+    // 64-byte slots: 32 bytes of payload each, so 100 bytes needs 4 slots.
+    std::vector<std::uint8_t> big(100);
+    for (std::size_t i = 0; i < big.size(); ++i) {
+        big[i] = static_cast<std::uint8_t>('a' + (i % 26));
+    }
+    check(!writer.write_as(7, 1, 0, big.data(), big.size()),
+          "a single write_as still refuses an oversize payload");
+    check(writer.write_split(7, 1, neuroos::shm::kFlagEos, big.data(), big.size()),
+          "write_split accepts an oversize payload");
+
+    auto reader = ring.reader_for_generation(7);
+    std::vector<std::uint8_t> got;
+    bool saw_eos = false;
+    int slots = 0;
+    while (auto piece = reader.try_read()) {
+        got.insert(got.end(), piece->payload.begin(), piece->payload.end());
+        saw_eos = saw_eos || (piece->flags & neuroos::shm::kFlagEos) != 0;
+        ++slots;
+    }
+    check(slots == 4, "100 bytes over 32-byte payloads takes 4 slots");
+    check(got == big, "the reassembled bytes are exactly what was written");
+    check(saw_eos, "the terminal flag survives the split");
+}
+
+void a_small_piece_still_takes_one_slot() {
+    neuroos::shm::Ring ring = neuroos::shm::Ring::create("small", 8, 64);
+    auto writer = ring.writer();
+    const std::uint8_t text[] = {'h', 'i'};
+    check(writer.write_split(1, 1, neuroos::shm::kFlagEos, text, sizeof(text)),
+          "write_split accepts a payload that fits");
+    auto reader = ring.reader_for_generation(1);
+    auto piece = reader.try_read();
+    check(piece.has_value() && piece->payload.size() == 2, "one slot, two bytes");
+    check(piece.has_value() && (piece->flags & neuroos::shm::kFlagEos) != 0,
+          "its flags are the ones passed in");
+    check(!reader.try_read().has_value(), "no second slot was written");
+}
+
+// A terminal slot carries no payload at all (H8's end-of-stream marker).
+void an_empty_piece_still_writes_one_slot() {
+    neuroos::shm::Ring ring = neuroos::shm::Ring::create("empty", 8, 64);
+    auto writer = ring.writer();
+    check(writer.write_split(1, 0, neuroos::shm::kFlagEos, nullptr, 0),
+          "write_split accepts an empty payload");
+    auto reader = ring.reader_for_generation(1);
+    auto piece = reader.try_read();
+    check(piece.has_value() && piece->payload.empty(), "one empty slot");
+    check(!reader.try_read().has_value(), "and only one");
+}
+
 } // namespace
 
 int main() {
@@ -115,6 +174,9 @@ int main() {
           "open rejects a slot_size too small for the slot metadata");
     check(open_is_rejected(neuroos::shm::kVersion + 1, 2, 64), "open rejects an unknown version");
     corrupt_len_is_not_read();
+    an_oversize_piece_is_split_not_dropped();
+    a_small_piece_still_takes_one_slot();
+    an_empty_piece_still_writes_one_slot();
 
     std::printf("%s\n", failures == 0 ? "all checks passed" : "FAILURES");
     return failures == 0 ? 0 : 1;

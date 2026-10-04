@@ -292,6 +292,108 @@ int main() {
         (void)bg_ring;
     }
 
+    // 5b. M12: a job cancelled while it is still *queued* must be taken
+    // out of the queue, not merely flagged. Before the fix, a queued job
+    // ran its full prompt prefill and decode once the job ahead of it
+    // finished, and only then wrote its end-of-stream slot -- so the
+    // cancelling client waited out the whole job ahead of it for an answer
+    // it had already abandoned. Two interactive jobs are submitted
+    // back-to-back on separate rings; the second one is cancelled at once
+    // and must be terminated immediately, long before the first (400
+    // tokens, ~24 s of real decoding) could possibly finish.
+    {
+        int afd = connect_or_die(sock_path);
+        neuroos::v1::Envelope areq;
+        areq.set_schema_version(1);
+        areq.mutable_attach_ring_request()->set_ring_name("queued-cancel-ring");
+        check(neuroos::ipc::write_envelope(afd, areq, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write AttachRingRequest for the queued-cancel ring");
+        auto aresp = neuroos::ipc::read_envelope_with_fd(afd, neuroos::ipc::kDefaultMaxFrame);
+        check(aresp.has_value() && aresp.value().has_value() && aresp.value()->fd >= 0,
+             "receive the queued-cancel ring fd");
+        auto qc_ring = neuroos::shm::Ring::open(aresp.value()->fd);
+        ::close(afd);
+
+        auto submit = [&](const char* ring_name, std::uint32_t max_tokens) {
+            int fd = connect_or_die(sock_path);
+            neuroos::v1::Envelope req;
+            req.set_schema_version(1);
+            auto* gen = req.mutable_generate_request();
+            gen->set_prompt("Count slowly from one to two hundred.");
+            gen->set_max_tokens(max_tokens);
+            gen->set_lane(neuroos::v1::LANE_INTERACTIVE);
+            gen->set_ring_name(ring_name);
+            gen->set_temperature(0.0F);
+            check(neuroos::ipc::write_envelope(fd, req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+                 "write GenerateRequest");
+            auto resp = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
+            check(resp.has_value() && resp.value().has_value() &&
+                      resp.value()->generate_response().accepted(),
+                 "GenerateRequest must be accepted");
+            std::uint64_t id = resp.value()->generate_response().generation_id();
+            ::close(fd);
+            return id;
+        };
+
+        std::uint64_t running_id = submit("smoke-test-ring", 400);
+        std::uint64_t queued_id = submit("queued-cancel-ring", 400);
+
+        auto qc_reader = qc_ring.reader_for_generation(queued_id);
+        auto cancel_sent_at = std::chrono::steady_clock::now();
+        int cfd = connect_or_die(sock_path);
+        neuroos::v1::Envelope creq;
+        creq.mutable_cancel_request()->set_generation_id(queued_id);
+        check(neuroos::ipc::write_envelope(cfd, creq, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write CancelRequest for the queued job");
+        auto cresp = neuroos::ipc::read_envelope(cfd, neuroos::ipc::kDefaultMaxFrame);
+        check(cresp.has_value() && cresp.value().has_value() &&
+                  cresp.value()->cancel_response().cancelled(),
+             "cancelling a queued job must report cancelled");
+        ::close(cfd);
+
+        // A single real decode step is ~55-75 ms, and the job ahead has 400
+        // of them to run; 3 s is far below that and far above the cost of
+        // writing one slot.
+        bool terminated = false;
+        int tokens = 0;
+        auto deadline = cancel_sent_at + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto piece = qc_reader.try_read();
+            if (!piece.has_value()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            if ((piece->flags & neuroos::shm::kFlagEos) != 0) {
+                check((piece->flags & neuroos::shm::kFlagCancel) != 0,
+                     "a cancelled job's terminal slot must carry kFlagCancel");
+                terminated = true;
+                break;
+            }
+            ++tokens;
+        }
+        double latency_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - cancel_sent_at)
+                                .count();
+        check(terminated,
+             "a queued job cancelled before it started must end its stream at once, not after "
+             "the job ahead of it finishes");
+        check(tokens == 0, "a queued job that was cancelled must never produce a token");
+        std::printf("OK: queued Cancel -> stream ended %.1f ms after CancelRequest, 0 tokens "
+                   "decoded (the job ahead of it was still running)\n",
+                   latency_ms);
+
+        // Clean up the job that was actually running.
+        int cfd2 = connect_or_die(sock_path);
+        neuroos::v1::Envelope creq2;
+        creq2.mutable_cancel_request()->set_generation_id(running_id);
+        neuroos::ipc::write_envelope(cfd2, creq2, neuroos::ipc::kDefaultMaxFrame);
+        neuroos::ipc::read_envelope(cfd2, neuroos::ipc::kDefaultMaxFrame);
+        ::close(cfd2);
+        // Drain the shared ring so step 6 starts from a clean reader.
+        while (reader.try_read().has_value()) {
+        }
+    }
+
     // 6. GBNF grammar (PRD FR-INF-04, phases.md §5.2 P2-S05): force the real
     // model to answer with exactly "yes" or "no", nothing else.
     {

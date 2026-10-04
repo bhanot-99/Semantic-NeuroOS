@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
+use neuroos_ipc::{
+    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, write_envelope_deadline,
+};
 use neuroos_proto::v1::{ActionRequest, Envelope, Taint, envelope};
 use neuroos_taint::TaintFlags;
 
@@ -49,7 +51,7 @@ impl KernelClient {
         capability: &str,
         taint: TaintFlags,
     ) -> Result<bool, KernelClientError> {
-        let mut stream = connect(&self.socket_path, KERNEL_CHECK_DEADLINE)
+        let mut stream = connect_retrying(&self.socket_path, KERNEL_CHECK_DEADLINE)
             .await
             .map_err(|source| KernelClientError::Connect {
                 path: self.socket_path.clone(),
