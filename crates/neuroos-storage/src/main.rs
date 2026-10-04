@@ -54,6 +54,17 @@ fn main() {
         tracing::error!(error = %e, "failed to enter the Landlock sandbox");
         std::process::exit(1);
     }
+    // M16: `ORT_DYLIB_PATH` is an environment write, so it belongs here --
+    // before the runtime's worker threads exist -- for the same reason the
+    // Landlock ruleset above does. `Embedder::load` deliberately no longer
+    // does it: it is also reached from the background re-index task, with
+    // the whole service running.
+    let onnxruntime_dylib = onnxruntime_dylib_path(&config.storage.models_dir);
+    if let Err(e) = neuroos_storage::embed::Embedder::set_dylib_path(&onnxruntime_dylib) {
+        tracing::error!(error = %e, "failed to pin the ONNX Runtime dylib");
+        std::process::exit(1);
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -64,14 +75,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    runtime.block_on(run(config));
+    runtime.block_on(run(config, onnxruntime_dylib));
 }
 
-async fn run(config: neuroos_common::Config) {
+async fn run(config: neuroos_common::Config, onnxruntime_dylib: std::path::PathBuf) {
     let my_uid = current_uid();
     let sqlite_path = neuroos_common::paths::storage_dir().join("meta.sqlite3");
     let lance_path = neuroos_common::paths::storage_dir().join("lance");
-    let onnxruntime_dylib = onnxruntime_dylib_path(&config.storage.models_dir);
 
     let engine = match neuroos_storage::engine::StorageEngine::open(
         &sqlite_path,

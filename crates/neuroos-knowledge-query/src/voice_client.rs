@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
+use neuroos_ipc::{
+    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, write_envelope_deadline,
+};
 use neuroos_proto::v1::{Envelope, PreambleRequest, envelope};
 
 /// rules.md §5.7: no voice.sock-specific deadline is named, so this uses
@@ -45,7 +47,7 @@ impl VoiceClient {
     /// soft): a failure here must not stop the answer itself from
     /// proceeding; callers decide whether to treat this as fatal.
     pub async fn request_preamble(&self, clip_id: &str) -> Result<(), VoiceClientError> {
-        let mut stream = connect(&self.socket_path, VOICE_REQUEST_DEADLINE)
+        let mut stream = connect_retrying(&self.socket_path, VOICE_REQUEST_DEADLINE)
             .await
             .map_err(|source| VoiceClientError::Connect {
                 path: self.socket_path.clone(),

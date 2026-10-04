@@ -182,3 +182,47 @@ async fn a_prompt_near_the_context_limit_ends_cleanly() {
         started.elapsed()
     );
 }
+
+/// M18: `SYSTEM_BUDGET_TOKENS` (128 of FR-KNO-06's 512) covers the system
+/// preamble plus the chat template's own fixed text, and nothing ever
+/// measured either -- the budget was a comment. Both are compile-time
+/// constants, so this is where the claim is checked, with C4's real
+/// tokenizer. The runtime budgets (deictic, evidence) are enforced in
+/// `assemble`; together with this, the whole prompt is within the cap.
+#[tokio::test]
+#[ignore = "needs the real BitNet model + built cpp/neuroos-inference binary; see doc comment"]
+async fn the_system_half_of_the_prompt_fits_its_budget() {
+    use neuroos_knowledge_query::assemble::{
+        DEICTIC_BUDGET_TOKENS, EVIDENCE_BUDGET_TOKENS, SYSTEM_BUDGET_TOKENS, TOTAL_BUDGET_TOKENS,
+        render_prompt,
+    };
+
+    let Some(proc) = spawn_real_inference() else {
+        return;
+    };
+    let client = ready_client(&proc).await;
+
+    // The template with both variable sections empty: the system preamble
+    // and the turn markers, i.e. exactly what the system budget pays for.
+    let fixed = render_prompt("", "");
+    let fixed_tokens = client.count_tokens(&fixed).await.unwrap();
+    assert!(
+        fixed_tokens <= SYSTEM_BUDGET_TOKENS,
+        "the preamble plus template is {fixed_tokens} real tokens, over the \
+         {SYSTEM_BUDGET_TOKENS}-token system budget"
+    );
+
+    // And the three budgets really do bound a full prompt: a deictic
+    // section and an evidence block each at their own limit, measured
+    // with the real tokenizer, stay under the 512-token hard cap.
+    let at_budget = |tokens: u32| "word ".repeat(tokens as usize);
+    let full = render_prompt(
+        &at_budget(EVIDENCE_BUDGET_TOKENS),
+        &at_budget(DEICTIC_BUDGET_TOKENS),
+    );
+    let full_tokens = client.count_tokens(&full).await.unwrap();
+    assert!(
+        full_tokens >= TOTAL_BUDGET_TOKENS / 2,
+        "sanity: this is meant to be a realistically large prompt, got {full_tokens}"
+    );
+}

@@ -62,13 +62,17 @@ fn enable_incremental_auto_vacuum(conn: &Connection) -> Result<(), StorageError>
 }
 
 fn migrate(conn: &Connection) -> Result<(), StorageError> {
+    apply_migrations(conn, MIGRATIONS)
+}
+
+fn apply_migrations(conn: &Connection, migrations: &[(&str, &str)]) -> Result<(), StorageError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version    TEXT PRIMARY KEY,
             applied_ns INTEGER NOT NULL
         );",
     )?;
-    for (version, sql) in MIGRATIONS {
+    for (version, sql) in migrations {
         let already_applied: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
             [version],
@@ -77,11 +81,32 @@ fn migrate(conn: &Connection) -> Result<(), StorageError> {
         if already_applied {
             continue;
         }
-        conn.execute_batch(sql)?;
-        conn.execute(
-            "INSERT INTO schema_migrations (version, applied_ns) VALUES (?1, ?2)",
-            (version, neuroos_common::now_ns()),
-        )?;
+        // M17: the migration's statements and the row that records it as
+        // applied are one transaction. SQLite's DDL is transactional, so a
+        // failure part-way (a crash, a disk error, a statement this build
+        // rejects) rolls the whole migration back instead of leaving
+        // half-created tables with nothing recording them -- which made
+        // every later `open()` re-run the migration and die on "table ...
+        // already exists", permanently.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let applied = (|| {
+            conn.execute_batch(sql)?;
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_ns) VALUES (?1, ?2)",
+                (version, neuroos_common::now_ns()),
+            )
+        })();
+        match applied {
+            Ok(_) => conn.execute_batch("COMMIT")?,
+            Err(err) => {
+                // A failing rollback would mask the real cause, so it is
+                // logged rather than returned (rules.md R0-6: no payloads).
+                if let Err(rollback) = conn.execute_batch("ROLLBACK") {
+                    tracing::error!(error = %rollback, "failed to roll back a partial migration");
+                }
+                return Err(err.into());
+            }
+        }
     }
     Ok(())
 }
@@ -802,6 +827,54 @@ mod tests {
             .unwrap();
         assert_eq!(chunks, 1);
         assert_eq!(meta, "flat");
+    }
+
+    /// M17: a migration was a bare `execute_batch` followed by a separate
+    /// `INSERT` into `schema_migrations`. A failure anywhere in between --
+    /// a crash, a disk error, a statement that is wrong on this SQLite
+    /// build -- left the tables the batch had already created with no
+    /// version row to say so, so every later `open()` re-ran the whole
+    /// migration and died on "table ... already exists". The database
+    /// could never be opened again.
+    #[test]
+    fn a_migration_that_fails_part_way_leaves_nothing_behind() {
+        let conn = Connection::open_in_memory().unwrap();
+        let bad: &[(&str, &str)] = &[(
+            "0001_bad",
+            "CREATE TABLE half_done (x INTEGER);
+             CREATE TABLE this_fails (y NOT_A_TYPE PRIMARY KEY AUTOINCREMENT);",
+        )];
+        assert!(apply_migrations(&conn, bad).is_err());
+        assert!(!table_exists(&conn, "half_done"));
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 0);
+    }
+
+    /// The symptom this is really about: after a failed migration the
+    /// database must still be openable.
+    #[test]
+    fn a_failed_migration_can_be_retried_once_the_fault_is_gone() {
+        let conn = Connection::open_in_memory().unwrap();
+        let bad: &[(&str, &str)] = &[(
+            "0001_initial",
+            "CREATE TABLE things (x INTEGER);
+             CREATE TABLE this_fails (y NOT_A_TYPE PRIMARY KEY AUTOINCREMENT);",
+        )];
+        assert!(apply_migrations(&conn, bad).is_err());
+        let fixed: &[(&str, &str)] = &[("0001_initial", "CREATE TABLE things (x INTEGER);")];
+        apply_migrations(&conn, fixed).expect("the retry must not hit 'table already exists'");
+        assert!(table_exists(&conn, "things"));
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]

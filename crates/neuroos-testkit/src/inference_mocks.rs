@@ -11,13 +11,78 @@ use neuroos_ipc::{
     write_envelope_with_fd,
 };
 use neuroos_proto::v1::{
-    AttachRingResponse, CancelResponse, DistillResponse, Envelope, GenerateResponse, envelope,
+    AttachRingResponse, CancelResponse, DistillResponse, Envelope, GenerateResponse,
+    GetInfoResponse, envelope,
 };
 use neuroos_shm::Ring;
 
 /// The `generation_id`s a client asked this server to cancel, in arrival
 /// order. Readable at any point after the exchange under test.
 pub type CancelledGenerations = Arc<Mutex<Vec<u64>>>;
+
+/// Every `tokenize_text` a client asked this server to count, in arrival
+/// order -- so a test can assert not just the result but how many C4 round
+/// trips producing it took (M18).
+pub type CountedTexts = Arc<Mutex<Vec<String>>>;
+
+/// One mock token per [`MOCK_BYTES_PER_TOKEN`] bytes, rounded up: the
+/// usual rule of thumb for English BPE, and (unlike a word count) never
+/// *below* one token per 4 bytes, so a caller's byte-based upper bound on
+/// the token count stays an upper bound here too.
+pub const MOCK_BYTES_PER_TOKEN: usize = 4;
+
+/// Answers `GetInfo` with a deterministic token count for `tokenize_text`
+/// and records every text it was asked about. Nothing else is
+/// implemented: this is for the token-budget paths, not generation.
+pub fn spawn_token_counter(sock_path: impl AsRef<Path>, allowed_uid: u32) -> CountedTexts {
+    let counted: CountedTexts = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::clone(&counted);
+    let sock_path = sock_path.as_ref().to_path_buf();
+    tokio::spawn(async move {
+        let Ok(server) = UdsServer::bind(UdsServerConfig::new(sock_path, vec![allowed_uid])) else {
+            return;
+        };
+        loop {
+            let Ok(Some((stream, _cred))) = server.accept().await else {
+                continue;
+            };
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Ok(Some(env)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
+                    let Some(envelope::Body::GetInfoRequest(req)) = env.body else {
+                        break;
+                    };
+                    let tokens = req.tokenize_text.len().div_ceil(MOCK_BYTES_PER_TOKEN);
+                    handle
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(req.tokenize_text);
+                    let resp = Envelope {
+                        schema_version: 1,
+                        trace_id: String::new(),
+                        request_id: env.request_id,
+                        sent_at_ns: 0,
+                        body: Some(envelope::Body::GetInfoResponse(GetInfoResponse {
+                            model_name: "mock".into(),
+                            context_length: 4096,
+                            vocab_size: 128_256,
+                            build_info: "testkit".into(),
+                            token_count: u32::try_from(tokens).unwrap_or(u32::MAX),
+                        })),
+                    };
+                    if write_envelope(&mut stream, &resp, DEFAULT_MAX_FRAME)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    counted
+}
 
 /// Accepts `AttachRing` (handing back a real memfd ring), accepts every
 /// `Generate`/`Distill` with `generation_id`, then writes *nothing* into

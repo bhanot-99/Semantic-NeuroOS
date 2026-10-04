@@ -322,6 +322,15 @@ impl RingWriter<'_> {
 
         let cur = seqlock.load(Ordering::Relaxed);
         seqlock.store(cur.wrapping_add(1), Ordering::Release); // odd: writing
+        // M19: the `Release` above keeps *earlier* work from moving after
+        // the odd marker, which is not what a seqlock writer needs; it
+        // needs the field stores below to stay *after* it, so a reader
+        // that has already seen an even counter cannot also see a
+        // half-written field. That requires a release fence here. On x86
+        // stores are not reordered with stores, so the old code was
+        // correct there by accident; on a weakly-ordered CPU (ARM, which
+        // Architecture.md §12 lists as a target) it is not.
+        std::sync::atomic::fence(Ordering::Release);
 
         u64_atomic(unsafe { slot.add(SLOT_SEQ_OFF) }).store(seq, Ordering::Relaxed);
         u64_atomic(unsafe { slot.add(SLOT_GENERATION_OFF) }).store(generation, Ordering::Relaxed);
@@ -336,6 +345,8 @@ impl RingWriter<'_> {
         // mid-write.
         unsafe { atomic_copy_to_slot(slot.add(SLOT_PAYLOAD_OFF), payload) };
 
+        // The `Release` here is the half that works as written: it keeps
+        // the field stores above from moving past the even marker.
         seqlock.store(cur.wrapping_add(2), Ordering::Release); // even: stable
         header.write_seq.store(seq + 1, Ordering::Release);
         Ok(())
@@ -404,7 +415,12 @@ impl RingReader<'_> {
             let payload =
                 unsafe { atomic_copy_from_slot(slot.add(SLOT_PAYLOAD_OFF), len.min(max)) };
 
-            let after = seqlock.load(Ordering::Acquire);
+            // M19: the mirror of the writer's missing fence. `Acquire` on
+            // the load below orders *later* reads after it; a seqlock
+            // reader needs the field reads above to stay *before* it, or
+            // the stability check is made against values read after it.
+            std::sync::atomic::fence(Ordering::Acquire);
+            let after = seqlock.load(Ordering::Relaxed);
             if after != before {
                 continue; // torn read; retry the same seq
             }

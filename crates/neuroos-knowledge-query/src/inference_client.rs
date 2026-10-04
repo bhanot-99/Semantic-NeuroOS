@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use neuroos_ipc::{
-    DEFAULT_MAX_FRAME, connect, read_envelope_deadline, read_envelope_with_fd_deadline,
+    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, read_envelope_with_fd_deadline,
     write_envelope_deadline,
 };
 use neuroos_proto::v1::{
@@ -88,7 +88,7 @@ impl InferenceClient {
     }
 
     async fn connect(&self) -> Result<UnixStream, InferenceClientError> {
-        connect(&self.socket_path, CONTROL_DEADLINE)
+        connect_retrying(&self.socket_path, CONTROL_DEADLINE)
             .await
             .map_err(|source| InferenceClientError::Connect {
                 path: self.socket_path.clone(),

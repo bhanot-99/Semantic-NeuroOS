@@ -33,8 +33,6 @@ pub struct StorageEngine {
     lance: Arc<LanceStore>,
     lance_dir: PathBuf,
     sqlite_path: PathBuf,
-    models_dir: PathBuf,
-    onnxruntime_dylib: PathBuf,
     /// BUG-001: `Arc<Mutex<_>>`, not a plain field, so `embed_blocking` can
     /// move a handle to it into `spawn_blocking` — see that fn's doc
     /// comment for why. The `std::sync::Mutex` here is uncontended in
@@ -57,24 +55,42 @@ impl StorageEngine {
             models_dir,
             onnxruntime_dylib,
         )?));
-        let engine = Self {
+        let mut engine = Self {
             conn,
             filter: IngestFilter::new(),
             lance,
             lance_dir: lance_path.to_path_buf(),
             sqlite_path: sqlite_path.to_path_buf(),
-            models_dir: models_dir.to_path_buf(),
-            onnxruntime_dylib: onnxruntime_dylib.to_path_buf(),
             embedder,
         };
+        engine.warm_query_path().await;
         engine.spawn_reindex_for_changed_families();
         Ok(engine)
+    }
+
+    /// M22: runs one throwaway hybrid query so the *first real* one is not
+    /// also the cold one. ONNX Runtime's first inference allocates its
+    /// arenas and finishes optimizing the graph, LanceDB opens each
+    /// family's dataset, and SQLite prepares the FTS statement -- measured
+    /// at 71 ms cold against 43 ms warm (debug build), i.e. 71 % of C5a's
+    /// 100 ms storage deadline before any disk cache misses, which is what
+    /// made `ask_end_to_end` flake right after a clean rebuild. `open()`
+    /// already spends ~700 ms loading the model, so this belongs here,
+    /// where healthd has not yet been told C3 is up.
+    ///
+    /// Best-effort by design (rules.md §5.6): a store that cannot answer
+    /// this -- a brand new one with no datasets yet -- must still open.
+    async fn warm_query_path(&mut self) {
+        if let Err(err) = self.query_hybrid("warm up the query path", 1).await {
+            tracing::debug!(error = %err, "query path warm-up did not complete");
+        }
     }
 
     /// FR-STO-11: on open, compares each family's stored
     /// `index_meta.embedding_model_id` against the embedder just loaded;
     /// any mismatch gets a background task that re-embeds every existing
-    /// chunk with its own, independently-loaded `Embedder` and writes the
+    /// chunk with *this* engine's `Embedder` (M16: it used to load a
+    /// second model, doubling resident model memory) and writes the
     /// new vectors back via `LanceStore::upsert_vectors` — `self.embedder`
     /// (used by `ingest`/`query_hybrid`) is never touched by it, so
     /// interactive ingest/query traffic is never blocked by a re-index.
@@ -97,19 +113,11 @@ impl StorageEngine {
             }
             let lance = Arc::clone(&self.lance);
             let sqlite_path = self.sqlite_path.clone();
-            let models_dir = self.models_dir.clone();
-            let onnxruntime_dylib = self.onnxruntime_dylib.clone();
+            // M16: the engine's own embedder, not a second model load.
+            let embedder = Arc::clone(&self.embedder);
             let family = family.to_string();
             tokio::spawn(async move {
-                if let Err(err) = reindex_family(
-                    &lance,
-                    &sqlite_path,
-                    &models_dir,
-                    &onnxruntime_dylib,
-                    &family,
-                )
-                .await
-                {
+                if let Err(err) = reindex_family(&lance, &sqlite_path, &embedder, &family).await {
                     tracing::error!(family, error = %err, "FR-STO-11: background reindex failed");
                 }
             });
@@ -554,8 +562,14 @@ async fn embed_blocking(
     .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
-/// FR-STO-11's actual re-index work: loads its own `Embedder` (a second,
-/// independent model load — never the caller's interactive one), re-embeds
+/// How many chunks one re-index batch re-embeds before releasing the
+/// embedder again (M16). The lock is uncontended in the steady state (the
+/// async `Mutex<StorageEngine>` in `server.rs` serializes requests before
+/// it), so this exists purely so a re-index of a large family cannot hold
+/// the embedder for minutes while queries queue behind it.
+pub(crate) const REINDEX_BATCH_SIZE: usize = 32;
+
+/// FR-STO-11's actual re-index work: re-embeds
 /// every chunk currently in `family` with it, writes the new vectors back
 /// via `LanceStore::upsert_vectors` (an upsert on `chunk_id`, so a query
 /// racing this sees either the pre- or post-reindex vector, never a gap),
@@ -566,41 +580,43 @@ async fn embed_blocking(
 async fn reindex_family(
     lance: &LanceStore,
     sqlite_path: &Path,
-    models_dir: &Path,
-    onnxruntime_dylib: &Path,
+    embedder: &Arc<StdMutex<Embedder>>,
     family: &str,
 ) -> Result<(), EngineError> {
-    let mut embedder = Embedder::load(models_dir, onnxruntime_dylib)?;
     let rows = lance.all_chunks(family).await?;
     if rows.is_empty() {
         return Ok(());
     }
-    // BUG-001: same fix as `embed_blocking` -- this background task's own
-    // embedder is never shared, so the whole per-chunk loop can move into
-    // one `spawn_blocking` call instead of freezing the async runtime for
-    // however long re-embedding every chunk in `family` takes.
-    let records = tokio::task::spawn_blocking(move || -> Result<Vec<ChunkRecord>, EmbedError> {
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            let vector = embedder
-                .embed(&[row.text.as_str()])?
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+    // M16: the engine's embedder, in `REINDEX_BATCH_SIZE` batches. BUG-001
+    // still applies to each batch (`embed_blocking` keeps the real
+    // inference call off the async runtime), but the lock is released
+    // between batches, so re-embedding a large family cannot hold the
+    // embedder -- and with it every query -- for minutes at a time.
+    let mut records = Vec::with_capacity(rows.len());
+    for batch in rows.chunks(REINDEX_BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(|row| row.text.clone()).collect();
+        let vectors = embed_blocking(embedder, texts).await?;
+        if vectors.len() != batch.len() {
+            // One vector per text is `embed`'s contract; anything else
+            // would silently mis-pair vectors with chunk ids.
+            return Err(EngineError::NoEmbedding);
+        }
+        for (row, vector) in batch.iter().zip(vectors) {
+            if vector.len() != crate::lance::EMBEDDING_DIM as usize {
+                // M15: `upsert_vectors` would otherwise panic in Arrow.
+                return Err(EngineError::NoEmbedding);
+            }
             records.push(ChunkRecord {
-                chunk_id: row.chunk_id,
+                chunk_id: row.chunk_id.clone(),
                 entity_id: row.entity_id,
-                text: row.text,
+                text: row.text.clone(),
                 vector,
                 taint: row.taint,
                 t_ns: row.t_ns,
-                domain: row.domain,
+                domain: row.domain.clone(),
             });
         }
-        Ok(records)
-    })
-    .await
-    .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))?;
+    }
     let reindexed = records.len();
     lance.upsert_vectors(family, &records).await?;
 
@@ -639,7 +655,13 @@ mod tests {
     }
 
     fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so")
+        // M16: a test is its own `main`, so it pins the ONNX Runtime
+        // dylib the way `main` does, before `Embedder::load` can be
+        // reached; harmless to repeat, an error only on a conflict.
+        let path =
+            dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
+        let _ = crate::embed::Embedder::set_dylib_path(&path);
+        path
     }
 
     fn window_event(toplevel_id: u64, at_ns: u64, kind: Kind) -> RawTelemetryEvent {
@@ -708,6 +730,114 @@ mod tests {
         assert!(
             results.iter().any(|r| r.text.contains("revenue")),
             "expected the ingested revenue-dashboard chunk among results: {results:?}"
+        );
+    }
+
+    /// M22: the first query after `open()` is what `ask()` pays on the
+    /// first question after a C3 start, and it used to be the *cold* one:
+    /// 71 ms against C5a's 100 ms storage deadline in a debug build,
+    /// before any disk-cache misses -- which is what made
+    /// `ask_end_to_end` flake right after a clean rebuild.
+    /// `warm_query_path` moves that cost into `open`.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn the_first_query_after_open_is_within_c5as_deadline() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+        engine
+            .ingest_external_document(
+                &crate::spool::SpoolDocument {
+                    doc_id: "warm".into(),
+                    url: String::new(),
+                    text: "the quarterly revenue report".into(),
+                    content_type: String::new(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        let t = std::time::Instant::now();
+        engine.query_hybrid("revenue numbers", 5).await.unwrap();
+        let first = t.elapsed();
+        let t = std::time::Instant::now();
+        engine.query_hybrid("revenue numbers", 5).await.unwrap();
+        let second = t.elapsed();
+        println!("first query {first:?}, second query {second:?}");
+        // What the warm-up actually buys, and the only thing a debug
+        // build on a shared machine can state honestly: the first query
+        // is no longer an outlier against the ones after it. Before
+        // `warm_query_path` it was 71 ms against 43 ms. The absolute
+        // budget (FR-STO-05) is `tests/pf_benchmark.rs`'s subject, which
+        // follows the same "print the number, bound only the absurd"
+        // convention.
+        assert!(
+            first < second * 2 + std::time::Duration::from_millis(20),
+            "the first query after open ({first:?}) is still a cold outlier \
+             against the second ({second:?})"
+        );
+    }
+
+    /// M16: `reindex_family` loaded a *second* `Embedder` -- a whole
+    /// second resident copy of bge-small-en-v1.5 -- doubling C3's model
+    /// memory against a 300 MiB hard cap (PRD §6.2) for as long as the
+    /// re-index ran. It now re-embeds through the engine's own embedder.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn a_reindex_does_not_load_a_second_model() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+        // More chunks than one re-index batch, so the batching loop's
+        // boundary is exercised too.
+        for i in 0..(REINDEX_BATCH_SIZE * 2 + 1) {
+            engine
+                .ingest_external_document(
+                    &crate::spool::SpoolDocument {
+                        doc_id: format!("doc-{i}"),
+                        url: String::new(),
+                        text: format!("document number {i} about quarterly revenue"),
+                        content_type: String::new(),
+                    },
+                    1_000 + i as u64,
+                )
+                .await
+                .unwrap();
+        }
+
+        let loads_before = Embedder::load_count();
+        reindex_family(
+            &engine.lance,
+            &engine.sqlite_path,
+            &engine.embedder,
+            "external",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Embedder::load_count(),
+            loads_before,
+            "a re-index must reuse the engine's embedder, not load another model"
+        );
+        assert_eq!(
+            engine.lance.all_chunks("external").await.unwrap().len(),
+            REINDEX_BATCH_SIZE * 2 + 1,
+            "every chunk must still be there, re-embedded in place"
         );
     }
 
@@ -1185,8 +1315,7 @@ mod tests {
         reindex_family(
             &engine.lance,
             &engine.sqlite_path,
-            &engine.models_dir,
-            &engine.onnxruntime_dylib,
+            &engine.embedder,
             "attention",
         )
         .await

@@ -238,6 +238,17 @@ class RingWriter {
 
         std::uint32_t cur = seqlock->load(std::memory_order_relaxed);
         seqlock->store(cur + 1, std::memory_order_release); // odd: writing
+        // M19: the `release` above keeps *earlier* work from moving after
+        // the odd marker, which is not what a seqlock writer needs; it
+        // needs the field stores below to stay *after* it, so a reader
+        // that has already seen an even counter cannot also see a
+        // half-written field. That takes a release fence here. On x86
+        // stores are not reordered with stores, so the old code was
+        // correct there by accident; on a weakly-ordered CPU (ARM, which
+        // Architecture.md §12 lists as a target) it is not. Must match
+        // crates/neuroos-shm/src/ring.rs, since either language may be the
+        // writer for a ring the other reads.
+        std::atomic_thread_fence(std::memory_order_release);
 
         seq_atomic(slot)->store(seq, std::memory_order_relaxed);
         generation_atomic(slot)->store(generation, std::memory_order_relaxed);
@@ -246,6 +257,8 @@ class RingWriter {
         utf8_len_atomic(slot)->store(static_cast<std::uint16_t>(len), std::memory_order_relaxed);
         atomic_copy_to_slot(slot + kSlotPayloadOff, payload, len);
 
+        // The `release` here is the half that works as written: it keeps
+        // the field stores above from moving past the even marker.
         seqlock->store(cur + 2, std::memory_order_release); // even: stable
         view_.write_seq()->store(seq + 1, std::memory_order_release);
         return true;
@@ -302,7 +315,12 @@ class RingReader {
             std::vector<std::uint8_t> payload;
             atomic_copy_from_slot(payload, slot + kSlotPayloadOff, len < max ? len : max);
 
-            std::uint32_t after = seqlock->load(std::memory_order_acquire);
+            // M19: the mirror of the writer's missing fence. `acquire` on
+            // the load below orders *later* reads after it; a seqlock
+            // reader needs the field reads above to stay *before* it, or
+            // the stability check is made against values read after it.
+            std::atomic_thread_fence(std::memory_order_acquire);
+            std::uint32_t after = seqlock->load(std::memory_order_relaxed);
             if (after != before) {
                 continue; // torn read; retry the same seq
             }

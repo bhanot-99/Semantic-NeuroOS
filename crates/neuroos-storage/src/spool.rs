@@ -474,7 +474,13 @@ mod tests {
     }
 
     fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so")
+        // M16: a test is its own `main`, so it pins the ONNX Runtime
+        // dylib the way `main` does, before `Embedder::load` can be
+        // reached; harmless to repeat, an error only on a conflict.
+        let path =
+            dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
+        let _ = crate::embed::Embedder::set_dylib_path(&path);
+        path
     }
 
     /// M14: `ingest_existing` used `?`, so the first unusable file (a
