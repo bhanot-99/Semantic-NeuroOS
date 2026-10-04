@@ -20,6 +20,12 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# M8: keyed fixture anonymisation. All three are on Architecture.md §12's
+# approved crypto list.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+zeroize = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 procfs = { version = "0.17", default-features = false }
 notify = "6"

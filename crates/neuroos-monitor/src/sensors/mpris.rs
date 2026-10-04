@@ -70,8 +70,42 @@ async fn run_once_on(conn: Connection, bus: &EventBus, privacy: &PrivacyState) -
     }
 }
 
+/// M7: what one `NameOwnerChanged` means for the watcher set.
+///
+/// The old code spawned a watcher on *every* MPRIS owner change and relied
+/// on "its first property fetch fails immediately and the task exits" to
+/// clean up. That is not what happens: `receive_properties_changed()`'s
+/// stream does not close when the player goes away, so a watcher for a
+/// dead player blocks on `changes.next()` forever instead of returning.
+/// Worse, a player that was merely *replaced* (a new owner for a name we
+/// already watch) got a second watcher while the first was still live, so
+/// every property change published duplicate telemetry events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerChange {
+    /// A player appeared on a name nothing is watching yet.
+    Start,
+    /// The name lost its owner: abort the watcher we have for it.
+    Stop,
+    /// Not an MPRIS name, or a name already watched by a live task.
+    Ignore,
+}
+
+fn classify_owner_change(name: &str, has_new_owner: bool, already_watching: bool) -> OwnerChange {
+    if !name.starts_with(MPRIS_PREFIX) {
+        return OwnerChange::Ignore;
+    }
+    match (has_new_owner, already_watching) {
+        (false, _) => OwnerChange::Stop,
+        (true, false) => OwnerChange::Start,
+        (true, true) => OwnerChange::Ignore,
+    }
+}
+
 /// Watches every player until the owner-change stream ends (`Ok`) or a
 /// bus call fails (`Err`).
+///
+/// Holds exactly one watcher task per player bus name (M7). Dropping the
+/// `JoinSet` on return aborts every watcher, so a reconnect starts clean.
 async fn watch_bus(
     conn: Connection,
     bus: &EventBus,
@@ -85,35 +119,72 @@ async fn watch_bus(
     // Start watching every player already running.
     let names = dbus.list_names().await.map_err(zbus::Error::from)?;
     let mut tasks = tokio::task::JoinSet::new();
+    let mut watchers: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
     for name in names {
         let name = name.to_string();
         if name.starts_with(MPRIS_PREFIX) {
-            tasks.spawn(watch_player(
-                conn.clone(),
-                name,
-                bus.clone(),
-                privacy.clone(),
-            ));
+            spawn_watcher(&mut tasks, &mut watchers, &conn, name, bus, privacy);
         }
     }
 
     while let Some(signal) = owner_changes.next().await {
+        // Reap watchers that ended by themselves, so neither the `JoinSet`
+        // nor `watchers` grows without bound.
+        reap_finished(&mut tasks, &mut watchers);
+
         let Ok(args) = signal.args() else { continue };
         let name = args.name().to_string();
-        if name.starts_with(MPRIS_PREFIX) {
-            // Either a new player (spawn and watch) or one that just vanished
-            // (spawn anyway; its first property fetch fails immediately and
-            // the task exits — self-cleaning, no separate "is it a removal"
-            // check needed).
-            tasks.spawn(watch_player(
-                conn.clone(),
-                name,
-                bus.clone(),
-                privacy.clone(),
-            ));
+        let has_new_owner = args.new_owner().as_ref().is_some();
+        match classify_owner_change(&name, has_new_owner, watchers.contains_key(&name)) {
+            OwnerChange::Start => {
+                spawn_watcher(&mut tasks, &mut watchers, &conn, name, bus, privacy);
+            }
+            OwnerChange::Stop => {
+                // The player is gone and its property stream will never
+                // close on its own, so the task has to be cancelled.
+                if let Some(handle) = watchers.remove(&name) {
+                    handle.abort();
+                }
+            }
+            OwnerChange::Ignore => {}
         }
     }
     Ok(())
+}
+
+/// Spawns one watcher for `name` and records its abort handle. The task
+/// yields its own bus name so [`reap_finished`] knows which entry to drop.
+fn spawn_watcher(
+    tasks: &mut tokio::task::JoinSet<String>,
+    watchers: &mut HashMap<String, tokio::task::AbortHandle>,
+    conn: &Connection,
+    name: String,
+    bus: &EventBus,
+    privacy: &PrivacyState,
+) {
+    let conn = conn.clone();
+    let bus = bus.clone();
+    let privacy = privacy.clone();
+    let key = name.clone();
+    let handle = tasks.spawn(async move {
+        watch_player(conn, name.clone(), bus, privacy).await;
+        name
+    });
+    watchers.insert(key, handle);
+}
+
+/// Drops the bookkeeping for every watcher that has already returned.
+/// Aborted tasks were removed from `watchers` before the abort, so their
+/// `JoinError` needs no further handling.
+fn reap_finished(
+    tasks: &mut tokio::task::JoinSet<String>,
+    watchers: &mut HashMap<String, tokio::task::AbortHandle>,
+) {
+    while let Some(result) = tasks.try_join_next() {
+        if let Ok(finished) = result {
+            watchers.remove(&finished);
+        }
+    }
 }
 
 /// Watches one player's `PlaybackStatus`/`Metadata`/`Position` until it goes
@@ -204,6 +275,75 @@ mod tests {
 
     fn owned(value: zbus::zvariant::Value<'_>) -> OwnedValue {
         OwnedValue::try_from(value).unwrap()
+    }
+
+    /// M7: before the fix every MPRIS owner change spawned another
+    /// watcher, so a replaced player ran two live watchers publishing
+    /// duplicate events, and a vanished player's watcher was never
+    /// cancelled at all.
+    #[test]
+    fn an_appearing_player_is_watched_once_and_only_once() {
+        let name = "org.mpris.MediaPlayer2.vlc";
+        assert_eq!(
+            classify_owner_change(name, true, false),
+            OwnerChange::Start,
+            "a new player must be watched"
+        );
+        assert_eq!(
+            classify_owner_change(name, true, true),
+            OwnerChange::Ignore,
+            "a name we already watch must not get a second watcher"
+        );
+    }
+
+    #[test]
+    fn a_vanishing_player_stops_its_watcher() {
+        // No new owner = the name was released; the watcher's property
+        // stream will never close by itself, so it must be aborted.
+        assert_eq!(
+            classify_owner_change("org.mpris.MediaPlayer2.vlc", false, true),
+            OwnerChange::Stop
+        );
+        // Stop is still correct when we have no handle: `watchers.remove`
+        // simply finds nothing.
+        assert_eq!(
+            classify_owner_change("org.mpris.MediaPlayer2.vlc", false, false),
+            OwnerChange::Stop
+        );
+    }
+
+    #[test]
+    fn non_mpris_names_are_ignored_entirely() {
+        for (has_owner, watching) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                classify_owner_change("org.freedesktop.Notifications", has_owner, watching),
+                OwnerChange::Ignore
+            );
+        }
+    }
+
+    /// M7: the `JoinSet` was never reaped, so finished tasks accumulated
+    /// for the life of the bus connection.
+    #[tokio::test]
+    async fn finished_watchers_are_reaped_from_both_the_joinset_and_the_map() {
+        let mut tasks: tokio::task::JoinSet<String> = tokio::task::JoinSet::new();
+        let mut watchers: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+
+        for name in ["a", "b"] {
+            let owned = name.to_string();
+            let handle = tasks.spawn(async move { owned });
+            watchers.insert(name.to_string(), handle);
+        }
+        // Let both tasks finish.
+        tokio::task::yield_now().await;
+        while !tasks.is_empty() {
+            reap_finished(&mut tasks, &mut watchers);
+            if !tasks.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(watchers.is_empty(), "{watchers:?} should have been reaped");
+        assert_eq!(tasks.len(), 0);
     }
 
     #[test]
