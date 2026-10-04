@@ -2,7 +2,7 @@
 //! (Architecture.md §6.1) -- preamble first, then deictic snap + evidence
 //! retrieval in parallel, prompt assembly with taint wrapping, a C6
 //! capability check, and finally a real C4 generation.
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use neuroos_taint::TaintFlags;
 
@@ -127,31 +127,26 @@ pub async fn ask(
         },
     )?;
 
+    // M10: the evidence join that used to be measured here moved into
+    // the distillation task, so nothing accumulates into `own_compute`
+    // before prompt assembly any more.
     let mut own_compute = Duration::ZERO;
 
     // FR-KNO-05: fire-and-forget, never on the critical path to the
     // answer below (rules.md AB-11).
-    if !chunks.is_empty() {
-        let t = Instant::now();
-        let raw_evidence_text = chunks
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n---\n");
-        own_compute += t.elapsed();
-
-        // C4 call (`GetInfoRequest.tokenize_text`), excluded from
-        // FR-KNO-09's own-compute budget.
-        if let Ok(raw_tokens) = inference.count_tokens(&raw_evidence_text).await {
-            distill::maybe_spawn_distillation(
-                inference.clone(),
-                distill_cache.clone(),
-                question.to_string(),
-                &chunks,
-                raw_tokens,
-            );
-        }
-    }
+    //
+    // M10: this used to `await inference.count_tokens(..)` right here --
+    // a real C4 round trip on the hot path, in a block whose own comment
+    // says it never blocks the current answer. The token count, the
+    // control-token defusing and the text join all happen inside the
+    // detached task now, so the only cost left here is cloning the chunk
+    // texts.
+    distill::maybe_spawn_distillation(
+        inference.clone(),
+        distill_cache.clone(),
+        question.to_string(),
+        &chunks,
+    );
 
     // KPI-1 diagnosis: with nothing relevant retrieved and no deictic
     // anchor, the small model rambles instead of declining. Decline
