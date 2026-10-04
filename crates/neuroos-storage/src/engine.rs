@@ -142,6 +142,17 @@ impl StorageEngine {
         self.lance
             .insert(chunk.family, std::slice::from_ref(&record))
             .await?;
+        crate::sqlite::insert_chunk_fts(
+            &self.conn,
+            &crate::sqlite::FtsChunk {
+                chunk_id: &record.chunk_id,
+                entity_id: record.entity_id,
+                domain: &record.domain,
+                taint: record.taint,
+                t_ns: record.t_ns,
+                text: &record.text,
+            },
+        )?;
         // FR-STO-11: records which model produced this family's vectors,
         // so a *future* `Embedder::model_id()` change has something to
         // compare against on the next `open()`.
@@ -168,12 +179,21 @@ impl StorageEngine {
         text: &str,
         top_k: usize,
     ) -> Result<Vec<crate::lance::ChunkMatch>, EngineError> {
-        let vector = embed_blocking(&self.embedder, vec![text.to_string()])
+        // bge-*-v1.5's own retrieval instruction for short queries against
+        // passages (BAAI model card); chunks are embedded without it.
+        let query = format!("{BGE_QUERY_INSTRUCTION}{text}");
+        let vector = embed_blocking(&self.embedder, vec![query])
             .await?
             .into_iter()
             .next()
             .unwrap_or_default();
-        Ok(self.lance.query_all_families(&vector, top_k).await?)
+        let dense = self
+            .lance
+            .query_all_families(&vector, top_k * CANDIDATE_OVERFETCH)
+            .await?;
+        let keyword =
+            crate::sqlite::search_chunks_fts(&self.conn, text, top_k * CANDIDATE_OVERFETCH)?;
+        Ok(fuse_rrf(dense, keyword, text, top_k))
     }
 
     /// FR-STO-06: `QueryFocusHistory(t, ±window)` — the deictic-snap query.
@@ -185,6 +205,26 @@ impl StorageEngine {
         Ok(crate::sqlite::query_focus_history(
             &self.conn, t_ns, window_ns,
         )?)
+    }
+
+    /// BUG-007: `QueryActivity`: focused titles by total dwell, and media
+    /// started, within `[since_ns, until_ns]` (0 = unbounded).
+    pub fn query_activity(
+        &self,
+        since_ns: u64,
+        until_ns: u64,
+        limit: usize,
+    ) -> Result<
+        (
+            Vec<crate::sqlite::ActivityRow>,
+            Vec<crate::sqlite::ActivityRow>,
+        ),
+        EngineError,
+    > {
+        Ok((
+            crate::sqlite::activity_windows(&self.conn, since_ns, until_ns, limit)?,
+            crate::sqlite::activity_media(&self.conn, since_ns, until_ns, limit)?,
+        ))
     }
 
     /// FR-KNO-10: entities the Python cold worker builds co-occurrence
@@ -303,8 +343,102 @@ impl StorageEngine {
         self.lance
             .delete_all_families(&format!("entity_id IN ({ids})"))
             .await?;
+        crate::sqlite::delete_chunks_fts(&self.conn, entity_ids)?;
         Ok(())
     }
+}
+
+/// BAAI's query-side instruction for bge-*-v1.5 retrieval.
+const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
+
+/// Candidates pulled from each retriever per requested result: telemetry
+/// repeats the same window title many times, so duplicates are dropped
+/// before fusion and each list still needs enough distinct texts.
+const CANDIDATE_OVERFETCH: usize = 4;
+
+/// Reciprocal-rank-fusion constant (Cormack et al., 2009; k = 60 is the
+/// standard choice and LanceDB's own default).
+const RRF_K: f32 = 60.0;
+
+/// Crude suffix stripping so "tests"/"installed"/"watching" match "test"/
+/// "install"/"watch" inside a chunk; FTS5's own porter stemmer already
+/// handles the BM25 side, this only feeds [`terms_matched`].
+fn stem(term: &str) -> &str {
+    for suffix in ["ing", "ed", "es", "s"] {
+        if let Some(root) = term.strip_suffix(suffix)
+            && root.len() >= 3
+        {
+            return root;
+        }
+    }
+    term
+}
+
+/// How many distinct question terms occur in `text` (BUG-007(b)'s
+/// keyword evidence strength): one shared generic word ("test", "watch")
+/// is weak; two or more ("lush" + "pop") identify the activity.
+fn terms_matched(terms: &[String], text: &str) -> f32 {
+    let lower = text.to_lowercase();
+    terms.iter().filter(|t| lower.contains(stem(t))).count() as f32
+}
+
+/// BUG-007(b): fuses dense (LanceDB) and keyword (FTS5/BM25) results by
+/// reciprocal rank fusion, after dropping repeated texts within each list.
+/// Every keyword hit's `keyword_score` is the number of distinct question
+/// terms it contains; a keyword-only chunk has distance 2.0 (unknown).
+/// Returns at most `top_k`, best first.
+fn fuse_rrf(
+    dense: Vec<crate::lance::ChunkMatch>,
+    keyword: Vec<crate::sqlite::FtsHit>,
+    question: &str,
+    top_k: usize,
+) -> Vec<crate::lance::ChunkMatch> {
+    let terms = crate::sqlite::fts_terms(question);
+    use std::collections::HashMap;
+    let mut fused: Vec<(f32, crate::lance::ChunkMatch)> = Vec::new();
+    let mut by_text: HashMap<String, usize> = HashMap::new();
+    for (rank, m) in dense.into_iter().enumerate() {
+        if by_text.contains_key(&m.text) {
+            continue;
+        }
+        by_text.insert(m.text.clone(), fused.len());
+        fused.push((1.0 / (RRF_K + rank as f32 + 1.0), m));
+    }
+    let mut seen_keyword = std::collections::HashSet::new();
+    let mut keyword_rank = 0usize;
+    for hit in keyword {
+        if !seen_keyword.insert(hit.text.clone()) {
+            continue;
+        }
+        let rrf = 1.0 / (RRF_K + keyword_rank as f32 + 1.0);
+        keyword_rank += 1;
+        let searchable = format!("{} {}", hit.text, crate::sqlite::search_aliases(&hit.text));
+        let score = terms_matched(&terms, &searchable);
+        match by_text.get(&hit.text) {
+            Some(&i) => {
+                fused[i].0 += rrf;
+                fused[i].1.keyword_score = score;
+            }
+            None => {
+                by_text.insert(hit.text.clone(), fused.len());
+                fused.push((
+                    rrf,
+                    crate::lance::ChunkMatch {
+                        chunk_id: hit.chunk_id,
+                        entity_id: hit.entity_id,
+                        text: hit.text,
+                        taint: hit.taint,
+                        t_ns: hit.t_ns,
+                        domain: hit.domain,
+                        distance: 2.0,
+                        keyword_score: score,
+                    },
+                ));
+            }
+        }
+    }
+    fused.sort_by(|a, b| b.0.total_cmp(&a.0));
+    fused.into_iter().take(top_k).map(|(_, m)| m).collect()
 }
 
 /// BUG-001: `Embedder::embed` runs real, synchronous, CPU-bound ONNX
@@ -496,6 +630,51 @@ mod tests {
             results.iter().any(|r| r.text.contains("revenue")),
             "expected the ingested revenue-dashboard chunk among results: {results:?}"
         );
+    }
+
+    fn hit(id: &str, text: &str) -> crate::sqlite::FtsHit {
+        crate::sqlite::FtsHit {
+            chunk_id: id.into(),
+            entity_id: 1,
+            domain: "window_focus".into(),
+            taint: 0,
+            t_ns: 0,
+            text: text.into(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn keyword_score_counts_distinct_question_terms_matched() {
+        let fused = fuse_rrf(
+            Vec::new(),
+            vec![
+                hit("a", "VaughnValle/lush-pop: A clean and green Linux setup"),
+                hit("b", "-c: Test"),
+            ],
+            "Who made the lush-pop repository? python unit tests",
+            5,
+        );
+        let score = |id: &str| {
+            fused
+                .iter()
+                .find(|m| m.chunk_id == id)
+                .unwrap()
+                .keyword_score
+        };
+        assert!((score("a") - 2.0).abs() < f32::EPSILON, "lush + pop");
+        assert!((score("b") - 1.0).abs() < f32::EPSILON, "tests ~ test");
+    }
+
+    #[test]
+    fn fusion_drops_repeated_texts_and_ranks_agreement_first() {
+        let fused = fuse_rrf(
+            Vec::new(),
+            vec![hit("a", "same"), hit("b", "same"), hit("c", "other")],
+            "same other",
+            5,
+        );
+        assert_eq!(fused.len(), 2);
     }
 
     /// Live proof (P4-S09): a real ingested+embedded document is actually

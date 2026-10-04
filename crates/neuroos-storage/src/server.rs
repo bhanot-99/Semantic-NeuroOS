@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
 use neuroos_proto::v1::{
-    ChunkMatch, EdgeRow, EntityRow, Envelope, Error, ErrorCode, FocusHistoryRow, ForgetResponse,
-    ListEdgesResponse, ListEntitiesResponse, PruneEdgesResponse, QueryFocusHistoryResponse,
-    QueryHybridResponse, Taint, UpsertEdgeResponse, envelope, forget_request,
+    ActivityItem, ChunkMatch, EdgeRow, EntityRow, Envelope, Error, ErrorCode, FocusHistoryRow,
+    ForgetResponse, ListEdgesResponse, ListEntitiesResponse, PruneEdgesResponse,
+    QueryActivityResponse, QueryFocusHistoryResponse, QueryHybridResponse, Taint,
+    UpsertEdgeResponse, envelope, forget_request,
 };
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -104,6 +105,25 @@ async fn handle_request(env: Envelope, engine: &Arc<Mutex<StorageEngine>>) -> En
                 Err(e) => internal_error(format!("QueryFocusHistory failed: {e}")),
             }
         }
+        Some(envelope::Body::QueryActivityRequest(req)) => {
+            let engine = engine.lock().await;
+            let item = |r: crate::sqlite::ActivityRow| ActivityItem {
+                app_id: r.app_id,
+                text: r.text,
+                first_ns: r.first_ns,
+                last_ns: r.last_ns,
+                dwell_ms: r.dwell_ms,
+            };
+            match engine.query_activity(req.since_ns, req.until_ns, req.limit.max(1) as usize) {
+                Ok((windows, media)) => {
+                    envelope::Body::QueryActivityResponse(QueryActivityResponse {
+                        windows: windows.into_iter().map(item).collect(),
+                        media: media.into_iter().map(item).collect(),
+                    })
+                }
+                Err(e) => internal_error(format!("QueryActivity failed: {e}")),
+            }
+        }
         Some(envelope::Body::QueryHybridRequest(req)) => {
             let mut engine = engine.lock().await;
             match engine
@@ -121,6 +141,7 @@ async fn handle_request(env: Envelope, engine: &Arc<Mutex<StorageEngine>>) -> En
                             t_ns: m.t_ns,
                             domain: m.domain,
                             distance: m.distance,
+                            keyword_score: m.keyword_score,
                         })
                         .collect(),
                 }),

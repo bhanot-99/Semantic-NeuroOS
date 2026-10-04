@@ -9,8 +9,13 @@ use neuroos_taint::TaintFlags;
 /// Every `.sql` file under `src/migrations/`, embedded at compile time
 /// (`include_str!`, not a runtime file read — this binary must work from
 /// wherever it's installed, not just a checkout).
-const MIGRATIONS: &[(&str, &str)] =
-    &[("0001_initial", include_str!("migrations/0001_initial.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_initial", include_str!("migrations/0001_initial.sql")),
+    (
+        "0002_chunks_fts",
+        include_str!("migrations/0002_chunks_fts.sql"),
+    ),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -82,6 +87,14 @@ pub fn touch_event_counter(
         (domain, key, at_ns as i64, dwell_ms as i64),
     )?;
     Ok(())
+}
+
+pub fn entity_exists(conn: &Connection, domain: &str, label: &str) -> Result<bool, StorageError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE domain = ?1 AND label = ?2)",
+        (domain, label),
+        |r| r.get(0),
+    )?)
 }
 
 /// Inserts a new entity or, if `(domain, label)` already exists, bumps
@@ -408,6 +421,201 @@ fn collect_ids<P: rusqlite::Params>(
     Ok(ids)
 }
 
+/// One row of `chunks_fts` (BUG-007(b)), mirroring a LanceDB chunk.
+pub struct FtsChunk<'a> {
+    pub chunk_id: &'a str,
+    pub entity_id: i64,
+    pub domain: &'a str,
+    pub taint: u32,
+    pub t_ns: u64,
+    pub text: &'a str,
+}
+
+pub fn insert_chunk_fts(conn: &Connection, c: &FtsChunk<'_>) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO chunks_fts (text, aliases, chunk_id, entity_id, domain, taint, t_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            c.text,
+            search_aliases(c.text),
+            c.chunk_id,
+            c.entity_id,
+            c.domain,
+            c.taint,
+            c.t_ns as i64,
+        ),
+    )?;
+    Ok(())
+}
+
+/// Search-only spellings of `text` that tokenization would otherwise lose:
+/// dotted acronyms joined ("J.A.R.V.I.S" -> "JARVIS", since the tokenizer
+/// sees single letters), and "reddit subreddit" for an `r/<name>` mention.
+pub fn search_aliases(text: &str) -> String {
+    let mut out = Vec::new();
+    for word in text.split_whitespace() {
+        let letters: Vec<&str> = word.split('.').filter(|p| !p.is_empty()).collect();
+        if letters.len() >= 3 && letters.iter().all(|p| p.chars().count() == 1) {
+            out.push(letters.concat());
+        }
+        if word.starts_with("r/") && word.len() > 2 {
+            out.push("reddit subreddit".to_string());
+        }
+    }
+    out.join(" ")
+}
+
+/// Removes every keyword row for `entity_ids` (forget/GC, alongside the
+/// matching LanceDB rows).
+pub fn delete_chunks_fts(conn: &Connection, entity_ids: &[i64]) -> Result<(), StorageError> {
+    let mut stmt = conn.prepare("DELETE FROM chunks_fts WHERE entity_id = ?1")?;
+    for id in entity_ids {
+        stmt.execute([id])?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FtsHit {
+    pub chunk_id: String,
+    pub entity_id: i64,
+    pub domain: String,
+    pub taint: u32,
+    pub t_ns: u64,
+    pub text: String,
+    /// `-bm25()`: higher is a stronger keyword match.
+    pub score: f64,
+}
+
+/// Question words, pronouns and auxiliaries: they carry no signal about
+/// *which* activity is meant, and in OR mode they'd match everything.
+const FTS_STOPWORDS: &[&str] = &[
+    "a", "about", "after", "all", "am", "an", "and", "any", "anything", "are", "as", "at", "be",
+    "been", "before", "by", "can", "could", "did", "do", "does", "doing", "during", "for", "from",
+    "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "of",
+    "on", "or", "so", "some", "than", "that", "the", "their", "them", "then", "there", "these",
+    "this", "those", "to", "was", "we", "were", "what", "when", "where", "which", "while", "who",
+    "whom", "why", "will", "with", "would", "you", "your",
+];
+
+/// Keyword terms of a free-text question: lowercased alphanumeric runs,
+/// minus stopwords, each double-quoted so no FTS5 operator in user text
+/// is ever interpreted.
+pub fn fts_terms(question: &str) -> Vec<String> {
+    question
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|t| !t.is_empty() && !FTS_STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// BUG-007(b): BM25 keyword search over chunk text, any-term (OR) match,
+/// best first. Empty when the question has no non-stopword terms.
+pub fn search_chunks_fts(
+    conn: &Connection,
+    question: &str,
+    limit: usize,
+) -> Result<Vec<FtsHit>, StorageError> {
+    let terms = fts_terms(question);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expr = terms
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, entity_id, domain, taint, t_ns, text, -bm25(chunks_fts)
+         FROM chunks_fts WHERE chunks_fts MATCH ?1
+         ORDER BY bm25(chunks_fts) LIMIT ?2",
+    )?;
+    let rows = stmt.query_map((expr, limit as i64), |r| {
+        Ok(FtsHit {
+            chunk_id: r.get(0)?,
+            entity_id: r.get(1)?,
+            domain: r.get(2)?,
+            taint: r.get(3)?,
+            t_ns: r.get::<_, i64>(4)? as u64,
+            text: r.get(5)?,
+            score: r.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// One aggregated activity row (BUG-007's `QueryActivity`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityRow {
+    pub app_id: String,
+    pub text: String,
+    pub first_ns: u64,
+    pub last_ns: u64,
+    pub dwell_ms: u64,
+}
+
+fn upper(until_ns: u64) -> i64 {
+    if until_ns == 0 {
+        i64::MAX
+    } else {
+        until_ns as i64
+    }
+}
+
+/// Focused window titles overlapping `[since_ns, until_ns]`, grouped per
+/// (app, title), most total dwell first.
+pub fn activity_windows(
+    conn: &Connection,
+    since_ns: u64,
+    until_ns: u64,
+    limit: usize,
+) -> Result<Vec<ActivityRow>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT app_id, title, MIN(t_start_ns), MAX(t_end_ns), SUM(dwell_ms)
+         FROM focus_history
+         WHERE t_end_ns >= ?1 AND t_start_ns <= ?2 AND title != ''
+         GROUP BY app_id, title
+         ORDER BY SUM(dwell_ms) DESC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map((since_ns as i64, upper(until_ns), limit as i64), |r| {
+        Ok(ActivityRow {
+            app_id: r.get(0)?,
+            text: r.get(1)?,
+            first_ns: r.get::<_, i64>(2)? as u64,
+            last_ns: r.get::<_, i64>(3)? as u64,
+            dwell_ms: r.get::<_, i64>(4)? as u64,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Media first seen playing in `[since_ns, until_ns]`, oldest first (the
+/// `media_playback` chunks, which name player, title and artist).
+pub fn activity_media(
+    conn: &Connection,
+    since_ns: u64,
+    until_ns: u64,
+    limit: usize,
+) -> Result<Vec<ActivityRow>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT text, t_ns FROM chunks_fts
+         WHERE domain = 'media_playback' AND t_ns >= ?1 AND t_ns <= ?2
+         ORDER BY t_ns LIMIT ?3",
+    )?;
+    let rows = stmt.query_map((since_ns as i64, upper(until_ns), limit as i64), |r| {
+        let t: i64 = r.get(1)?;
+        Ok(ActivityRow {
+            app_id: String::new(),
+            text: r.get(0)?,
+            first_ns: t as u64,
+            last_ns: t as u64,
+            dwell_ms: 0,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
@@ -419,7 +627,7 @@ mod tests {
         let applied: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(applied, 1);
+        assert_eq!(applied, MIGRATIONS.len() as i64);
         // re-running migrate() on the same connection must not error or
         // re-apply (CREATE TABLE would fail the second time if it did).
         migrate(&conn).unwrap();
@@ -923,5 +1131,157 @@ mod tests {
             .query_row("SELECT label FROM entities LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stored_label, payload);
+    }
+
+    fn fts_row(conn: &Connection, id: &str, entity_id: i64, text: &str) {
+        insert_chunk_fts(
+            conn,
+            &FtsChunk {
+                chunk_id: id,
+                entity_id,
+                domain: "window_focus",
+                taint: 0,
+                t_ns: 1,
+                text,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fts_finds_a_rare_name_token_inside_a_title() {
+        let conn = open_in_memory().unwrap();
+        fts_row(
+            &conn,
+            "a",
+            1,
+            "brave-browser: VaughnValle/lush-pop: A clean and green Linux setup",
+        );
+        fts_row(
+            &conn,
+            "b",
+            2,
+            "vlc: High.School.Return.of.a.Gangster.S01E03.720p",
+        );
+        let hits = search_chunks_fts(&conn, "Who made the lush-pop repository?", 5).unwrap();
+        assert_eq!(hits.first().map(|h| h.chunk_id.as_str()), Some("a"));
+        let hits = search_chunks_fts(&conn, "which gangster episodes", 5).unwrap();
+        assert_eq!(hits.first().map(|h| h.chunk_id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn fts_stems_query_words() {
+        let conn = open_in_memory().unwrap();
+        fts_row(&conn, "a", 1, "COSMIC Terminal: sudo apt install lightdm");
+        let hits = search_chunks_fts(&conn, "Did I installed lightdm?", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn fts_ignores_stopwords_and_fts_syntax_in_questions() {
+        let conn = open_in_memory().unwrap();
+        fts_row(&conn, "a", 1, "what did I do");
+        // only stopwords: no keyword search at all
+        assert!(
+            search_chunks_fts(&conn, "What did I do?", 5)
+                .unwrap()
+                .is_empty()
+        );
+        // FTS5 operators/quotes in user text must not error
+        assert!(search_chunks_fts(&conn, "\"NEAR(a b) OR * -x\" AND", 5).is_ok());
+    }
+
+    #[test]
+    fn fts_rows_are_deleted_by_entity() {
+        let conn = open_in_memory().unwrap();
+        fts_row(&conn, "a", 7, "lightdm");
+        fts_row(&conn, "b", 8, "lightdm again");
+        delete_chunks_fts(&conn, &[7]).unwrap();
+        let hits = search_chunks_fts(&conn, "lightdm", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, 8);
+    }
+
+    fn focus(conn: &Connection, app: &str, title: &str, start: u64, end: u64) {
+        insert_focus_history(
+            conn,
+            &FocusHistoryEntry {
+                app_id: app,
+                title,
+                pid: 0,
+                root_pid: 0,
+                t_start_ns: start,
+                t_end_ns: end,
+                dwell_ms: (end - start) / 1_000_000,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn activity_windows_ranks_titles_by_total_dwell_within_range() {
+        const S: u64 = 1_000_000_000;
+        let conn = open_in_memory().unwrap();
+        focus(&conn, "vlc", "Show E01", 0, 600 * S);
+        focus(&conn, "brave", "Docs", 600 * S, 660 * S);
+        focus(&conn, "brave", "Docs", 700 * S, 760 * S);
+        focus(&conn, "term", "late", 5000 * S, 5100 * S);
+        let rows = activity_windows(&conn, 0, 1000 * S, 10).unwrap();
+        let texts: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["Show E01", "Docs"]);
+        assert_eq!(rows[1].dwell_ms, 120_000);
+        assert_eq!(rows[1].first_ns, 600 * S);
+        // until_ns = 0 is unbounded
+        assert_eq!(activity_windows(&conn, 0, 0, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn activity_media_lists_media_chunks_oldest_first() {
+        let conn = open_in_memory().unwrap();
+        for (id, t) in [("b", 20u64), ("a", 10)] {
+            insert_chunk_fts(
+                &conn,
+                &FtsChunk {
+                    chunk_id: id,
+                    entity_id: 1,
+                    domain: "media_playback",
+                    taint: 0,
+                    t_ns: t,
+                    text: &format!("vlc played \"{id}\""),
+                },
+            )
+            .unwrap();
+        }
+        fts_row(&conn, "w", 2, "not media");
+        let rows = activity_media(&conn, 0, 0, 10).unwrap();
+        let texts: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["vlc played \"a\"", "vlc played \"b\""]);
+    }
+
+    #[test]
+    fn aliases_join_dotted_acronyms_and_name_subreddits() {
+        assert_eq!(
+            search_aliases("J.A.R.V.I.S Animated Theme : r/omarchy - Brave"),
+            "JARVIS reddit subreddit"
+        );
+        assert_eq!(search_aliases("High.School.Return.of.a.Gangster"), "");
+        let conn = open_in_memory().unwrap();
+        fts_row(
+            &conn,
+            "a",
+            1,
+            "J.A.R.V.I.S Animated Theme : r/omarchy - Brave",
+        );
+        let hits = search_chunks_fts(
+            &conn,
+            "What Reddit post about a Jarvis theme did I open?",
+            5,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].text,
+            "J.A.R.V.I.S Animated Theme : r/omarchy - Brave"
+        );
     }
 }

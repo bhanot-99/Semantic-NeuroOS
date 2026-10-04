@@ -49,6 +49,11 @@ message ChunkMatch {
   uint64 t_ns = 5;
   string domain = 6;
   float distance = 7;
+  // BUG-007(b): how many distinct (non-stopword) question terms this chunk
+  // contains, set for chunks C3's FTS keyword index returned; 0 when the
+  // chunk came from vector search alone. Keyword-only hits carry
+  // distance = 2 (cosine-distance maximum, i.e. unknown).
+  float keyword_score = 8;
 }
 
 message QueryHybridResponse {
@@ -129,4 +134,32 @@ message PruneEdgesRequest {
 
 message PruneEdgesResponse {
   uint64 pruned = 1;
+}
+
+// BUG-007: structured activity for broad and temporal questions ("what did
+// I do most", "the last episode", "before X"), which vector/keyword chunk
+// retrieval can't answer (TimelineQA, Tan et al. 2023: aggregation needs
+// a small, structured evidence set). Time bounds are inclusive UTC ns;
+// until_ns = 0 means no upper bound.
+message QueryActivityRequest {
+  uint64 since_ns = 1;
+  uint64 until_ns = 2;
+  uint32 limit = 3;
+}
+
+message ActivityItem {
+  string app_id = 1;
+  // window title, or a media chunk's text ("vlc played ...")
+  string text = 2;
+  uint64 first_ns = 3;
+  uint64 last_ns = 4;
+  // total focused time; 0 for media
+  uint64 dwell_ms = 5;
+}
+
+message QueryActivityResponse {
+  // focused window titles, most total dwell first
+  repeated ActivityItem windows = 1;
+  // media started in range, oldest first
+  repeated ActivityItem media = 2;
 }

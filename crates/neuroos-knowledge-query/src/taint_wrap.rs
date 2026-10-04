@@ -52,6 +52,7 @@ mod tests {
             t_ns: 0,
             domain: "d".into(),
             distance: 0.0,
+            keyword_score: 0.0,
         }
     }
 

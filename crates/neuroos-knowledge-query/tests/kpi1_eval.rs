@@ -115,16 +115,64 @@ fn spawn_real_inference() -> Option<InferenceProcess> {
     Some(InferenceProcess { child, tmp })
 }
 
-/// Reads the machine-local scripted questions (see the file header).
-fn scripted_questions() -> Vec<String> {
-    let path = raw_dump_dir().join("questions.txt");
+/// One scripted question plus its optional first-pass grading key.
+struct Scripted {
+    question: String,
+    /// `None`: ungraded. `Some(empty)`: a negative control, expect a
+    /// decline. Otherwise: correct if the text contains any alternative
+    /// (case-insensitive).
+    expect: Option<Vec<String>>,
+    /// Retrieval-only key (`## evidence:`), for questions whose answer
+    /// ("yes") never appears in the evidence itself.
+    evidence: Option<Vec<String>>,
+}
+
+fn alternatives(s: &str) -> Vec<String> {
+    s.split('|').map(|a| a.trim().to_lowercase()).collect()
+}
+
+/// Reads the machine-local scripted questions (see the file header). Each
+/// line is `question [## expect: alt1 | alt2]`, or `... ## expect: DECLINE`.
+fn scripted_questions() -> Vec<Scripted> {
+    // NEUROOS_KPI1_QUESTIONS: an alternate question file (e.g. a held-out
+    // set never used while tuning retrieval/prompting).
+    let path = std::env::var_os("NEUROOS_KPI1_QUESTIONS")
+        .map_or_else(|| raw_dump_dir().join("questions.txt"), PathBuf::from);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_owned)
+        .map(|l| {
+            let (l, evidence) = match l.split_once("## evidence:") {
+                Some((rest, ev)) => (rest, Some(alternatives(ev))),
+                None => (l, None),
+            };
+            let (question, expect) = match l.split_once("## expect:") {
+                Some((q, e)) if e.trim() == "DECLINE" => (q, Some(Vec::new())),
+                Some((q, e)) => (q, Some(alternatives(e))),
+                None => (l, None),
+            };
+            Scripted {
+                question: question.trim().to_owned(),
+                expect,
+                evidence,
+            }
+        })
         .collect()
+}
+
+/// First-pass auto-grade only; KPI-1 itself is human-graded.
+fn auto_grade(expect: &Option<Vec<String>>, text: &str) -> Option<bool> {
+    let lower = text.to_lowercase();
+    let declined = lower.contains("i don't know") || lower.contains("i do not know");
+    expect.as_ref().map(|alts| {
+        if alts.is_empty() {
+            declined
+        } else {
+            !declined && alts.iter().any(|a| lower.contains(a.as_str()))
+        }
+    })
 }
 
 /// Live proof (P5's own KPI-1 harness), needs the real BitNet model, built
@@ -143,16 +191,28 @@ async fn kpi1_scripted_questions_over_real_recorded_telemetry() {
         );
         return;
     }
-    if !dump_dir.join("questions.txt").exists() {
+    if std::env::var_os("NEUROOS_KPI1_QUESTIONS").is_none()
+        && !dump_dir.join("questions.txt").exists()
+    {
         eprintln!("skipping: {}/questions.txt not found", dump_dir.display());
         return;
     }
-    let Some(inference_proc) = spawn_real_inference() else {
-        return;
+    // NEUROOS_KPI1_RETRIEVAL_ONLY=1: skip C4 and grade whether the
+    // retrieved evidence contains the expected answer (seconds, not minutes).
+    let retrieval_only = std::env::var_os("NEUROOS_KPI1_RETRIEVAL_ONLY").is_some();
+    let inference_proc = if retrieval_only {
+        None
+    } else {
+        let Some(p) = spawn_real_inference() else {
+            return;
+        };
+        Some(p)
     };
-    let inference_sock = inference_proc.tmp.path().join("run/neuroos/inference.sock");
+    let inference_sock = inference_proc.as_ref().map_or_else(PathBuf::new, |p| {
+        p.tmp.path().join("run/neuroos/inference.sock")
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !inference_sock.exists() {
+    while inference_proc.is_some() && !inference_sock.exists() {
         if std::time::Instant::now() > deadline {
             panic!("inference.sock never appeared");
         }
@@ -190,6 +250,34 @@ async fn kpi1_scripted_questions_over_real_recorded_telemetry() {
         dumps.len()
     );
 
+    // Retrieval-only diagnostic: is each expected answer stored at all?
+    // (A question whose answer never reached C3 bounds what retrieval can
+    // achieve; e.g. windows too brief to pass the ingest promotion gate.)
+    if std::env::var_os("NEUROOS_KPI1_RETRIEVAL_ONLY").is_some() {
+        for item in scripted_questions() {
+            let Some(alts) = item.evidence.as_ref().or(item.expect.as_ref()) else {
+                continue;
+            };
+            if alts.is_empty() || alts.iter().any(|a| a == "yes") {
+                continue;
+            }
+            let mut stored = false;
+            for alt in alts {
+                let hits = engine.query_hybrid(alt, 50).await.unwrap_or_default();
+                if hits
+                    .iter()
+                    .any(|h| h.text.to_lowercase().contains(alt.as_str()))
+                {
+                    stored = true;
+                    break;
+                }
+            }
+            if !stored {
+                eprintln!("UNREACHABLE (answer not in store): {}", item.question);
+            }
+        }
+    }
+
     let storage_sock_dir = tempfile::tempdir().unwrap();
     let storage_sock = storage_sock_dir.path().join("storage.sock");
     let voice_sock_dir = tempfile::tempdir().unwrap();
@@ -203,7 +291,7 @@ async fn kpi1_scripted_questions_over_real_recorded_telemetry() {
 
     let questions = scripted_questions();
     assert!(
-        questions.len() >= 50,
+        questions.len() >= 50 || std::env::var_os("NEUROOS_KPI1_QUESTIONS").is_some(),
         "KPI-1 needs >=50 scripted questions, have {}",
         questions.len()
     );
@@ -225,30 +313,67 @@ async fn kpi1_scripted_questions_over_real_recorded_telemetry() {
             transcript.push_str(&format!("Ingested {total_events} real events from {} raw dumps.\n\n", dumps.len()));
             transcript.push_str("Not committed to the repo -- may quote real personal browsing history.\n\n---\n\n");
 
-            for (i, question) in questions.iter().enumerate() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let result = orchestrate::ask(
-                    &voice,
-                    &storage,
-                    &inference,
-                    &kernel,
-                    &distill_cache,
-                    question,
-                    0,
-                )
-                .await;
-                let (answer, degraded) = match result {
-                    Ok(r) => (r.answer, r.degraded),
-                    Err(e) => (format!("[error: {e}]"), true),
+            let (mut graded, mut correct) = (0u32, 0u32);
+            for (i, item) in questions.iter().enumerate() {
+                let question = &item.question;
+                let (answer, degraded) = if retrieval_only {
+                    match neuroos_knowledge_query::evidence::retrieve(&storage, question).await {
+                        Ok(ev) if ev.is_empty() => ("I don't know. [no evidence]".to_owned(), false),
+                        Ok(ev) => (
+                            ev.iter()
+                                .map(|c| format!("[d={:.3} k={:.1}] {}", c.distance, c.keyword_score, c.text))
+                                .collect::<Vec<_>>()
+                                .join(" || "),
+                            false,
+                        ),
+                        Err(e) => (format!("[error: {e}]"), true),
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let result = orchestrate::ask(
+                        &voice,
+                        &storage,
+                        &inference,
+                        &kernel,
+                        &distill_cache,
+                        question,
+                        0,
+                    )
+                    .await;
+                    match result {
+                        Ok(r) => (r.answer, r.degraded),
+                        Err(e) => (format!("[error: {e}]"), true),
+                    }
                 };
-                eprintln!("[{}/{}] Q: {question}\nA: {answer}\n", i + 1, questions.len());
+                let key = if retrieval_only && item.evidence.is_some() {
+                    &item.evidence
+                } else {
+                    &item.expect
+                };
+                let grade = auto_grade(key, &answer);
+                if let Some(ok) = grade {
+                    graded += 1;
+                    correct += u32::from(ok);
+                }
+                let mark = match grade {
+                    Some(true) => "PASS",
+                    Some(false) => "FAIL",
+                    None => "----",
+                };
+                eprintln!("[{}/{}] {mark} Q: {question}\nA: {answer}\n", i + 1, questions.len());
                 transcript.push_str(&format!(
-                    "## {}. {question}\n\n**Answer{}:** {answer}\n\n",
+                    "## {}. {question}\n\n**Answer{}:** {answer}\n\n*Auto-grade (first pass): {mark}*\n\n",
                     i + 1,
                     if degraded { " (degraded)" } else { "" },
                     answer = answer
                 ));
             }
+            let summary = format!(
+                "AUTO-GRADE{}: {correct}/{graded} first-pass correct",
+                if retrieval_only { " (retrieval only)" } else { "" }
+            );
+            eprintln!("\n{summary}");
+            transcript.push_str(&format!("---\n\n{summary}\n"));
 
             std::fs::write(transcript_path(), &transcript).unwrap();
             eprintln!("\nTranscript written to {}", transcript_path().display());

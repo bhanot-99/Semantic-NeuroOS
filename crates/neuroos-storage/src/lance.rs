@@ -30,6 +30,13 @@ const HNSW_PROMOTION_P99_THRESHOLD: Duration = Duration::from_millis(5);
 /// p99 estimate to mean anything.
 const MIN_SAMPLES_BEFORE_PROMOTION_CHECK: u64 = 20;
 
+/// BUG-007(c): a family is compacted in the background after this many
+/// `insert` calls. Telemetry ingest adds one row (one fragment) per call;
+/// at a measured ~6,100 events/3 h, waiting for the 6-hourly backup left
+/// thousands of fragments and 140-250 ms flat scans. Compacting every 256
+/// inserts keeps queries at ~20-40 ms for ~0.3 s of off-path work.
+const COMPACT_EVERY_INSERTS: u64 = 256;
+
 /// See `neuroos_health::histogram::lock`'s doc comment: recovers rather
 /// than panics on a poisoned mutex (rules.md §5).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -79,6 +86,8 @@ pub struct ChunkMatch {
     pub t_ns: u64,
     pub domain: String,
     pub distance: f32,
+    /// See `ChunkMatch.keyword_score` in storage.proto; 0 for vector hits.
+    pub keyword_score: f32,
 }
 
 fn schema() -> Arc<Schema> {
@@ -166,6 +175,7 @@ fn decode_batch(batch: &RecordBatch, has_distance: bool) -> Result<Vec<ChunkMatc
             t_ns: t_ns.value(i),
             domain: domain.value(i).to_string(),
             distance: distance.map(|d| d.value(i)).unwrap_or(0.0),
+            keyword_score: 0.0,
         })
         .collect())
 }
@@ -200,6 +210,11 @@ pub struct LanceStore {
     /// `tokio::spawn`ed task that actually builds the index, without
     /// needing `self: Arc<Self>` on every `LanceStore` method.
     promoted: Arc<Mutex<HashSet<String>>>,
+    /// BUG-007(c): `insert` calls per family since its last compaction.
+    inserts_since_compact: Mutex<HashMap<String, u64>>,
+    /// Families with a background compaction in flight, so a burst of
+    /// inserts doesn't stack up concurrent compactions of the same table.
+    compacting: Arc<Mutex<HashSet<String>>>,
 }
 
 impl LanceStore {
@@ -220,6 +235,8 @@ impl LanceStore {
             tables,
             query_latencies: Mutex::new(HashMap::new()),
             promoted: Arc::new(Mutex::new(HashSet::new())),
+            inserts_since_compact: Mutex::new(HashMap::new()),
+            compacting: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -265,7 +282,41 @@ impl LanceStore {
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema()),
         );
         table.add(reader).execute().await?;
+        self.maybe_spawn_compaction(family, table);
         Ok(())
+    }
+
+    /// BUG-007(c): every `COMPACT_EVERY_INSERTS` inserts, merges `family`'s
+    /// small fragments in a detached task, off both the ingest and query
+    /// paths (same reasoning as BUG-003's HNSW promotion). A failure (e.g.
+    /// a commit conflict with a concurrent write) just leaves the counter
+    /// reset; the next threshold crossing tries again.
+    fn maybe_spawn_compaction(&self, family: &str, table: &Table) {
+        {
+            let mut counts = lock(&self.inserts_since_compact);
+            let count = counts.entry(family.to_string()).or_insert(0);
+            *count += 1;
+            if *count < COMPACT_EVERY_INSERTS || !lock(&self.compacting).insert(family.to_string())
+            {
+                return;
+            }
+            *count = 0;
+        }
+        let family = family.to_string();
+        let table = table.clone();
+        let compacting = Arc::clone(&self.compacting);
+        tokio::spawn(async move {
+            let result = table
+                .optimize(OptimizeAction::Compact {
+                    options: CompactionOptions::default(),
+                    remap_options: None,
+                })
+                .await;
+            if let Err(err) = result {
+                tracing::warn!(family, error = %err, "BUG-007: background compaction failed, will retry");
+            }
+            lock(&compacting).remove(&family);
+        });
     }
 
     /// FR-STO-05: exact (flat) nearest-neighbor search within one family,
@@ -363,6 +414,16 @@ impl LanceStore {
                 );
             }
         });
+    }
+
+    /// Test/introspection hook: number of data fragments in `family`'s table.
+    pub async fn fragment_count(&self, family: &str) -> Result<usize, LanceError> {
+        Ok(self
+            .table(family)?
+            .stats()
+            .await?
+            .fragment_stats
+            .num_fragments)
     }
 
     /// Test/introspection hook: whether `family` has been promoted to HNSW
@@ -758,5 +819,34 @@ mod tests {
         }
         assert!(store.is_promoted("attention"));
         assert!(!store.is_promoted("work"));
+    }
+
+    /// BUG-007(c): telemetry ingest inserts one row per call, so without
+    /// compaction between 6-hourly backups a family accumulates one
+    /// fragment per event and flat-scan queries blow C5's 100 ms deadline.
+    #[tokio::test]
+    async fn single_row_inserts_trigger_background_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        for i in 0..COMPACT_EVERY_INSERTS {
+            let mut v = vec![0.0; EMBEDDING_DIM as usize];
+            v[i as usize % EMBEDDING_DIM as usize] = 1.0;
+            store
+                .insert("attention", &[chunk(&format!("c{i}"), v)])
+                .await
+                .unwrap();
+        }
+        let mut fragments = store.fragment_count("attention").await.unwrap();
+        for _ in 0..100 {
+            if fragments < COMPACT_EVERY_INSERTS as usize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fragments = store.fragment_count("attention").await.unwrap();
+        }
+        assert!(
+            fragments < COMPACT_EVERY_INSERTS as usize,
+            "expected background compaction, still {fragments} fragments"
+        );
     }
 }
