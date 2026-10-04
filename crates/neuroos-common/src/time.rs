@@ -19,6 +19,13 @@ pub fn hhmm_in(ns: u64, tz: &jiff::tz::TimeZone) -> String {
     ts.to_zoned(tz.clone()).strftime("%H:%M").to_string()
 }
 
+/// `ns` as a sortable UTC label, `YYYYMMDDTHHMMSSZ` (backup directory
+/// names, Architecture.md §7.1's `backups/<UTC timestamp>/`).
+pub fn utc_label(ns: u64) -> String {
+    let ts = Timestamp::from_nanosecond(ns as i128).unwrap_or(Timestamp::UNIX_EPOCH);
+    ts.strftime("%Y%m%dT%H%M%SZ").to_string()
+}
+
 /// [`hhmm_in`] the system's local time zone (UTC if it can't be found).
 pub fn local_hhmm(ns: u64) -> String {
     hhmm_in(ns, &jiff::tz::TimeZone::system())
@@ -45,6 +52,15 @@ mod tests {
         let a = now_ns();
         let b = now_ns();
         assert!(b >= a);
+    }
+
+    #[test]
+    fn utc_label_is_sortable_utc() {
+        // 2026-09-29T16:48:08Z
+        assert_eq!(
+            utc_label(1_790_700_488u64 * 1_000_000_000),
+            "20260929T164808Z"
+        );
     }
 
     #[test]

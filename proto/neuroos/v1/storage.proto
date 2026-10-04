@@ -163,3 +163,25 @@ message QueryActivityResponse {
   // media started in range, oldest first
   repeated ActivityItem media = 2;
 }
+
+// ADR-0011 / Architecture.md §7.5: the systemd timers' RPCs into C3's
+// lifecycle jobs (`neuroosctl storage gc|backup`). Run inside C3, the only
+// writer of user data (AB-2).
+message MaintenanceRequest {
+  oneof job {
+    GcJob gc = 1;
+    BackupJob backup = 2;
+  }
+}
+
+message GcJob {}
+
+message BackupJob {
+  uint32 keep = 1; // backups to keep; 0 = Architecture.md §7.5's default (8)
+}
+
+message MaintenanceResponse {
+  uint64 entities_deleted = 1;      // gc
+  uint64 focus_history_deleted = 2; // gc
+  string backup_path = 3;           // backup
+}

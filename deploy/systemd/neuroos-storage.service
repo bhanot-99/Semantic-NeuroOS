@@ -1,0 +1,50 @@
+# systemd user unit (ADR-0002) for neuroos-storage [C3]
+[Unit]
+Description=NeuroOS neuroos-storage [C3]
+PartOf=neuroos.target
+
+[Service]
+Type=simple
+# '+': runs outside the sandbox, to create the bind-mount sources.
+ExecStartPre=+/usr/bin/mkdir -p -m 0700 %h/.local/share/neuroos/storage %h/.local/share/neuroos/backups
+ExecStart=/opt/neuroos/bin/neuroos-storage
+
+# --- hardening baseline (Architecture.md §8.1); user unit, per ADR-0002
+# (spike S-01, P0-S06) ---
+PrivateNetwork=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+InaccessiblePaths=-/run/systemd/resolve
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+MemoryMax=300M
+Restart=on-failure
+RestartSec=2s
+
+# %t/neuroos holds every socket; ProtectSystem=strict would make it read-only.
+RuntimeDirectory=neuroos
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+BindReadOnlyPaths=/opt/neuroos/models/bge-small-en-v1.5 /opt/neuroos/models/onnxruntime -%h/.config/neuroos/config.toml
+BindPaths=%h/.local/share/neuroos/storage %h/.local/share/neuroos/backups
+# C7's spool (Architecture.md §6.3): read + remove; the user is in the `neuroos`
+# group (deploy/sysusers.d). Optional until C7 (Phase 8) is installed.
+ReadWritePaths=-/var/spool/neuroos-fetcher
+
+[Install]
+WantedBy=neuroos.target

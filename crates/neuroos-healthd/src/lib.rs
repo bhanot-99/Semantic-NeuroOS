@@ -95,10 +95,47 @@ pub async fn run_forever(
     }
 }
 
+/// H15 / Architecture.md §8.2's healthd row: cgroup files (read), its own
+/// sockets in the runtime dir, and the soak CSV. Health targets' sockets
+/// are only connected to, which Landlock does not restrict.
+pub fn sandbox_policy(targets: &[targets::Target]) -> neuroos_sandbox::Policy {
+    let mut policy = neuroos_sandbox::Policy::baseline()
+        .read_write(neuroos_common::paths::runtime_dir())
+        .read_write(neuroos_common::paths::soak_dir());
+    for cgroup in targets.iter().filter_map(|t| t.cgroup_path.as_ref()) {
+        policy = policy.read_only(cgroup.clone());
+    }
+    policy
+}
+
 pub fn current_uid() -> u32 {
     // SAFETY: getuid() takes no arguments and cannot fail.
     unsafe extern "C" {
         fn getuid() -> u32;
     }
     unsafe { getuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use super::*;
+
+    #[test]
+    fn sandbox_policy_writes_only_the_runtime_and_soak_dirs() {
+        let mut t = targets::default_targets();
+        t[0].cgroup_path = Some("/sys/fs/cgroup/user.slice/x".into());
+        let policy = sandbox_policy(&t);
+        let paths = neuroos_common::paths::data_dir();
+        assert!(
+            policy.allows_write_to(&neuroos_common::paths::soak_dir().join("healthd-soak.csv"))
+        );
+        assert!(policy.allows_write_to(&neuroos_common::paths::healthd_sock()));
+        assert!(!policy.allows_write_to(&paths.join("storage/meta.sqlite3")));
+        assert!(
+            policy
+                .read_only_paths()
+                .contains(&"/sys/fs/cgroup/user.slice/x".into())
+        );
+    }
 }

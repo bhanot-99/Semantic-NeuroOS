@@ -21,6 +21,10 @@ const PLAYER_PATH: &str = "/org/mpris/MediaPlayer2";
 pub enum MprisSensorError {
     #[error("D-Bus session bus connection failed: {0}")]
     Zbus(#[from] zbus::Error),
+    /// H10: the bus connection went away (session bus restarted or
+    /// crashed), which ends the `NameOwnerChanged` stream.
+    #[error("D-Bus session bus connection closed")]
+    Disconnected,
 }
 
 #[proxy(
@@ -42,17 +46,37 @@ trait MprisPlayer {
 pub async fn run_forever(bus: EventBus, privacy: PrivacyState) {
     let mut backoff_ms = 100u64;
     loop {
-        match run_once(&bus, &privacy).await {
-            Ok(()) => unreachable!("run_once only returns on error"),
-            Err(e) => tracing::warn!(error = %e, "MPRIS sensor stopped; reconnecting"),
-        }
+        let e = run_once(&bus, &privacy).await;
+        tracing::warn!(error = %e, "MPRIS sensor stopped; reconnecting");
         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(10_000);
     }
 }
 
-async fn run_once(bus: &EventBus, privacy: &PrivacyState) -> Result<(), MprisSensorError> {
-    let conn = Connection::session().await?;
+/// Only ever returns once the sensor has stopped, so the return value is
+/// always the reason why (H10: there is no success case to mistake for
+/// "unreachable").
+async fn run_once(bus: &EventBus, privacy: &PrivacyState) -> MprisSensorError {
+    match Connection::session().await {
+        Ok(conn) => run_once_on(conn, bus, privacy).await,
+        Err(e) => e.into(),
+    }
+}
+
+async fn run_once_on(conn: Connection, bus: &EventBus, privacy: &PrivacyState) -> MprisSensorError {
+    match watch_bus(conn, bus, privacy).await {
+        Ok(()) => MprisSensorError::Disconnected,
+        Err(e) => e,
+    }
+}
+
+/// Watches every player until the owner-change stream ends (`Ok`) or a
+/// bus call fails (`Err`).
+async fn watch_bus(
+    conn: Connection,
+    bus: &EventBus,
+    privacy: &PrivacyState,
+) -> Result<(), MprisSensorError> {
     let dbus = DBusProxy::new(&conn).await?;
 
     // Watch for players appearing/disappearing.
@@ -206,6 +230,46 @@ mod tests {
         assert_eq!(metadata_array_str(&m, "xesam:artist"), "A, B");
     }
 
+    /// H10: when the bus connection drops, the owner-change stream ends.
+    /// That must surface as an error (so `run_forever` reconnects), never
+    /// as `Ok(())` -- which `run_forever` used to treat as unreachable and
+    /// panic on, killing the sensor for good. Uses a private, throwaway
+    /// `dbus-daemon` so the test can kill the bus deterministically.
+    #[tokio::test]
+    async fn a_dropped_bus_connection_is_an_error_not_a_panic() {
+        use std::io::BufRead;
+        let mut daemon = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("dbus-daemon must be installed for this test");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let conn = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let bus = EventBus::new(4);
+        let privacy = PrivacyState::new(Vec::new());
+        let sensor = tokio::spawn(async move { run_once_on(conn, &bus, &privacy).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), sensor)
+            .await
+            .expect("the sensor must notice the bus going away")
+            .expect("the sensor task must not panic");
+        assert!(
+            matches!(result, MprisSensorError::Disconnected),
+            "a dropped bus must be reported as a disconnect, got {result}"
+        );
+    }
+
     /// Live proof (P3-S03): connects to the real session bus, lists names
     /// and watches for owner changes, without erroring — needs a real
     /// D-Bus session, so `#[ignore]`d like the Wayland sensors' own live
@@ -220,15 +284,13 @@ mod tests {
         // Timing out (dropping the future) means connect + list_names +
         // subscribe all succeeded and it's parked waiting for the next
         // owner-change signal; an early Err would mean a real failure.
-        match tokio::time::timeout(
+        if let Ok(e) = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             run_once(&bus, &privacy),
         )
         .await
         {
-            Err(_) => {}
-            Ok(Err(e)) => panic!("run_once errored: {e}"),
-            Ok(Ok(())) => panic!("run_once returned Ok(()) unexpectedly"),
+            panic!("run_once stopped early: {e}");
         }
     }
 }

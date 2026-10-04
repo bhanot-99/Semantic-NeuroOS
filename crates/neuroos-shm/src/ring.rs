@@ -151,6 +151,19 @@ impl Ring {
         RingReader {
             ring: self,
             next_seq: 0,
+            only_generation: None,
+        }
+    }
+
+    /// H7: a reader that returns only `generation`'s slots -- a client
+    /// reading its own job's tokens by the `generation_id` its
+    /// `GenerateResponse` carried, regardless of which job the ring's
+    /// header has moved on to since.
+    pub fn reader_for_generation(&self, generation: u64) -> RingReader<'_> {
+        RingReader {
+            ring: self,
+            next_seq: 0,
+            only_generation: Some(generation),
         }
     }
 }
@@ -260,13 +273,27 @@ impl RingWriter<'_> {
             + 1
     }
 
+    /// Writes one slot stamped with the header's current generation.
     pub fn write(&self, token_id: u32, flags: u16, payload: &[u8]) -> Result<(), RingError> {
+        let generation = self.ring.header().generation_id.load(Ordering::Acquire);
+        self.write_as(generation, token_id, flags, payload)
+    }
+
+    /// H7: writes one slot stamped with `generation` -- the job's own id,
+    /// fixed at submit time -- not the header's current one, which moves on
+    /// as soon as the next job on this (shared) ring is submitted.
+    pub fn write_as(
+        &self,
+        generation: u64,
+        token_id: u32,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<(), RingError> {
         let max = self.ring.max_payload();
         if payload.len() > max {
             return Err(RingError::PayloadTooLarge(payload.len(), max));
         }
         let header = self.ring.header();
-        let generation = header.generation_id.load(Ordering::Acquire);
         let seq = header.write_seq.load(Ordering::Relaxed);
         let idx = (seq % self.ring.capacity_slots as u64) as u32;
         let slot = self.ring.slot_ptr(idx);
@@ -298,6 +325,7 @@ impl RingWriter<'_> {
 pub struct RingReader<'a> {
     ring: &'a Ring,
     next_seq: u64,
+    only_generation: Option<u64>,
 }
 
 impl RingReader<'_> {
@@ -365,9 +393,12 @@ impl RingReader<'_> {
             }
 
             self.next_seq = seq + 1;
-            let cur_gen = header.generation_id.load(Ordering::Acquire);
-            if generation != cur_gen {
-                continue; // stale generation (a cancel happened); skip it
+            let wanted = match self.only_generation {
+                Some(only) => only,
+                None => header.generation_id.load(Ordering::Acquire),
+            };
+            if generation != wanted {
+                continue; // another job's slot, or a stale (cancelled) one; skip it
             }
             return Some(TokenPiece {
                 token_id,
@@ -375,5 +406,39 @@ impl RingReader<'_> {
                 payload,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use super::*;
+
+    fn payloads(mut reader: RingReader<'_>) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| reader.try_read().map(|p| p.payload)).collect()
+    }
+
+    /// H7: job A is still decoding when job B is submitted on the same
+    /// ring (bumping the header). A's remaining slots must still reach
+    /// only A's reader, and B's only B's.
+    #[test]
+    fn a_reader_for_one_generation_never_sees_another_jobs_slots() {
+        let ring = Ring::create("generation-test", 16, 64).unwrap();
+        let writer = ring.writer();
+        let job_a = writer.cancel();
+        writer.write_as(job_a, 0, 0, b"a1").unwrap();
+        let job_b = writer.cancel(); // B submitted while A is running
+        writer.write_as(job_a, 1, 0, b"a2").unwrap();
+        writer.write_as(job_b, 2, 0, b"b1").unwrap();
+        writer.write_as(job_a, 3, FLAG_EOS, b"").unwrap();
+
+        assert_eq!(
+            payloads(ring.reader_for_generation(job_a)),
+            vec![b"a1".to_vec(), b"a2".to_vec(), Vec::new()]
+        );
+        assert_eq!(
+            payloads(ring.reader_for_generation(job_b)),
+            vec![b"b1".to_vec()]
+        );
     }
 }

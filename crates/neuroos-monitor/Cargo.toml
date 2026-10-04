@@ -13,6 +13,7 @@ neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
 neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
 neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
+neuroos-sandbox = { path = "../neuroos-sandbox", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "sync"] }
 cosmic-protocols = { version = "0.2", features = ["client", "wayland-client"] }
 wayland-client = "0.31"

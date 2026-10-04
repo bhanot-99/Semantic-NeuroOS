@@ -28,9 +28,13 @@ pub enum StorageError {
 /// `schema_migrations`.
 pub fn open(path: &Path) -> Result<Connection, StorageError> {
     let conn = Connection::open(path)?;
+    enable_incremental_auto_vacuum(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // H15: temp tables/indices (and VACUUM's scratch space) in memory, not
+    // in /tmp, which C3's Landlock sandbox doesn't grant.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -41,6 +45,20 @@ pub fn open_in_memory() -> Result<Connection, StorageError> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// Architecture.md §7.5's GC step runs `PRAGMA incremental_vacuum`, which
+/// is a no-op unless the file is in `auto_vacuum = INCREMENTAL` mode. The
+/// mode only takes effect on an existing file after a full `VACUUM`, so a
+/// database created before this was set is converted once, here.
+fn enable_incremental_auto_vacuum(conn: &Connection) -> Result<(), StorageError> {
+    const INCREMENTAL: i64 = 2;
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode != INCREMENTAL {
+        conn.pragma_update(None, "auto_vacuum", INCREMENTAL)?;
+        conn.execute_batch("VACUUM;")?;
+    }
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> Result<(), StorageError> {
@@ -372,41 +390,69 @@ pub fn upsert_index_meta(
     Ok(())
 }
 
+/// The entities [`forget_by_app`] will delete. The caller reads these
+/// *before* forgetting, so it can delete the matching LanceDB rows while
+/// the ids are still known (a failed forget is then safely retryable).
+pub fn entity_ids_for_app(conn: &Connection, app_id: &str) -> Result<Vec<i64>, StorageError> {
+    collect_ids(conn, "SELECT id FROM entities WHERE label = ?1", [app_id])
+}
+
+/// The entities [`forget_since`] will delete (created at or after the cutoff).
+pub fn entity_ids_created_since(
+    conn: &Connection,
+    since_ns: u64,
+) -> Result<Vec<i64>, StorageError> {
+    collect_ids(
+        conn,
+        "SELECT id FROM entities WHERE created_ns >= ?1",
+        [since_ns as i64],
+    )
+}
+
 /// FR-STO-12/FR-PRV-03 ("forget"): deletes every row tied to `app_id`
-/// (entities, their chunk metadata, focus history, event counters) and
-/// returns the deleted entities' ids, so the caller can also purge the
-/// matching LanceDB rows (`entity_id IN (...)`).
+/// (entities and their edges, chunk metadata and keyword rows, focus
+/// history, event counters) in one transaction, and returns the deleted
+/// entities' ids. LanceDB rows are the caller's job.
 pub fn forget_by_app(conn: &Connection, app_id: &str) -> Result<Vec<i64>, StorageError> {
-    let entity_ids = collect_ids(conn, "SELECT id FROM entities WHERE label = ?1", [app_id])?;
-    conn.execute(
-        "DELETE FROM chunks_meta WHERE entity_id IN (SELECT id FROM entities WHERE label = ?1)",
-        [app_id],
-    )?;
-    conn.execute("DELETE FROM entities WHERE label = ?1", [app_id])?;
-    conn.execute("DELETE FROM focus_history WHERE app_id = ?1", [app_id])?;
-    conn.execute("DELETE FROM event_counters WHERE key = ?1", [app_id])?;
+    let tx = conn.unchecked_transaction()?;
+    let entity_ids = entity_ids_for_app(&tx, app_id)?;
+    delete_entities(&tx, &entity_ids)?;
+    tx.execute("DELETE FROM focus_history WHERE app_id = ?1", [app_id])?;
+    tx.execute("DELETE FROM event_counters WHERE key = ?1", [app_id])?;
+    tx.commit()?;
     Ok(entity_ids)
 }
 
-/// Same, but for everything at or after `since_ns` (an absolute UTC-ns
-/// cutoff — `neuroosctl forget --since 1h` becomes `since_ns = now - 1h`
-/// at the call site, not in here, so this stays a pure "delete after X"
-/// primitive).
+/// Same, but for everything recorded at or after `since_ns` (an absolute
+/// UTC-ns cutoff — `neuroosctl forget --since 1h` becomes
+/// `since_ns = now - 1h` at the call site). Entities created in the window are deleted
+/// outright; an older entity keeps its row but loses every chunk and
+/// focus segment from the window — including a segment that started
+/// before the cutoff but was still on screen after it.
 pub fn forget_since(conn: &Connection, since_ns: u64) -> Result<Vec<i64>, StorageError> {
     let since = since_ns as i64;
-    let entity_ids = collect_ids(
-        conn,
-        "SELECT id FROM entities WHERE created_ns >= ?1",
-        [since],
-    )?;
-    conn.execute(
-        "DELETE FROM chunks_meta WHERE entity_id IN (SELECT id FROM entities WHERE created_ns >= ?1)",
-        [since],
-    )?;
-    conn.execute("DELETE FROM entities WHERE created_ns >= ?1", [since])?;
-    conn.execute("DELETE FROM focus_history WHERE t_start_ns >= ?1", [since])?;
-    conn.execute("DELETE FROM event_counters WHERE first_ns >= ?1", [since])?;
+    let tx = conn.unchecked_transaction()?;
+    let entity_ids = entity_ids_created_since(&tx, since_ns)?;
+    delete_entities(&tx, &entity_ids)?;
+    tx.execute("DELETE FROM chunks_fts WHERE t_ns >= ?1", [since])?;
+    tx.execute("DELETE FROM focus_history WHERE t_end_ns >= ?1", [since])?;
+    tx.execute("DELETE FROM event_counters WHERE first_ns >= ?1", [since])?;
+    tx.commit()?;
     Ok(entity_ids)
+}
+
+/// Deletes `entity_ids` and every row that references them. Edges go
+/// first: their foreign keys would otherwise reject the entity delete.
+pub(crate) fn delete_entities(conn: &Connection, entity_ids: &[i64]) -> Result<(), StorageError> {
+    let mut edges = conn.prepare("DELETE FROM edges WHERE src = ?1 OR dst = ?1")?;
+    let mut meta = conn.prepare("DELETE FROM chunks_meta WHERE entity_id = ?1")?;
+    let mut entities = conn.prepare("DELETE FROM entities WHERE id = ?1")?;
+    for id in entity_ids {
+        edges.execute([id])?;
+        meta.execute([id])?;
+        entities.execute([id])?;
+    }
+    delete_chunks_fts(conn, entity_ids)
 }
 
 fn collect_ids<P: rusqlite::Params>(
@@ -1283,5 +1329,142 @@ mod tests {
             hits[0].text,
             "J.A.R.V.I.S Animated Theme : r/omarchy - Brave"
         );
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn fts_row_at(conn: &Connection, id: &str, entity_id: i64, domain: &str, t_ns: u64) {
+        insert_chunk_fts(
+            conn,
+            &FtsChunk {
+                chunk_id: id,
+                entity_id,
+                domain,
+                taint: 0,
+                t_ns,
+                text: id,
+            },
+        )
+        .unwrap();
+    }
+
+    /// H1: the cold worker's edges reference entities with a foreign key;
+    /// forget must remove them first instead of failing on the constraint.
+    #[test]
+    fn forget_by_app_succeeds_when_edges_reference_the_entity() {
+        let conn = open_in_memory().unwrap();
+        let (editor, browser) = two_entities(&conn);
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: editor,
+                dst: browser,
+                kind: "co_occurs".into(),
+                weight: 1.0,
+                reinforced_ns: 1,
+                hypothesis: true,
+            },
+        )
+        .unwrap();
+        fts_row(&conn, "editor-chunk", editor, "editor text");
+
+        let label: String = conn
+            .query_row("SELECT label FROM entities WHERE id = ?1", [editor], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let deleted = forget_by_app(&conn, &label).unwrap();
+
+        assert_eq!(deleted, vec![editor]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM edges"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunks_fts"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM entities"), 1);
+    }
+
+    #[test]
+    fn forget_since_succeeds_when_edges_reference_the_entity() {
+        let conn = open_in_memory().unwrap();
+        let old = upsert_entity(&conn, "d", "k", "old", TaintFlags::empty(), 1, false).unwrap();
+        let new = upsert_entity(&conn, "d", "k", "new", TaintFlags::empty(), 100, false).unwrap();
+        upsert_edge(
+            &conn,
+            &EdgeRow {
+                src: old,
+                dst: new,
+                kind: "co_occurs".into(),
+                weight: 1.0,
+                reinforced_ns: 1,
+                hypothesis: true,
+            },
+        )
+        .unwrap();
+
+        let deleted = forget_since(&conn, 50).unwrap();
+
+        assert_eq!(deleted, vec![new]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM edges"), 0);
+    }
+
+    /// H2: an entity created before the cutoff (a long-lived app) must
+    /// still lose every chunk and focus segment from the forgotten window.
+    #[test]
+    fn forget_since_removes_recent_rows_of_an_older_entity() {
+        let conn = open_in_memory().unwrap();
+        let app = upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "browser",
+            TaintFlags::empty(),
+            1_000,
+            false,
+        )
+        .unwrap();
+        fts_row_at(&conn, "before", app, "window_focus", 1_000);
+        fts_row_at(&conn, "after", app, "window_focus", 9_000);
+        // a session that started before the cutoff but was on screen after it
+        insert_focus_history(
+            &conn,
+            &FocusHistoryEntry {
+                app_id: "browser",
+                title: "straddling",
+                pid: 0,
+                root_pid: 0,
+                t_start_ns: 4_000,
+                t_end_ns: 6_000,
+                dwell_ms: 0,
+            },
+        )
+        .unwrap();
+
+        let deleted = forget_since(&conn, 5_000).unwrap();
+
+        assert!(deleted.is_empty(), "the entity itself predates the cutoff");
+        let remaining: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT chunk_id FROM chunks_fts").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(remaining, vec!["before".to_string()]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM focus_history"), 0);
+    }
+
+    /// H4: `PRAGMA incremental_vacuum` only reclaims space when the file
+    /// was switched to incremental auto-vacuum.
+    #[test]
+    fn open_enables_incremental_auto_vacuum_on_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.sqlite3");
+        // an existing database created without it is converted too
+        drop(Connection::open(&path).unwrap());
+        let conn = open(&path).unwrap();
+        let mode: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "2 = INCREMENTAL");
     }
 }

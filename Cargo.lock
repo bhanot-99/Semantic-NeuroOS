@@ -3364,6 +3364,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3853,6 +3864,7 @@ dependencies = [
  "neuroos-health",
  "neuroos-ipc",
  "neuroos-proto",
+ "neuroos-sandbox",
  "neuroos-testkit",
  "tempfile",
  "thiserror",
@@ -3889,6 +3901,7 @@ dependencies = [
  "neuroos-ipc",
  "neuroos-monitor",
  "neuroos-proto",
+ "neuroos-sandbox",
  "neuroos-shm",
  "neuroos-storage",
  "neuroos-taint",
@@ -3913,6 +3926,7 @@ dependencies = [
  "neuroos-health",
  "neuroos-ipc",
  "neuroos-proto",
+ "neuroos-sandbox",
  "notify",
  "procfs",
  "proptest",
@@ -3939,6 +3953,12 @@ dependencies = [
 [[package]]
 name = "neuroos-sandbox"
 version = "0.1.0"
+dependencies = [
+ "landlock",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "neuroos-shm"
@@ -3963,10 +3983,12 @@ dependencies = [
  "neuroos-ipc",
  "neuroos-monitor",
  "neuroos-proto",
+ "neuroos-sandbox",
  "neuroos-taint",
  "notify",
  "proptest",
  "rusqlite",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",

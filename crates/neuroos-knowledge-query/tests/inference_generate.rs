@@ -97,3 +97,88 @@ async fn generate_produces_real_text_through_a_real_memfd_ring() {
         "generation should produce some text: {answer:?}"
     );
 }
+
+async fn ready_client(proc: &InferenceProcess) -> InferenceClient {
+    let sock = sock_path(proc);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !sock.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "inference.sock never appeared (model load took too long or failed)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    InferenceClient::new(sock)
+}
+
+const APPLE: &str = "System: Repeat the user's word many times.<|eot_id|>User: apple<|eot_id|>Assistant: apple apple";
+const ZEBRA: &str = "System: Repeat the user's word many times.<|eot_id|>User: zebra<|eot_id|>Assistant: zebra zebra";
+
+/// H7: two generations on the same (reused) ring name must each get only
+/// their own tokens. The ring's generation used to be bumped at submit
+/// and stamped onto slots at write time, so a request submitted while
+/// another was still decoding received the first one's remaining tokens.
+#[tokio::test]
+#[ignore = "needs the real BitNet model + built cpp/neuroos-inference binary; see doc comment"]
+async fn concurrent_generations_on_one_ring_do_not_mix_tokens() {
+    let Some(proc) = spawn_real_inference() else {
+        return;
+    };
+    let client = ready_client(&proc).await;
+    let solo_apple = client.generate("shared", APPLE, 24).await.unwrap();
+    let solo_zebra = client.generate("shared", ZEBRA, 24).await.unwrap();
+    assert!(
+        solo_apple.contains("apple") && !solo_apple.contains("zebra"),
+        "precondition (model behaviour): {solo_apple:?}"
+    );
+    assert!(
+        solo_zebra.contains("zebra") && !solo_zebra.contains("apple"),
+        "precondition (model behaviour): {solo_zebra:?}"
+    );
+
+    let (a, z) = (client.clone(), client.clone());
+    let apple = tokio::spawn(async move { a.generate("shared", APPLE, 24).await });
+    tokio::time::sleep(Duration::from_millis(300)).await; // apple is decoding
+    let zebra = tokio::spawn(async move { z.generate("shared", ZEBRA, 24).await });
+    let apple = apple.await.unwrap().unwrap();
+    let zebra = zebra.await.unwrap().unwrap();
+
+    assert!(
+        !apple.contains("zebra"),
+        "apple got zebra's tokens: {apple:?}"
+    );
+    assert!(
+        !zebra.contains("apple"),
+        "zebra got apple's tokens: {zebra:?}"
+    );
+    assert!(apple.contains("apple"), "{apple:?}");
+    assert!(zebra.contains("zebra"), "{zebra:?}");
+}
+
+/// H8: a prompt that leaves less room in the 512-token context than
+/// `max_tokens` must end cleanly at the context limit (with an
+/// end-of-stream slot), not fail mid-decode and leave the client waiting
+/// for its 30 s generation deadline.
+#[tokio::test]
+#[ignore = "needs the real BitNet model + built cpp/neuroos-inference binary; see doc comment"]
+async fn a_prompt_near_the_context_limit_ends_cleanly() {
+    let Some(proc) = spawn_real_inference() else {
+        return;
+    };
+    let client = ready_client(&proc).await;
+    let mut prompt = String::from("Notes:");
+    while client.count_tokens(&prompt).await.unwrap() < 495 {
+        prompt.push_str(" the quick brown fox");
+    }
+    assert!(client.count_tokens(&prompt).await.unwrap() <= 512);
+
+    let started = std::time::Instant::now();
+    let answer = client.generate("near-limit", &prompt, 64).await;
+
+    assert!(answer.is_ok(), "{answer:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "must end at the context limit, not at the client deadline ({:?})",
+        started.elapsed()
+    );
+}

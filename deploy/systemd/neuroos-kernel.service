@@ -1,19 +1,14 @@
-# systemd template unit for neuroos-kernel [C6]
+# systemd user unit (ADR-0002) for neuroos-kernel [C6]
 [Unit]
 Description=NeuroOS neuroos-kernel [C6]
-After=neuroos@%i.target
-PartOf=neuroos@%i.target
+PartOf=neuroos.target
 
 [Service]
 Type=simple
-User=%i
-Group=%i
 ExecStart=/opt/neuroos/bin/neuroos-kernel
-Environment=XDG_RUNTIME_DIR=/run/user/%i
-Environment=NEUROOS_RUNTIME_DIR=/run/user/%i/neuroos
 
-# --- hardening baseline (Architecture.md §8.1); unit mode (User=%i template vs
-# a user unit) is confirmed empirically by spike S-01 / ADR-0002 (P0-S06) ---
+# --- hardening baseline (Architecture.md §8.1); user unit, per ADR-0002
+# (spike S-01, P0-S06) ---
 PrivateNetwork=true
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -38,8 +33,13 @@ UMask=0077
 MemoryMax=64M
 Restart=on-failure
 RestartSec=2s
-BindReadOnlyPaths=%h/.config/neuroos/hmac.key
-BindPaths=%h/.local/share/neuroos/actions.jsonl
+
+# %t/neuroos holds every socket; ProtectSystem=strict would make it read-only.
+RuntimeDirectory=neuroos
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+BindReadOnlyPaths=-%h/.config/neuroos/hmac.key -%h/.config/neuroos/config.toml
+BindPaths=-%h/.local/share/neuroos/actions.jsonl
 
 [Install]
-WantedBy=neuroos@%i.target
+WantedBy=neuroos.target

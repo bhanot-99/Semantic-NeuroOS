@@ -287,29 +287,52 @@ impl StorageEngine {
     }
 
     /// FR-STO-12/FR-PRV-03: forgets everything tied to `app_id` — SQLite
-    /// rows and their matching LanceDB chunks (`entity_id IN (...)`, safe
-    /// to build directly since only our own `i64` entity ids are
-    /// interpolated, never user text). Returns how many entities were
-    /// forgotten.
+    /// rows and their matching LanceDB chunks — and returns how many
+    /// entities were forgotten. LanceDB goes first, while the entity ids
+    /// are still in SQLite, so a forget that fails part-way is retryable;
+    /// the purge then removes the rows physically (H3).
     pub async fn forget_by_app(&mut self, app_id: &str) -> Result<usize, EngineError> {
-        let entity_ids = crate::sqlite::forget_by_app(&self.conn, app_id)?;
-        self.delete_lance_rows(&entity_ids).await?;
-        Ok(entity_ids.len())
+        let entity_ids = crate::sqlite::entity_ids_for_app(&self.conn, app_id)?;
+        self.delete_lance(entity_predicate(&entity_ids)).await?;
+        let forgotten = crate::sqlite::forget_by_app(&self.conn, app_id)?;
+        self.lance.purge_deleted().await?;
+        Ok(forgotten.len())
     }
 
-    /// Same, but for everything at or after `since_ns`.
+    /// Same, but for everything recorded at or after `since_ns`: entities
+    /// created in the window, and every chunk from the window whichever
+    /// entity it belongs to (H2).
     pub async fn forget_since(&mut self, since_ns: u64) -> Result<usize, EngineError> {
-        let entity_ids = crate::sqlite::forget_since(&self.conn, since_ns)?;
-        self.delete_lance_rows(&entity_ids).await?;
-        Ok(entity_ids.len())
+        let entity_ids = crate::sqlite::entity_ids_created_since(&self.conn, since_ns)?;
+        let recent = format!("t_ns >= {since_ns}");
+        let predicate = match entity_predicate(&entity_ids) {
+            Some(by_entity) => format!("{by_entity} OR {recent}"),
+            None => recent,
+        };
+        self.delete_lance(Some(predicate)).await?;
+        let forgotten = crate::sqlite::forget_since(&self.conn, since_ns)?;
+        self.lance.purge_deleted().await?;
+        Ok(forgotten.len())
     }
 
-    /// Architecture.md §7.5's daily GC job: expires entities/focus_history
-    /// past their domain's retention and purges the matching LanceDB rows.
+    /// Architecture.md §7.5's daily GC job: expires rows past their
+    /// domain's retention in SQLite, then the matching LanceDB chunks
+    /// (every chunk of the domain older than its cutoff, plus those of
+    /// expired entities), then purges them physically. Re-running after a
+    /// partial failure finishes the job: the cutoffs are recomputed.
     pub async fn gc(&mut self, now_ns: u64) -> Result<crate::lifecycle::GcSummary, EngineError> {
-        let (summary, entity_ids) = crate::lifecycle::gc_expired_entities(&self.conn, now_ns)?;
-        self.delete_lance_rows(&entity_ids).await?;
-        Ok(summary)
+        let outcome = crate::lifecycle::gc_expired_entities(&self.conn, now_ns)?;
+        let mut clauses: Vec<String> = outcome
+            .chunk_cutoffs
+            .iter()
+            .map(|(domain, cutoff)| format!("(domain = '{domain}' AND t_ns < {cutoff})"))
+            .collect();
+        clauses.extend(entity_predicate(&outcome.entity_ids));
+        if !clauses.is_empty() {
+            self.delete_lance(Some(clauses.join(" OR "))).await?;
+        }
+        self.lance.purge_deleted().await?;
+        Ok(outcome.summary)
     }
 
     /// Architecture.md §7.5's 6-hourly backup job.
@@ -331,21 +354,26 @@ impl StorageEngine {
         crate::lifecycle::backup(&self.conn, &self.lance_dir, backups_root, label, keep).await
     }
 
-    async fn delete_lance_rows(&self, entity_ids: &[i64]) -> Result<(), EngineError> {
-        if entity_ids.is_empty() {
-            return Ok(());
+    async fn delete_lance(&self, predicate: Option<String>) -> Result<(), EngineError> {
+        if let Some(predicate) = predicate {
+            self.lance.delete_all_families(&predicate).await?;
         }
-        let ids = entity_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        self.lance
-            .delete_all_families(&format!("entity_id IN ({ids})"))
-            .await?;
-        crate::sqlite::delete_chunks_fts(&self.conn, entity_ids)?;
         Ok(())
     }
+}
+
+/// `entity_id IN (...)` over our own `i64` ids (never user text, so safe
+/// to interpolate), or `None` when there are none.
+fn entity_predicate(entity_ids: &[i64]) -> Option<String> {
+    if entity_ids.is_empty() {
+        return None;
+    }
+    let ids = entity_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("entity_id IN ({ids})"))
 }
 
 /// BAAI's query-side instruction for bge-*-v1.5 retrieval.
@@ -745,6 +773,78 @@ mod tests {
         assert_eq!(entities, 0);
     }
 
+    /// H2 live proof: the window entity is promoted (created) at t=6s by a
+    /// first session, then a later "quarterly revenue dashboard" segment
+    /// ends at t=9s. Forgetting since t=8.5s must remove that chunk from
+    /// LanceDB and FTS while the entity and its earlier chunk survive.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn forget_since_removes_a_recent_chunk_of_an_older_entity() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+        let active = || {
+            Kind::StateChanged(WindowStateChanged {
+                states: vec![ToplevelState::Activated as i32],
+            })
+        };
+        let inactive = || Kind::StateChanged(WindowStateChanged { states: vec![] });
+        let s = 1_000_000_000;
+        for (at, kind) in [
+            (
+                0,
+                Kind::Opened(WindowOpened {
+                    app_id: "org.mozilla.firefox".into(),
+                    title: "kernel mailing list archive".into(),
+                    pid: 0,
+                    pid_known: false,
+                }),
+            ),
+            (0, active()),
+            (6 * s, inactive()),
+            (7 * s, active()),
+            (
+                8 * s,
+                Kind::TitleChanged(neuroos_proto::v1::WindowTitleChanged {
+                    title: "quarterly revenue dashboard".into(),
+                }),
+            ),
+            (9 * s, inactive()),
+        ] {
+            engine.ingest(&window_event(1, at, kind)).await.unwrap();
+        }
+        let mentions_revenue = |m: &Vec<crate::lance::ChunkMatch>| {
+            m.iter().any(|c| c.text.contains("quarterly revenue"))
+        };
+        assert!(mentions_revenue(
+            &engine.query_hybrid("quarterly revenue", 5).await.unwrap()
+        ));
+
+        let forgotten = engine.forget_since(8 * s + s / 2).await.unwrap();
+
+        assert_eq!(forgotten, 0, "the entity itself predates the cutoff");
+        let after = engine.query_hybrid("quarterly revenue", 5).await.unwrap();
+        assert!(
+            !mentions_revenue(&after),
+            "the chunk recorded after the cutoff must be gone from LanceDB and FTS: {after:?}"
+        );
+        assert!(
+            after.iter().any(|c| c.text.contains("kernel mailing list")),
+            "chunks from before the cutoff are kept: {after:?}"
+        );
+        assert!(!dir_contains_bytes(
+            lance_dir.path(),
+            b"quarterly revenue dashboard"
+        ));
+    }
+
     /// Live proof (P4-S09 / phases.md §7.4 "Forget verified (rows,
     /// vectors, next backup)"): the third leg -- a backup taken *after* a
     /// forget must not resurrect the forgotten row. Needs the real model +
@@ -822,6 +922,26 @@ mod tests {
             entities, 0,
             "a backup taken after forget must not contain the forgotten entity"
         );
+        // H3: nor its text in the copied LanceDB files (old dataset
+        // versions included).
+        assert!(
+            !dir_contains_bytes(&backup_dest.join("lancedb"), b"quarterly revenue dashboard"),
+            "the forgotten chunk's text must not survive in the backup's LanceDB copy"
+        );
+    }
+
+    fn dir_contains_bytes(dir: &std::path::Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dir_contains_bytes(&path, needle)
+            } else {
+                std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle)
+            }
+        })
     }
 
     /// Live proof (P4-S08/FR-STO-11): ingesting records `index_meta`, and

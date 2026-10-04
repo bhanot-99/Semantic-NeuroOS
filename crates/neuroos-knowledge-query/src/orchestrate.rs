@@ -13,7 +13,7 @@ use crate::evidence;
 use crate::inference_client::{InferenceClient, InferenceClientError};
 use crate::kernel_client::{KernelClient, KernelClientError};
 use crate::storage_client::{StorageClient, StorageClientError};
-use crate::voice_client::{VoiceClient, VoiceClientError};
+use crate::voice_client::VoiceClient;
 
 /// design.md §9.3's "Lookup / summarise" category -- matches
 /// Architecture.md §6.1's own sequence-diagram example verbatim. Rotating
@@ -43,8 +43,6 @@ pub const NO_EVIDENCE_ANSWER: &str = "I don't know. Nothing in your recorded act
 
 #[derive(Debug, thiserror::Error)]
 pub enum AskError {
-    #[error("preamble request failed: {0}")]
-    Preamble(#[from] VoiceClientError),
     #[error("focus history query failed: {0}")]
     FocusHistory(StorageClientError),
     #[error("evidence retrieval failed: {0}")]
@@ -66,10 +64,19 @@ pub async fn ask_context(
     storage: &StorageClient,
     t_speech_start_ns: u64,
 ) -> Result<Option<WindowContext>, AskError> {
-    voice.request_preamble(DEFAULT_PREAMBLE).await?;
+    request_preamble(voice).await;
     deictic::snap(storage, t_speech_start_ns)
         .await
         .map_err(AskError::FocusHistory)
+}
+
+/// H9 / rules.md §5.6 (fail soft): the preamble only masks latency, so a
+/// C2 that is down or slow must not stop the answer itself. The failure is
+/// logged (no user content in it) and the hot path carries on.
+async fn request_preamble(voice: &VoiceClient) {
+    if let Err(e) = voice.request_preamble(DEFAULT_PREAMBLE).await {
+        tracing::warn!(error = %e, "preamble request failed; answering without it");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +110,7 @@ pub async fn ask(
     question: &str,
     t_speech_start_ns: u64,
 ) -> Result<AskResult, AskError> {
-    voice.request_preamble(DEFAULT_PREAMBLE).await?;
+    request_preamble(voice).await;
 
     let (window, chunks) = tokio::try_join!(
         async {

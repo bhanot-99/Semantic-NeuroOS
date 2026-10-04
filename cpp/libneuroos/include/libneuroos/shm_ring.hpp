@@ -179,13 +179,23 @@ class RingWriter {
         return cancel();
     }
 
-    // Returns false if `payload` exceeds the slot's max payload size.
+    // Returns false if `payload` exceeds the slot's max payload size. Stamps
+    // the slot with the header's current generation.
     bool write(std::uint32_t token_id, std::uint16_t flags, const std::uint8_t* payload,
                std::size_t len) {
+        return write_as(generation_id(), token_id, flags, payload, len);
+    }
+
+    // H7: stamps the slot with `generation` -- the job's own id, fixed when
+    // the job was submitted -- rather than whatever the header holds at
+    // write time. A ring name is shared by many requests, and the header
+    // moves on as soon as the next one is submitted, possibly while this
+    // job is still decoding.
+    bool write_as(std::uint64_t generation, std::uint32_t token_id, std::uint16_t flags,
+                  const std::uint8_t* payload, std::size_t len) {
         if (len > view_.max_payload()) {
             return false;
         }
-        std::uint64_t generation = generation_id();
         std::uint64_t seq = view_.write_seq()->load(std::memory_order_relaxed);
         std::uint32_t idx = static_cast<std::uint32_t>(seq % view_.capacity_slots());
         std::uint8_t* slot = view_.slot_ptr(idx);
@@ -213,7 +223,11 @@ class RingWriter {
 // Single-reader handle.
 class RingReader {
   public:
-    explicit RingReader(RingView view) : view_(view) {}
+    // With `only_generation` set, returns only that generation's slots (H7:
+    // a client reading its own job's tokens, by the generation_id its
+    // GenerateResponse carried); otherwise only the header's current one.
+    explicit RingReader(RingView view, std::optional<std::uint64_t> only_generation = std::nullopt)
+        : view_(view), only_generation_(only_generation) {}
 
     std::optional<TokenPiece> try_read() {
         for (;;) {
@@ -253,9 +267,11 @@ class RingReader {
             }
 
             next_seq_ = seq + 1;
-            std::uint64_t cur_gen = view_.generation_id()->load(std::memory_order_acquire);
-            if (generation != cur_gen) {
-                continue; // stale generation (a cancel happened); skip it
+            std::uint64_t wanted = only_generation_.has_value()
+                                       ? *only_generation_
+                                       : view_.generation_id()->load(std::memory_order_acquire);
+            if (generation != wanted) {
+                continue; // another job's slot, or a stale (cancelled) one; skip it
             }
             return TokenPiece{token_id, flags, std::move(payload)};
         }
@@ -263,6 +279,7 @@ class RingReader {
 
   private:
     RingView view_;
+    std::optional<std::uint64_t> only_generation_;
     std::uint64_t next_seq_ = 0;
 };
 

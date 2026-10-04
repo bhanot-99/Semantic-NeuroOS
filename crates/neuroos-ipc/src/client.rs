@@ -57,3 +57,71 @@ pub async fn connect_with_reconnect(
         }
     }
 }
+
+/// AB-10's reconnect schedule: exponential from 100 ms, capped at 10 s,
+/// each delay jittered down by up to half so clients that lost the same
+/// server don't reconnect in lockstep. [`Backoff::reset`] after a
+/// successful connection starts the next outage from 100 ms again.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    next: Duration,
+}
+
+impl Backoff {
+    pub const INITIAL: Duration = Duration::from_millis(100);
+    pub const MAX: Duration = Duration::from_secs(10);
+
+    pub fn new() -> Self {
+        Self {
+            next: Self::INITIAL,
+        }
+    }
+
+    /// The delay to wait before the next attempt (then doubles, capped).
+    pub fn next_delay(&mut self) -> Duration {
+        let base = self.next;
+        self.next = (self.next * 2).min(Self::MAX);
+        let half = base / 2;
+        // Not a secret, just decorrelation: the clock's sub-second noise.
+        let noise = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()))
+            .unwrap_or(0);
+        let half_ns = half.as_nanos().max(1) as u64;
+        base - Duration::from_nanos(noise % half_ns)
+    }
+
+    pub fn reset(&mut self) {
+        self.next = Self::INITIAL;
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_from_100ms_caps_at_10s_and_jitters_downward() {
+        let mut b = Backoff::new();
+        let mut base = Backoff::INITIAL;
+        for _ in 0..12 {
+            let d = b.next_delay();
+            assert!(
+                d <= base && d >= base / 2,
+                "{d:?} outside [{:?}, {base:?}]",
+                base / 2
+            );
+            base = (base * 2).min(Backoff::MAX);
+        }
+        assert_eq!(base, Backoff::MAX);
+        b.reset();
+        assert!(b.next_delay() <= Backoff::INITIAL);
+    }
+}

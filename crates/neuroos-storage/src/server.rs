@@ -8,10 +8,13 @@ use std::sync::Arc;
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
 use neuroos_proto::v1::{
     ActivityItem, ChunkMatch, EdgeRow, EntityRow, Envelope, Error, ErrorCode, FocusHistoryRow,
-    ForgetResponse, ListEdgesResponse, ListEntitiesResponse, PruneEdgesResponse,
-    QueryActivityResponse, QueryFocusHistoryResponse, QueryHybridResponse, Taint,
-    UpsertEdgeResponse, envelope, forget_request,
+    ForgetResponse, ListEdgesResponse, ListEntitiesResponse, MaintenanceResponse,
+    PruneEdgesResponse, QueryActivityResponse, QueryFocusHistoryResponse, QueryHybridResponse,
+    Taint, UpsertEdgeResponse, envelope, forget_request, maintenance_request,
 };
+
+/// Architecture.md §7.5: "keep 8".
+const DEFAULT_BACKUPS_KEPT: usize = 8;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
@@ -27,13 +30,78 @@ use crate::engine::StorageEngine;
 /// was never any genuine cross-thread parallelism to gain by using
 /// `tokio::spawn` in the first place).
 pub async fn serve(engine: Arc<Mutex<StorageEngine>>, path: PathBuf, allowed_uids: Vec<u32>) {
+    serve_with_backups_dir(
+        engine,
+        path,
+        allowed_uids,
+        neuroos_common::paths::backups_dir(),
+    )
+    .await;
+}
+
+/// [`serve`], writing `storage backup` snapshots under `backups_dir`.
+pub async fn serve_with_backups_dir(
+    engine: Arc<Mutex<StorageEngine>>,
+    path: PathBuf,
+    allowed_uids: Vec<u32>,
+    backups_dir: PathBuf,
+) {
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(serve_local(engine, path, allowed_uids))
+        .run_until(serve_local(
+            engine,
+            path,
+            allowed_uids,
+            Arc::new(backups_dir),
+        ))
         .await;
 }
 
-async fn serve_local(engine: Arc<Mutex<StorageEngine>>, path: PathBuf, allowed_uids: Vec<u32>) {
+/// Where the running C3 service listens and what it feeds from.
+pub struct ServicePaths {
+    pub storage_sock: PathBuf,
+    pub monitor_sock: PathBuf,
+    pub spool_dir: PathBuf,
+    pub backups_dir: PathBuf,
+}
+
+/// H11: the whole running C3 -- `storage.sock`, the live `monitor.sock`
+/// telemetry feed (C1 → C3, Architecture.md §6.2) and the C7 spool watcher
+/// (§6.3) -- on one `LocalSet`, sharing one engine.
+pub async fn run_service(
+    engine: Arc<Mutex<StorageEngine>>,
+    paths: ServicePaths,
+    allowed_uids: Vec<u32>,
+) {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            tokio::task::spawn_local(crate::monitor_feed::subscribe_forever(
+                Arc::clone(&engine),
+                paths.monitor_sock,
+            ));
+            let spool_engine = Arc::clone(&engine);
+            let spool_dir = paths.spool_dir;
+            tokio::task::spawn_local(async move {
+                crate::spool::watch_forever(&spool_engine, &spool_dir).await;
+            });
+            serve_local(
+                engine,
+                paths.storage_sock,
+                allowed_uids,
+                Arc::new(paths.backups_dir),
+            )
+            .await;
+        })
+        .await;
+}
+
+async fn serve_local(
+    engine: Arc<Mutex<StorageEngine>>,
+    path: PathBuf,
+    allowed_uids: Vec<u32>,
+    backups_dir: Arc<PathBuf>,
+) {
     let server = match UdsServer::bind(UdsServerConfig::new(path, allowed_uids)) {
         Ok(s) => s,
         Err(e) => {
@@ -44,7 +112,11 @@ async fn serve_local(engine: Arc<Mutex<StorageEngine>>, path: PathBuf, allowed_u
     loop {
         match server.accept().await {
             Ok(Some((stream, _cred))) => {
-                tokio::task::spawn_local(handle_conn(stream, Arc::clone(&engine)));
+                tokio::task::spawn_local(handle_conn(
+                    stream,
+                    Arc::clone(&engine),
+                    Arc::clone(&backups_dir),
+                ));
             }
             Ok(None) => continue, // rejected peer (SO_PEERCRED not in allowlist); keep serving
             Err(e) => {
@@ -54,7 +126,11 @@ async fn serve_local(engine: Arc<Mutex<StorageEngine>>, path: PathBuf, allowed_u
     }
 }
 
-async fn handle_conn(mut stream: UnixStream, engine: Arc<Mutex<StorageEngine>>) {
+async fn handle_conn(
+    mut stream: UnixStream,
+    engine: Arc<Mutex<StorageEngine>>,
+    backups_dir: Arc<PathBuf>,
+) {
     loop {
         let env = match read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
             Ok(Some(env)) => env,
@@ -64,7 +140,7 @@ async fn handle_conn(mut stream: UnixStream, engine: Arc<Mutex<StorageEngine>>) 
                 return;
             }
         };
-        let response = handle_request(env, &engine).await;
+        let response = handle_request(env, &engine, &backups_dir).await;
         if write_envelope(&mut stream, &response, DEFAULT_MAX_FRAME)
             .await
             .is_err()
@@ -82,7 +158,11 @@ fn internal_error(message: impl Into<String>) -> envelope::Body {
     })
 }
 
-async fn handle_request(env: Envelope, engine: &Arc<Mutex<StorageEngine>>) -> Envelope {
+async fn handle_request(
+    env: Envelope,
+    engine: &Arc<Mutex<StorageEngine>>,
+    backups_dir: &std::path::Path,
+) -> Envelope {
     let now = neuroos_common::now_ns();
     let body = match env.body {
         Some(envelope::Body::QueryFocusHistoryRequest(req)) => {
@@ -227,6 +307,35 @@ async fn handle_request(env: Envelope, engine: &Arc<Mutex<StorageEngine>>) -> En
             match engine.prune_hypothesis_edges(req.older_than_ns) {
                 Ok(pruned) => envelope::Body::PruneEdgesResponse(PruneEdgesResponse { pruned }),
                 Err(e) => internal_error(format!("PruneEdges failed: {e}")),
+            }
+        }
+        Some(envelope::Body::MaintenanceRequest(req)) => {
+            let mut engine = engine.lock().await;
+            match req.job {
+                Some(maintenance_request::Job::Gc(_)) => match engine.gc(now).await {
+                    Ok(summary) => envelope::Body::MaintenanceResponse(MaintenanceResponse {
+                        entities_deleted: summary.entities_deleted as u64,
+                        focus_history_deleted: summary.focus_history_deleted as u64,
+                        backup_path: String::new(),
+                    }),
+                    Err(e) => internal_error(format!("GC failed: {e}")),
+                },
+                Some(maintenance_request::Job::Backup(job)) => {
+                    let keep = match job.keep {
+                        0 => DEFAULT_BACKUPS_KEPT,
+                        n => n as usize,
+                    };
+                    let label = neuroos_common::time::utc_label(now);
+                    match engine.backup(backups_dir, &label, keep).await {
+                        Ok(path) => envelope::Body::MaintenanceResponse(MaintenanceResponse {
+                            entities_deleted: 0,
+                            focus_history_deleted: 0,
+                            backup_path: path.display().to_string(),
+                        }),
+                        Err(e) => internal_error(format!("backup failed: {e}")),
+                    }
+                }
+                None => internal_error("MaintenanceRequest without a job"),
             }
         }
         _ => internal_error("unsupported request on storage.sock"),
@@ -623,6 +732,71 @@ mod tests {
                     }
                     other => panic!("unexpected response: {other:?}"),
                 }
+            } => {}
+        }
+    }
+
+    /// H12 live proof: `MaintenanceRequest` runs the real GC and a real
+    /// backup over a real `storage.sock` (ADR-0011).
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn maintenance_gc_and_backup_run_over_a_real_storage_sock() {
+        use neuroos_proto::v1::{BackupJob, GcJob, MaintenanceRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::open(
+            &dir.path().join("meta.sqlite3"),
+            &dir.path().join("lance"),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+        let sock_path = dir.path().join("storage.sock");
+        let backups = dir.path().join("backups");
+
+        let call = |job| {
+            let sock_path = sock_path.clone();
+            async move {
+                let mut stream = connect(&sock_path, Duration::from_secs(1)).await.unwrap();
+                let req = Envelope {
+                    schema_version: 1,
+                    trace_id: String::new(),
+                    request_id: 1,
+                    sent_at_ns: 0,
+                    body: Some(envelope::Body::MaintenanceRequest(MaintenanceRequest {
+                        job: Some(job),
+                    })),
+                };
+                write_envelope_deadline(
+                    &mut stream,
+                    &req,
+                    DEFAULT_MAX_FRAME,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, Duration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body
+            }
+        };
+        tokio::select! {
+            _ = serve_with_backups_dir(Arc::new(Mutex::new(engine)), sock_path.clone(), vec![current_uid()], backups.clone()) => {
+                panic!("storage.sock server exited unexpectedly");
+            }
+            _ = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let gc = call(maintenance_request::Job::Gc(GcJob {})).await;
+                assert!(matches!(gc, Some(envelope::Body::MaintenanceResponse(_))), "{gc:?}");
+                let backup = call(maintenance_request::Job::Backup(BackupJob { keep: 0 })).await;
+                let Some(envelope::Body::MaintenanceResponse(r)) = backup else {
+                    panic!("expected a MaintenanceResponse, got {backup:?}");
+                };
+                let path = std::path::PathBuf::from(&r.backup_path);
+                assert!(path.starts_with(&backups), "{path:?}");
+                assert!(path.join("meta.sqlite3").exists());
             } => {}
         }
     }

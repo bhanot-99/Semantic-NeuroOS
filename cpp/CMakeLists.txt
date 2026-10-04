@@ -64,6 +64,10 @@ target_link_libraries(shm-stress-cpp PRIVATE libneuroos Threads::Threads)
 add_executable(cpp-ipc-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_ipc_smoke.cpp)
 target_link_libraries(cpp-ipc-smoke PRIVATE libneuroos Threads::Threads)
 
+# H15: libneuroos's Landlock sandbox denies what its policy doesn't grant.
+add_executable(cpp-sandbox-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_sandbox_smoke.cpp)
+target_link_libraries(cpp-sandbox-smoke PRIVATE libneuroos Threads::Threads)
+
 # Phase 2 IT: drives a real running neuroos-inference (real model) over inference.sock.
 add_executable(cpp-inference-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_inference_smoke.cpp)
 target_link_libraries(cpp-inference-smoke PRIVATE libneuroos Threads::Threads)

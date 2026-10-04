@@ -15,6 +15,7 @@ neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 neuroos-taint = { path = "../neuroos-taint", version = "0.1.0" }
 neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
 neuroos-shm = { path = "../neuroos-shm", version = "0.1.0" }
+neuroos-sandbox = { path = "../neuroos-sandbox", version = "0.1.0" }
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

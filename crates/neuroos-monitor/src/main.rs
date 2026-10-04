@@ -26,8 +26,7 @@ enum Command {
     Anonymize { input: PathBuf, output: PathBuf },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     if neuroos_common::init_logging().is_err() {
         // logging isn't up yet; this is the one place a bare eprintln is
         // acceptable (rules.md §4 governs *services*, not this one line).
@@ -37,7 +36,10 @@ async fn main() {
     let args = Args::parse();
 
     if let Some(Command::Anonymize { input, output }) = args.command {
-        match anonymise::anonymise_file(&input, &output).await {
+        // An offline operator tool on files the operator names, not the
+        // service: no sandbox.
+        let result = runtime().block_on(anonymise::anonymise_file(&input, &output));
+        match result {
             Ok(count) => {
                 tracing::info!(events = count, "anonymised dump written");
             }
@@ -58,6 +60,37 @@ async fn main() {
     };
     let monitor_cfg = config.monitor;
 
+    // H15: locked in before the async runtime spawns its worker threads.
+    // `--record`'s file is created first so the sandbox can grant exactly
+    // that one file. Fail closed (rules.md §5.5).
+    if let Some(path) = &args.record
+        && let Err(e) = std::fs::File::create(path)
+    {
+        tracing::error!(error = %e, path = %path.display(), "failed to create the --record dump file");
+        std::process::exit(1);
+    }
+    let policy = neuroos_monitor::sandbox_policy(&monitor_cfg, args.record.as_deref());
+    if let Err(e) = neuroos_sandbox::enter(&policy, &[neuroos_common::paths::runtime_dir()]) {
+        tracing::error!(error = %e, "failed to enter the Landlock sandbox");
+        std::process::exit(1);
+    }
+    runtime().block_on(run(args, monitor_cfg));
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start the async runtime");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run(args: Args, monitor_cfg: neuroos_common::config::MonitorConfig) {
     let my_uid = current_uid();
     let bus = EventBus::new(monitor_cfg.bus_capacity);
     let privacy = PrivacyState::new(monitor_cfg.effective_excluded_app_ids());

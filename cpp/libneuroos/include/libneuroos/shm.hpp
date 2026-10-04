@@ -38,6 +38,9 @@ class Ring {
     RingReader reader() const {
         return RingReader(view_);
     }
+    RingReader reader_for_generation(std::uint64_t generation) const {
+        return RingReader(view_, generation);
+    }
 
   private:
     Ring(int fd, void* base, std::size_t len, std::uint32_t capacity_slots,

@@ -1,0 +1,10 @@
+# triggers the C3 gc job (Architecture.md §7.5)
+[Unit]
+Description=NeuroOS storage GC vacuum (daily)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

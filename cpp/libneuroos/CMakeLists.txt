@@ -8,6 +8,7 @@ add_library(libneuroos STATIC
     src/health_server.cpp
     src/sha256.cpp
     src/paths.cpp
+    src/sandbox.cpp
 )
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)

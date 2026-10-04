@@ -215,6 +215,11 @@ pub struct LanceStore {
     /// Families with a background compaction in flight, so a burst of
     /// inserts doesn't stack up concurrent compactions of the same table.
     compacting: Arc<Mutex<HashSet<String>>>,
+    /// H3: per-family lock held by every background rewrite of the table
+    /// (compaction, HNSW build) and by [`Self::purge_deleted`], whose
+    /// unverified-file cleanup would otherwise delete files an in-flight
+    /// rewrite is still writing.
+    maintenance: HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl LanceStore {
@@ -237,7 +242,18 @@ impl LanceStore {
             promoted: Arc::new(Mutex::new(HashSet::new())),
             inserts_since_compact: Mutex::new(HashMap::new()),
             compacting: Arc::new(Mutex::new(HashSet::new())),
+            maintenance: FAMILIES
+                .iter()
+                .map(|f| (*f, Arc::new(tokio::sync::Mutex::new(()))))
+                .collect(),
         })
+    }
+
+    fn maintenance_lock(&self, family: &str) -> Result<Arc<tokio::sync::Mutex<()>>, LanceError> {
+        self.maintenance
+            .get(family)
+            .cloned()
+            .ok_or_else(|| LanceError::UnknownFamily(family.to_string()))
     }
 
     fn check_family(family: &str) -> Result<(), LanceError> {
@@ -282,7 +298,7 @@ impl LanceStore {
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema()),
         );
         table.add(reader).execute().await?;
-        self.maybe_spawn_compaction(family, table);
+        self.maybe_spawn_compaction(family, table)?;
         Ok(())
     }
 
@@ -291,21 +307,23 @@ impl LanceStore {
     /// paths (same reasoning as BUG-003's HNSW promotion). A failure (e.g.
     /// a commit conflict with a concurrent write) just leaves the counter
     /// reset; the next threshold crossing tries again.
-    fn maybe_spawn_compaction(&self, family: &str, table: &Table) {
+    fn maybe_spawn_compaction(&self, family: &str, table: &Table) -> Result<(), LanceError> {
         {
             let mut counts = lock(&self.inserts_since_compact);
             let count = counts.entry(family.to_string()).or_insert(0);
             *count += 1;
             if *count < COMPACT_EVERY_INSERTS || !lock(&self.compacting).insert(family.to_string())
             {
-                return;
+                return Ok(());
             }
             *count = 0;
         }
+        let maintenance = self.maintenance_lock(family)?;
         let family = family.to_string();
         let table = table.clone();
         let compacting = Arc::clone(&self.compacting);
         tokio::spawn(async move {
+            let _maintenance = maintenance.lock().await;
             let result = table
                 .optimize(OptimizeAction::Compact {
                     options: CompactionOptions::default(),
@@ -317,6 +335,7 @@ impl LanceStore {
             }
             lock(&compacting).remove(&family);
         });
+        Ok(())
     }
 
     /// FR-STO-05: exact (flat) nearest-neighbor search within one family,
@@ -355,7 +374,12 @@ impl LanceStore {
             // "index in progress" state to check — `create_index` just
             // hasn't returned yet), so every other query keeps working at
             // flat-scan latency while this builds in the background.
-            Self::spawn_hnsw_promotion(family.to_string(), table.clone(), self.promoted.clone());
+            Self::spawn_hnsw_promotion(
+                family.to_string(),
+                table.clone(),
+                self.promoted.clone(),
+                self.maintenance_lock(family)?,
+            );
         }
         results
     }
@@ -395,8 +419,14 @@ impl LanceStore {
     /// un-marks `family` in `promoted` so the next qualifying query's
     /// `record_query_latency` retries, instead of leaving it permanently
     /// stuck un-promoted.
-    fn spawn_hnsw_promotion(family: String, table: Table, promoted: Arc<Mutex<HashSet<String>>>) {
+    fn spawn_hnsw_promotion(
+        family: String,
+        table: Table,
+        promoted: Arc<Mutex<HashSet<String>>>,
+        maintenance: Arc<tokio::sync::Mutex<()>>,
+    ) {
         tokio::spawn(async move {
+            let _maintenance = maintenance.lock().await;
             let result = table
                 .create_index(
                     &["vector"],
@@ -522,6 +552,42 @@ impl LanceStore {
         Ok(())
     }
 
+    /// H3 (FR-STO-12/FR-PRV-03): makes earlier [`Self::delete`]s physical.
+    /// A LanceDB delete only records a deletion vector -- the row stays in
+    /// its data file and in every older dataset version (which backups
+    /// copy). Compacting with `materialize_deletions_threshold = 0`
+    /// rewrites every fragment that has deletions, then pruning every old
+    /// version removes the files that still held the rows. Waits for any
+    /// in-flight background compaction or HNSW build on the family first
+    /// (`maintenance`), since `delete_unverified` would otherwise remove
+    /// files those are still writing. Callers hold the engine lock, so no
+    /// foreground write races this either.
+    pub async fn purge_deleted(&self) -> Result<(), LanceError> {
+        for family in FAMILIES {
+            let maintenance = self.maintenance_lock(family)?;
+            let _maintenance = maintenance.lock().await;
+            let table = self.table(family)?;
+            table
+                .optimize(OptimizeAction::Compact {
+                    options: CompactionOptions {
+                        materialize_deletions: true,
+                        materialize_deletions_threshold: 0.0,
+                        ..CompactionOptions::default()
+                    },
+                    remap_options: None,
+                })
+                .await?;
+            table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(lancedb::table::optimize::Duration::zero()),
+                    delete_unverified: Some(true),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     /// BUG-002: real telemetry ingest calls `insert` one chunk at a time
     /// (`store_chunk`'s own doc comment: "fine at telemetry ingest rates" --
     /// batching is only the spool/replay path's concern), and Lance's
@@ -543,6 +609,8 @@ impl LanceStore {
     /// §7.5).
     pub async fn compact_all_families(&self) -> Result<(), LanceError> {
         for family in FAMILIES {
+            let maintenance = self.maintenance_lock(family)?;
+            let _maintenance = maintenance.lock().await;
             self.table(family)?
                 .optimize(OptimizeAction::Compact {
                     options: CompactionOptions::default(),
@@ -848,5 +916,63 @@ mod tests {
             fragments < COMPACT_EVERY_INSERTS as usize,
             "expected background compaction, still {fragments} fragments"
         );
+    }
+
+    /// Whether any file under `dir` contains `needle` byte-for-byte.
+    fn dir_contains_bytes(dir: &Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dir_contains_bytes(&path, needle)
+            } else {
+                std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle)
+            }
+        })
+    }
+
+    /// H3: a LanceDB delete only writes a deletion vector; the row stays in
+    /// the data file and in every older dataset version until compaction
+    /// rewrites it and the old versions are pruned. Forget must leave
+    /// nothing recoverable on disk (or in the next backup's copy of it).
+    #[tokio::test]
+    async fn purge_removes_deleted_rows_and_old_versions_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        let secret = "forget-me-7f3a9c2e-unique-window-title";
+        let mut forgotten = chunk("forgotten", vec![1.0; EMBEDDING_DIM as usize]);
+        forgotten.entity_id = 42;
+        forgotten.text = secret.to_string();
+        store.insert("attention", &[forgotten]).await.unwrap();
+        store
+            .insert(
+                "attention",
+                &[chunk("kept", vec![-1.0; EMBEDDING_DIM as usize])],
+            )
+            .await
+            .unwrap();
+
+        store
+            .delete_all_families("entity_id IN (42)")
+            .await
+            .unwrap();
+        assert!(
+            dir_contains_bytes(dir.path(), secret.as_bytes()),
+            "precondition: a bare delete leaves the text on disk"
+        );
+
+        store.purge_deleted().await.unwrap();
+
+        assert!(
+            !dir_contains_bytes(dir.path(), secret.as_bytes()),
+            "forgotten text must be gone from every file after purge"
+        );
+        let table = store.table("attention").unwrap();
+        assert_eq!(table.list_versions().await.unwrap().len(), 1);
+        let remaining = store.all_chunks("attention").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].chunk_id, "kept");
     }
 }

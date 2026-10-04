@@ -1,11 +1,12 @@
 //! neuroosctl entry point (Architecture.md §6.5, PRD FR-CLI-01).
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
 use neuroos_proto::v1::{
-    AggregateStatusRequest, AskRequest, ComponentStatus, Envelope, MonitorPauseRequest,
-    MonitorStatusRequest, RenderGraphViewRequest, Status, envelope,
+    AggregateStatusRequest, AskRequest, BackupJob, ComponentStatus, Envelope, ForgetRequest, GcJob,
+    MaintenanceRequest, MonitorPauseRequest, MonitorStatusRequest, RenderGraphViewRequest, Status,
+    envelope, forget_request, maintenance_request,
 };
 use serde::Serialize;
 
@@ -20,6 +21,11 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 /// to `REQUEST_TIMEOUT` since a large personal graph can still take a
 /// moment to serialize, but nowhere near `ASK_TIMEOUT`'s generation budget.
 const GRAPH_TIMEOUT: Duration = Duration::from_secs(10);
+/// `forget` deletes rows, then purges LanceDB physically (compaction +
+/// version pruning), which waits for any in-flight background index build.
+const FORGET_TIMEOUT: Duration = Duration::from_secs(300);
+/// GC and backup (Architecture.md §7.5) rewrite or copy the whole store.
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Parser)]
 #[command(name = "neuroosctl", about = "NeuroOS operator CLI")]
@@ -57,6 +63,34 @@ enum Commands {
     Graph {
         #[command(subcommand)]
         action: GraphCommand,
+    },
+    /// Permanently forget an app's history, or everything recorded in a
+    /// recent time window (FR-PRV-03): rows, vectors and keyword index.
+    #[command(group(ArgGroup::new("target").required(true).args(["app", "since"])))]
+    Forget {
+        /// Forget everything recorded for this app_id.
+        #[arg(long)]
+        app: Option<String>,
+        /// Forget everything recorded in the last DURATION (e.g. 30m, 2h, 1d).
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// C3 lifecycle jobs (Architecture.md §7.5; run by the systemd timers).
+    Storage {
+        #[command(subcommand)]
+        action: StorageCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageCommand {
+    /// Expire rows past their domain's retention and vacuum.
+    Gc,
+    /// Snapshot SQLite + LanceDB into the backups directory.
+    Backup {
+        /// Backups to keep (0 = the default, 8).
+        #[arg(long, default_value_t = 0)]
+        keep: u32,
     },
 }
 
@@ -99,6 +133,31 @@ async fn main() {
         Commands::Graph {
             action: GraphCommand::Open,
         } => run_graph_open().await,
+        Commands::Forget { app, since } => {
+            match forget_body(app, since.as_deref(), neuroos_common::now_ns()) {
+                Ok(body) => {
+                    run_storage(&neuroos_common::paths::storage_sock(), body, FORGET_TIMEOUT).await
+                }
+                Err(e) => {
+                    eprintln!("neuroosctl: {e}");
+                    2
+                }
+            }
+        }
+        Commands::Storage { action } => {
+            let job = match action {
+                StorageCommand::Gc => maintenance_request::Job::Gc(GcJob {}),
+                StorageCommand::Backup { keep } => {
+                    maintenance_request::Job::Backup(BackupJob { keep })
+                }
+            };
+            run_storage(
+                &neuroos_common::paths::storage_sock(),
+                envelope::Body::MaintenanceRequest(MaintenanceRequest { job: Some(job) }),
+                MAINTENANCE_TIMEOUT,
+            )
+            .await
+        }
     };
     std::process::exit(exit_code);
 }
@@ -310,6 +369,110 @@ async fn run_ask(question: &str) -> i32 {
     }
 }
 
+/// `30s`, `15m`, `2h`, `1d`, `1w`.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("duration {text:?} needs a unit (s, m, h, d or w)"))?;
+    let (number, unit) = text.split_at(split);
+    let n: u64 = number
+        .parse()
+        .map_err(|_| format!("duration {text:?} must start with a whole number"))?;
+    let secs_per = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => {
+            return Err(format!(
+                "unknown duration unit {unit:?} (use s, m, h, d or w)"
+            ));
+        }
+    };
+    n.checked_mul(secs_per)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration {text:?} is too large"))
+}
+
+/// The `ForgetRequest` for `--app` or `--since` (clap guarantees exactly one).
+fn forget_body(
+    app: Option<String>,
+    since: Option<&str>,
+    now_ns: u64,
+) -> Result<envelope::Body, String> {
+    let target = match (app, since) {
+        (Some(app), _) => forget_request::Target::AppId(app),
+        (None, Some(since)) => {
+            let window = parse_duration(since)?.as_nanos().min(u64::MAX as u128) as u64;
+            forget_request::Target::SinceNs(now_ns.saturating_sub(window))
+        }
+        (None, None) => return Err("give --app or --since".to_string()),
+    };
+    Ok(envelope::Body::ForgetRequest(ForgetRequest {
+        target: Some(target),
+    }))
+}
+
+/// One `storage.sock` round trip for `forget` / `storage gc|backup`, with
+/// a human-readable result. Exit code 0 on success, 1 on failure.
+async fn run_storage(
+    socket_path: &std::path::Path,
+    body: envelope::Body,
+    timeout: Duration,
+) -> i32 {
+    let response = async {
+        let mut stream = connect(socket_path, REQUEST_TIMEOUT)
+            .await
+            .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
+        let request = Envelope {
+            schema_version: 1,
+            trace_id: String::new(),
+            request_id: 0,
+            sent_at_ns: neuroos_common::now_ns(),
+            body: Some(body),
+        };
+        write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+        read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, timeout)
+            .await
+            .map_err(|e| format!("read response: {e}"))?
+            .ok_or_else(|| "neuroos-storage closed the connection with no response".to_string())
+    }
+    .await;
+    match response.map(|env| env.body) {
+        Ok(Some(envelope::Body::ForgetResponse(r))) => {
+            println!("forgotten: {} entities (plus their chunks)", r.forgotten);
+            0
+        }
+        Ok(Some(envelope::Body::MaintenanceResponse(r))) => {
+            if r.backup_path.is_empty() {
+                println!(
+                    "gc: {} entities and {} focus segments expired",
+                    r.entities_deleted, r.focus_history_deleted
+                );
+            } else {
+                println!("backup written to {}", r.backup_path);
+            }
+            0
+        }
+        Ok(Some(envelope::Body::Error(e))) => {
+            eprintln!("neuroosctl: {}", e.message);
+            1
+        }
+        Ok(other) => {
+            eprintln!("neuroosctl: unexpected response: {other:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("neuroosctl: could not reach neuroos-storage: {e}");
+            1
+        }
+    }
+}
+
 async fn run_status(json: bool) -> i32 {
     let report = match fetch_status().await {
         Ok(report) => report,
@@ -448,12 +611,107 @@ mod tests {
         }
     }
 
+    /// L6: these tests point the CLI at their own sockets through
+    /// `XDG_RUNTIME_DIR`/`XDG_DATA_HOME`, which are process-wide. Under
+    /// `cargo test` (one process, many threads) they raced each other;
+    /// every test that sets them holds this for its whole run.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn current_uid() -> u32 {
         // SAFETY: getuid() takes no arguments and cannot fail.
         unsafe extern "C" {
             fn getuid() -> u32;
         }
         unsafe { getuid() }
+    }
+
+    #[test]
+    fn parse_duration_accepts_every_unit_and_rejects_garbage() {
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("30m"), Ok(Duration::from_secs(1_800)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7_200)));
+        assert_eq!(parse_duration("1d"), Ok(Duration::from_secs(86_400)));
+        assert_eq!(parse_duration("1w"), Ok(Duration::from_secs(604_800)));
+        for bad in ["", "h", "12", "1y", "-1h", "1.5h", "99999999999999999999w"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn forget_since_is_now_minus_the_window() {
+        let body = forget_body(None, Some("1h"), 10_000_000_000_000).unwrap();
+        let envelope::Body::ForgetRequest(ForgetRequest {
+            target: Some(forget_request::Target::SinceNs(since)),
+        }) = body
+        else {
+            panic!("expected a since-forget");
+        };
+        assert_eq!(since, 10_000_000_000_000 - 3_600_000_000_000);
+        assert!(forget_body(None, Some("bogus"), 0).is_err());
+    }
+
+    /// H12: `storage gc` / `storage backup` / `forget` really reach
+    /// storage.sock and report the result (exit 0), or exit 1 when C3
+    /// answers with an error or is down.
+    #[tokio::test]
+    async fn storage_commands_round_trip_over_a_real_socket() {
+        use neuroos_ipc::{UdsServer, UdsServerConfig, read_envelope, write_envelope};
+        use neuroos_proto::v1::{ForgetResponse, MaintenanceResponse};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("storage.sock");
+        let server = UdsServer::bind(UdsServerConfig::new(&sock, vec![current_uid()])).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok(Some((mut stream, _))) = server.accept().await else {
+                    continue;
+                };
+                let Ok(Some(req)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await else {
+                    continue;
+                };
+                let body = match req.body {
+                    Some(envelope::Body::ForgetRequest(_)) => {
+                        envelope::Body::ForgetResponse(ForgetResponse { forgotten: 3 })
+                    }
+                    Some(envelope::Body::MaintenanceRequest(MaintenanceRequest {
+                        job: Some(maintenance_request::Job::Backup(_)),
+                    })) => envelope::Body::MaintenanceResponse(MaintenanceResponse {
+                        backup_path: "/tmp/b".into(),
+                        ..Default::default()
+                    }),
+                    _ => envelope::Body::Error(neuroos_proto::v1::Error {
+                        code: 6,
+                        message: "GC failed".into(),
+                        retryable: false,
+                    }),
+                };
+                let resp = Envelope {
+                    body: Some(body),
+                    ..req
+                };
+                let _ = write_envelope(&mut stream, &resp, DEFAULT_MAX_FRAME).await;
+            }
+        });
+
+        let forget = forget_body(Some("org.example".into()), None, 0).unwrap();
+        assert_eq!(run_storage(&sock, forget, FORGET_TIMEOUT).await, 0);
+        let backup = envelope::Body::MaintenanceRequest(MaintenanceRequest {
+            job: Some(maintenance_request::Job::Backup(BackupJob { keep: 0 })),
+        });
+        assert_eq!(run_storage(&sock, backup, MAINTENANCE_TIMEOUT).await, 0);
+        let gc = envelope::Body::MaintenanceRequest(MaintenanceRequest {
+            job: Some(maintenance_request::Job::Gc(GcJob {})),
+        });
+        assert_eq!(
+            run_storage(&sock, gc, MAINTENANCE_TIMEOUT).await,
+            1,
+            "C3 error -> exit 1"
+        );
+        let down = dir.path().join("nobody-listening.sock");
+        let gc = envelope::Body::MaintenanceRequest(MaintenanceRequest {
+            job: Some(maintenance_request::Job::Gc(GcJob {})),
+        });
+        assert_eq!(run_storage(&down, gc, MAINTENANCE_TIMEOUT).await, 1);
     }
 
     #[test]
@@ -523,9 +781,9 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_round_trips_against_a_real_healthd_sock_server() {
+        let _env = ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test process (nextest runs each test in
-        // its own process); no other thread reads env vars concurrently.
+        // SAFETY: ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", dir.path());
         }
@@ -550,6 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_ask_round_trips_against_a_real_knowledge_sock_server() {
+        let _env = ENV_LOCK.lock().await;
         use neuroos_knowledge_query::distill::DistillationCache;
         use neuroos_knowledge_query::inference_client::InferenceClient;
         use neuroos_knowledge_query::kernel_client::KernelClient;
@@ -559,8 +818,7 @@ mod tests {
         use neuroos_testkit::{kernel_mocks, voice_mocks};
 
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test process (nextest runs each test in
-        // its own process); no other thread reads env vars concurrently.
+        // SAFETY: ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", dir.path());
         }
@@ -593,6 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_graph_open_round_trips_and_writes_the_html_file() {
+        let _env = ENV_LOCK.lock().await;
         use neuroos_knowledge_query::distill::DistillationCache;
         use neuroos_knowledge_query::inference_client::InferenceClient;
         use neuroos_knowledge_query::kernel_client::KernelClient;
@@ -603,8 +862,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test process (nextest runs each test in
-        // its own process); no other thread reads env vars concurrently.
+        // SAFETY: ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", dir.path());
             std::env::set_var("XDG_DATA_HOME", data_dir.path());
@@ -648,7 +906,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_graph_open_reports_a_clear_error_when_knowledge_query_is_unreachable() {
-        // SAFETY: single-threaded test process.
+        let _env = ENV_LOCK.lock().await;
+        // SAFETY: ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var(
                 "XDG_RUNTIME_DIR",
@@ -661,7 +920,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_ask_reports_a_clear_error_when_knowledge_query_is_unreachable() {
-        // SAFETY: single-threaded test process.
+        let _env = ENV_LOCK.lock().await;
+        // SAFETY: ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var(
                 "XDG_RUNTIME_DIR",
@@ -674,7 +934,8 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_status_reports_a_clear_error_when_healthd_is_unreachable() {
-        // SAFETY: single-threaded test process.
+        let _env = ENV_LOCK.lock().await;
+        // SAFETY: ENV_LOCK serializes every test that touches these vars.
         unsafe {
             std::env::set_var(
                 "XDG_RUNTIME_DIR",

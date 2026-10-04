@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <csignal>
+#include <filesystem>
 #include <string>
 #include <thread>
 
@@ -12,6 +13,7 @@
 #include "lanes.hpp"
 #include "libneuroos/health_server.hpp"
 #include "libneuroos/paths.hpp"
+#include "libneuroos/sandbox.hpp"
 #include "ring.hpp"
 #include "server.hpp"
 
@@ -37,6 +39,20 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
 
     std::string model_path = neuroos::inference::resolve_model_path(config);
+
+    // H15 / Architecture.md §8.2's C4 row: the model (read) and its own
+    // sockets in the runtime dir, nothing else. Applied before the model
+    // loads and before any thread exists, so every thread inherits it.
+    // Fail closed (rules.md §5.5).
+    std::error_code mkdir_error;
+    std::filesystem::create_directories(neuroos::paths::runtime_dir(), mkdir_error);
+    neuroos::sandbox::Policy policy = neuroos::sandbox::Policy::baseline();
+    policy.read_only.push_back(std::filesystem::path(model_path).parent_path().string());
+    policy.read_write.push_back(neuroos::paths::runtime_dir());
+    if (auto sandboxed = neuroos::sandbox::restrict_self(policy); !sandboxed) {
+        spdlog::error("failed to enter the Landlock sandbox: {}", sandboxed.error().message);
+        return 1;
+    }
     spdlog::info("loading model {} (threads={}, max_context_tokens={})", model_path, config.threads,
                  config.max_context_tokens);
 

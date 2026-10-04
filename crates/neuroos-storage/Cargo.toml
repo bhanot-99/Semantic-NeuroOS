@@ -14,6 +14,7 @@ neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 neuroos-taint = { path = "../neuroos-taint", version = "0.1.0" }
 neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
+neuroos-sandbox = { path = "../neuroos-sandbox", version = "0.1.0" }
 thiserror = "2"
 tracing = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -21,13 +22,15 @@ fastembed = { version = "7", default-features = false, features = ["ort-load-dyn
 lancedb = { version = "=0.39.0", default-features = false }
 arrow-array = "58"
 arrow-schema = "58"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 notify = "6"
+tempfile = "3"
 
 [dev-dependencies]
+rustix = { version = "1", features = ["process"] }
 proptest = "1"
 tempfile = "3"
 neuroos-monitor = { path = "../neuroos-monitor", version = "0.1.0" }
