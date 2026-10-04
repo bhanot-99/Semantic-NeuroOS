@@ -183,15 +183,15 @@ impl InferenceClient {
         let resp = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, CONTROL_DEADLINE)
             .await?
             .ok_or(InferenceClientError::NoResponse)?;
-        match resp.body {
-            Some(envelope::Body::GenerateResponse(r)) if r.accepted => {}
+        let generation_id = match resp.body {
+            Some(envelope::Body::GenerateResponse(r)) if r.accepted => r.generation_id,
             Some(envelope::Body::GenerateResponse(r)) => {
                 return Err(InferenceClientError::Remote(r.error));
             }
             Some(envelope::Body::Error(e)) => return Err(InferenceClientError::Remote(e.message)),
             _ => return Err(InferenceClientError::UnexpectedResponse),
-        }
-        read_all_tokens(ring, max_tokens, GENERATE_DEADLINE).await
+        };
+        read_all_tokens(ring, generation_id, max_tokens, GENERATE_DEADLINE).await
     }
 
     /// FR-KNO-05: distills `chunks` on C4's background lane (implicit in
@@ -216,15 +216,15 @@ impl InferenceClient {
         let resp = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, CONTROL_DEADLINE)
             .await?
             .ok_or(InferenceClientError::NoResponse)?;
-        match resp.body {
-            Some(envelope::Body::DistillResponse(r)) if r.accepted => {}
+        let generation_id = match resp.body {
+            Some(envelope::Body::DistillResponse(r)) if r.accepted => r.generation_id,
             Some(envelope::Body::DistillResponse(r)) => {
                 return Err(InferenceClientError::Remote(r.error));
             }
             Some(envelope::Body::Error(e)) => return Err(InferenceClientError::Remote(e.message)),
             _ => return Err(InferenceClientError::UnexpectedResponse),
-        }
-        read_all_tokens(ring, max_tokens, DISTILL_DEADLINE).await
+        };
+        read_all_tokens(ring, generation_id, max_tokens, DISTILL_DEADLINE).await
     }
 }
 
@@ -236,22 +236,19 @@ impl InferenceClient {
 /// takes tens of ms per Phase 2's own measurements, so 1ms polling is
 /// plenty responsive without truly spin-looping a whole thread).
 ///
-/// `max_tokens` is also a stop condition, not just `FLAG_EOS`: C4's own
-/// `engine.cpp` only sets `FLAG_EOS` when the model's sampler naturally
-/// hits its end-of-generation token (`llama_vocab_is_eog`) -- reaching
-/// `max_tokens` first writes no end-of-stream signal of any kind, so a
-/// reader that trusted `FLAG_EOS` alone would hang until `deadline` on
-/// every capped-length generation. `tests/contract/cpp_inference_smoke.cpp`
-/// already works around this the same way (`pieces >= 8`); see memory.md's
-/// tech debt register for the real fix (C4 should write FLAG_EOS when
-/// max_tokens is reached too).
+/// Reads only `generation_id`'s slots (H7: the ring name is shared, so
+/// another request's tokens can be in it too). C4 ends every job's stream
+/// with a `FLAG_EOS` slot (H8: also at max_tokens, the context limit, on
+/// cancel or failure); `max_tokens` stays a stop condition too, as a
+/// bound in its own right.
 async fn read_all_tokens(
     ring: Ring,
+    generation_id: u64,
     max_tokens: u32,
     deadline: Duration,
 ) -> Result<String, InferenceClientError> {
     tokio::task::spawn_blocking(move || {
-        let mut reader = ring.reader();
+        let mut reader = ring.reader_for_generation(generation_id);
         let mut text = String::new();
         let mut pieces = 0u32;
         let start = Instant::now();

@@ -92,7 +92,12 @@ pub fn maybe_spawn_distillation(
     if raw_evidence_tokens <= DISTILL_THRESHOLD_TOKENS {
         return;
     }
-    let chunks: Vec<String> = raw_evidence.iter().map(|c| c.text.clone()).collect();
+    // H6: C4 builds the distillation prompt straight from these, with
+    // special-token parsing on -- same defusing as the answer prompt.
+    let chunks: Vec<String> = raw_evidence
+        .iter()
+        .map(|c| crate::assemble::defuse_control_tokens(&c.text))
+        .collect();
     let limiter = cache.limiter.clone();
     tokio::spawn(async move {
         // BUG-006: acquired inside the already-detached task, not before

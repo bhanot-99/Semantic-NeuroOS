@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
 use neuroos_proto::v1::{
-    EdgeRow, EntityRow, Envelope, ListEdgesResponse, ListEntitiesResponse,
-    QueryFocusHistoryResponse, envelope,
+    EdgeRow, EntityRow, Envelope, ListEdgesResponse, ListEntitiesResponse, QueryActivityResponse,
+    QueryFocusHistoryResponse, QueryHybridResponse, envelope,
 };
 
 /// Accepts connections, records the `Instant` its first
@@ -95,6 +95,57 @@ pub fn spawn_fixed_graph(
                             envelope::Body::ListEdgesResponse(ListEdgesResponse {
                                 edges: edges.clone(),
                             })
+                        }
+                        _ => return,
+                    };
+                    let resp = Envelope {
+                        schema_version: 1,
+                        trace_id: env.trace_id,
+                        request_id: env.request_id,
+                        sent_at_ns: 0,
+                        body: Some(body),
+                    };
+                    if write_envelope(&mut stream, &resp, DEFAULT_MAX_FRAME)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Answers every query `ask()` makes (`QueryFocusHistory`,
+/// `QueryHybridVectorText`, `QueryActivity`) with an empty result: a C3
+/// that is up but has recorded nothing relevant, so `ask()` declines with
+/// its no-evidence answer without ever calling C4 or C6.
+pub fn spawn_empty(sock_path: impl AsRef<Path>, allowed_uid: u32) {
+    let sock_path = sock_path.as_ref().to_path_buf();
+    tokio::spawn(async move {
+        let Ok(server) = UdsServer::bind(UdsServerConfig::new(sock_path, vec![allowed_uid])) else {
+            return;
+        };
+        loop {
+            let Ok(Some((mut stream, _cred))) = server.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                while let Ok(Some(env)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
+                    let body = match env.body {
+                        Some(envelope::Body::QueryFocusHistoryRequest(_)) => {
+                            envelope::Body::QueryFocusHistoryResponse(QueryFocusHistoryResponse {
+                                row: None,
+                            })
+                        }
+                        Some(envelope::Body::QueryHybridRequest(_)) => {
+                            envelope::Body::QueryHybridResponse(QueryHybridResponse {
+                                matches: Vec::new(),
+                            })
+                        }
+                        Some(envelope::Body::QueryActivityRequest(_)) => {
+                            envelope::Body::QueryActivityResponse(QueryActivityResponse::default())
                         }
                         _ => return,
                     };

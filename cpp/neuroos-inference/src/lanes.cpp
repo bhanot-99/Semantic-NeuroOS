@@ -111,6 +111,7 @@ void LaneScheduler::worker_loop(std::deque<QueueEntry>& queue, std::mutex& queue
         auto sink =
             rings_.get_or_create(entry.job.ring_name, /*capacity_slots=*/0, /*slot_size=*/0);
         int tokens_produced = 0;
+        bool eos_written = false;
         auto should_cancel = [&entry, &extra_yield_check, this] {
             if (shutdown_.load(std::memory_order_acquire)) {
                 return true;
@@ -124,14 +125,26 @@ void LaneScheduler::worker_loop(std::deque<QueueEntry>& queue, std::mutex& queue
         auto result = ctx.generate(
             entry.job.prompt, entry.job.max_tokens, entry.job.temperature, entry.job.seed,
             entry.job.grammar_gbnf, entry.job.repetition_penalty,
-            [&sink, &tokens_produced](const GeneratedToken& token) {
+            [&sink, &tokens_produced, &eos_written, &entry](const GeneratedToken& token) {
                 ++tokens_produced;
                 std::uint16_t flags = token.is_eos ? neuroos::shm::kFlagEos : 0;
-                sink.write(token.token_id, flags,
-                           reinterpret_cast<const std::uint8_t*>(token.text.data()),
-                           token.text.size());
+                eos_written = eos_written || token.is_eos;
+                sink.write_as(entry.job.generation_id, token.token_id, flags,
+                              reinterpret_cast<const std::uint8_t*>(token.text.data()),
+                              token.text.size());
             },
             should_cancel);
+        // H8: every job's stream ends with an end-of-stream slot -- also
+        // when it stopped at max_tokens or the context limit, was
+        // cancelled, or failed -- so a reader never waits out its deadline
+        // for a token that will never come.
+        if (!eos_written) {
+            std::uint16_t flags = neuroos::shm::kFlagEos;
+            if (entry.cancelled->load(std::memory_order_acquire)) {
+                flags |= neuroos::shm::kFlagCancel;
+            }
+            sink.write_as(entry.job.generation_id, 0, flags, nullptr, 0);
+        }
         spdlog::debug("generation {} produced {} tokens, ok={}", entry.job.generation_id,
                       tokens_produced, static_cast<bool>(result));
         if (!result) {

@@ -421,8 +421,8 @@ pub fn forget_by_app(conn: &Connection, app_id: &str) -> Result<Vec<i64>, Storag
 }
 
 /// Same, but for everything recorded at or after `since_ns` (an absolute
-/// UTC-ns cutoff — `neuroosctl forget --since 1h` becomes `since_ns = now
-/// - 1h` at the call site). Entities created in the window are deleted
+/// UTC-ns cutoff — `neuroosctl forget --since 1h` becomes
+/// `since_ns = now - 1h` at the call site). Entities created in the window are deleted
 /// outright; an older entity keeps its row but loses every chunk and
 /// focus segment from the window — including a segment that started
 /// before the cutoff but was still on screen after it.

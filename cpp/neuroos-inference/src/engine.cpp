@@ -278,6 +278,13 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
         if (eos) {
             break;
         }
+        // H8: the KV cache holds n_ctx tokens. Once it's full, decoding
+        // the next one fails, so stop here instead: the caller ends the
+        // stream cleanly (FR-INF-02's max_context_tokens bounds prompt and
+        // completion together).
+        if (resident_tokens_.size() >= n_ctx()) {
+            break;
+        }
 
         llama_batch next_batch =
             llama_batch_get_one(&next, 1, static_cast<llama_pos>(resident_tokens_.size()), 0);
