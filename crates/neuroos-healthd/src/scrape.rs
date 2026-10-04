@@ -13,6 +13,15 @@ use crate::targets::Target;
 pub async fn scrape_one(target: &Target, timeout: Duration) -> ComponentRecord {
     match scrape_one_inner(target, timeout).await {
         Ok(record) => apply_cgroup_usage(record, target).apply_budget_alert(),
+        // M4: `ComponentRecord::unknown`'s doc comment draws the line at
+        // reachability -- "DOWN means was reachable, now isn't" -- so a
+        // target whose socket cannot even be connected to may simply not
+        // be installed or not started yet, which is UNKNOWN, not DOWN. A
+        // target that accepts the connection and then hangs, crashes or
+        // answers garbage *is* reachable and broken: that is DOWN.
+        // `Aggregate::update` promotes UNKNOWN to DOWN for a target that
+        // had answered before, since that one really did die.
+        Err(ScrapeError::Connect(_)) => ComponentRecord::unknown(target),
         Err(_) => down_record(target),
     }
 }
@@ -160,13 +169,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_target_is_down() {
+    /// M4: a socket that cannot be connected to at all is UNKNOWN, not
+    /// DOWN -- the component may simply not be installed or started yet.
+    /// `Aggregate::update` is what turns this into DOWN for a target that
+    /// had already answered once.
+    async fn unreachable_target_is_unknown_not_down() {
         let t = target(
             "nope",
             PathBuf::from("/tmp/neuroos-healthd-test-nonexistent.sock"),
         );
         let record = scrape_one(&t, Duration::from_millis(200)).await;
-        assert_eq!(record.status, neuroos_proto::v1::Status::Down);
+        assert_eq!(record.status, neuroos_proto::v1::Status::Unknown);
     }
 
     #[tokio::test]

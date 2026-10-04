@@ -98,6 +98,10 @@ async fn run(args: Args, monitor_cfg: neuroos_common::config::MonitorConfig) {
     // P0-S04: a health endpoint is one line.
     let health =
         neuroos_health::HealthServer::new(concat!("neuroos-monitor v", env!("CARGO_PKG_VERSION")));
+    // M3: the sensors report through this same endpoint, so C1 shows
+    // DEGRADED while any of them is down instead of always OK.
+    let sensor_health =
+        neuroos_monitor::sensor_health::SensorHealth::new(std::sync::Arc::clone(&health));
     tokio::spawn(health.serve(
         neuroos_common::paths::component_health_sock("neuroos-monitor"),
         vec![my_uid],
@@ -118,13 +122,19 @@ async fn run(args: Args, monitor_cfg: neuroos_common::config::MonitorConfig) {
     tokio::spawn(sensors::wayland_cosmic::run_forever(
         bus.clone(),
         privacy.clone(),
+        sensor_health.clone(),
     ));
     tokio::spawn(sensors::idle::run_forever(
         monitor_cfg.idle_timeout_s.saturating_mul(1000),
         bus.clone(),
         privacy.clone(),
+        sensor_health.clone(),
     ));
-    tokio::spawn(sensors::mpris::run_forever(bus.clone(), privacy.clone()));
+    tokio::spawn(sensors::mpris::run_forever(
+        bus.clone(),
+        privacy.clone(),
+        sensor_health.clone(),
+    ));
     let folder_watches = monitor_cfg
         .folders
         .iter()
@@ -137,6 +147,7 @@ async fn run(args: Args, monitor_cfg: neuroos_common::config::MonitorConfig) {
         folder_watches,
         bus.clone(),
         privacy.clone(),
+        sensor_health,
     ));
     tokio::spawn(resource_and_focus_loop(
         Duration::from_secs(monitor_cfg.resource_sample_interval_s.max(1) as u64),

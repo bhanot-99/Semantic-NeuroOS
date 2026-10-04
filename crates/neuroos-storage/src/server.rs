@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use neuroos_health::HealthServer;
 use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
 use neuroos_proto::v1::{
     ActivityItem, ChunkMatch, EdgeRow, EntityRow, Envelope, Error, ErrorCode, FocusHistoryRow,
@@ -19,6 +20,33 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use crate::engine::StorageEngine;
+
+/// M3: C3's health endpoint reported OK no matter what, because nothing
+/// ever called `incr_error`/`set_status`. Every request now lands in a
+/// latency histogram under its kind's label and, when it fails, in an
+/// error counter under the same label (a stable identifier, never user
+/// content -- rules.md R0-6).
+fn request_label(body: Option<&envelope::Body>) -> &'static str {
+    match body {
+        Some(envelope::Body::QueryFocusHistoryRequest(_)) => "query_focus_history",
+        Some(envelope::Body::QueryActivityRequest(_)) => "query_activity",
+        Some(envelope::Body::QueryHybridRequest(_)) => "query_hybrid",
+        Some(envelope::Body::ForgetRequest(_)) => "forget",
+        Some(envelope::Body::ListEntitiesRequest(_)) => "list_entities",
+        Some(envelope::Body::ListEdgesRequest(_)) => "list_edges",
+        Some(envelope::Body::UpsertEdgeRequest(_)) => "upsert_edge",
+        Some(envelope::Body::PruneEdgesRequest(_)) => "prune_edges",
+        Some(envelope::Body::MaintenanceRequest(_)) => "maintenance",
+        _ => "unsupported",
+    }
+}
+
+/// Counter name for a telemetry event C1 sent that could not be ingested.
+pub const INGEST_FAILED: &str = "ingest_failed";
+/// Counter name (and degraded reason) for the C1 -> C3 feed being down.
+pub const MONITOR_FEED_DOWN: &str = "monitor_feed_disconnected";
+/// Counter name for a spool document C7 left that could not be ingested.
+pub const SPOOL_FAILED: &str = "spool_ingest_failed";
 
 /// `rusqlite::Connection` (inside `StorageEngine`) is `!Sync` (it uses
 /// `RefCell` internally), so a future that holds `&StorageEngine` across an
@@ -35,16 +63,20 @@ pub async fn serve(engine: Arc<Mutex<StorageEngine>>, path: PathBuf, allowed_uid
         path,
         allowed_uids,
         neuroos_common::paths::backups_dir(),
+        HealthServer::new(concat!("neuroos-storage v", env!("CARGO_PKG_VERSION"))),
     )
     .await;
 }
 
-/// [`serve`], writing `storage backup` snapshots under `backups_dir`.
+/// [`serve`], writing `storage backup` snapshots under `backups_dir` and
+/// reporting into `health` (the same endpoint C3's health socket serves,
+/// so a caller can read back what the requests recorded -- M3).
 pub async fn serve_with_backups_dir(
     engine: Arc<Mutex<StorageEngine>>,
     path: PathBuf,
     allowed_uids: Vec<u32>,
     backups_dir: PathBuf,
+    health: Arc<HealthServer>,
 ) {
     let local = tokio::task::LocalSet::new();
     local
@@ -53,6 +85,7 @@ pub async fn serve_with_backups_dir(
             path,
             allowed_uids,
             Arc::new(backups_dir),
+            health,
         ))
         .await;
 }
@@ -72,6 +105,7 @@ pub async fn run_service(
     engine: Arc<Mutex<StorageEngine>>,
     paths: ServicePaths,
     allowed_uids: Vec<u32>,
+    health: Arc<HealthServer>,
 ) {
     let local = tokio::task::LocalSet::new();
     local
@@ -79,17 +113,20 @@ pub async fn run_service(
             tokio::task::spawn_local(crate::monitor_feed::subscribe_forever(
                 Arc::clone(&engine),
                 paths.monitor_sock,
+                Arc::clone(&health),
             ));
             let spool_engine = Arc::clone(&engine);
             let spool_dir = paths.spool_dir;
+            let spool_health = Arc::clone(&health);
             tokio::task::spawn_local(async move {
-                crate::spool::watch_forever(&spool_engine, &spool_dir).await;
+                crate::spool::watch_forever(&spool_engine, &spool_dir, &spool_health).await;
             });
             serve_local(
                 engine,
                 paths.storage_sock,
                 allowed_uids,
                 Arc::new(paths.backups_dir),
+                health,
             )
             .await;
         })
@@ -101,6 +138,7 @@ async fn serve_local(
     path: PathBuf,
     allowed_uids: Vec<u32>,
     backups_dir: Arc<PathBuf>,
+    health: Arc<HealthServer>,
 ) {
     let server = match UdsServer::bind(UdsServerConfig::new(path, allowed_uids)) {
         Ok(s) => s,
@@ -116,6 +154,7 @@ async fn serve_local(
                     stream,
                     Arc::clone(&engine),
                     Arc::clone(&backups_dir),
+                    Arc::clone(&health),
                 ));
             }
             Ok(None) => continue, // this one connection failed; keep serving
@@ -133,6 +172,7 @@ async fn handle_conn(
     mut stream: UnixStream,
     engine: Arc<Mutex<StorageEngine>>,
     backups_dir: Arc<PathBuf>,
+    health: Arc<HealthServer>,
 ) {
     loop {
         let env = match read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
@@ -143,7 +183,15 @@ async fn handle_conn(
                 return;
             }
         };
+        let label = request_label(env.body.as_ref());
+        let started = std::time::Instant::now();
         let response = handle_request(env, &engine, &backups_dir).await;
+        health.record_latency(label, started.elapsed());
+        // M3: one failed request is counted but does not make C3 sick --
+        // see `HealthServer::set_status`'s doc comment for the convention.
+        if matches!(response.body, Some(envelope::Body::Error(_))) {
+            health.incr_error(label);
+        }
         if write_envelope(&mut stream, &response, DEFAULT_MAX_FRAME)
             .await
             .is_err()
@@ -785,8 +833,10 @@ mod tests {
                     .body
             }
         };
+        let health = HealthServer::new("neuroos-storage test");
+        let observed = Arc::clone(&health);
         tokio::select! {
-            _ = serve_with_backups_dir(Arc::new(Mutex::new(engine)), sock_path.clone(), vec![current_uid()], backups.clone()) => {
+            _ = serve_with_backups_dir(Arc::new(Mutex::new(engine)), sock_path.clone(), vec![current_uid()], backups.clone(), health) => {
                 panic!("storage.sock server exited unexpectedly");
             }
             _ = async {
@@ -800,7 +850,45 @@ mod tests {
                 let path = std::path::PathBuf::from(&r.backup_path);
                 assert!(path.starts_with(&backups), "{path:?}");
                 assert!(path.join("meta.sqlite3").exists());
+                // M3: both succeeded, so they are timed but not counted as
+                // errors -- C3's endpoint reported a flat OK with no
+                // histograms at all before the fix.
+                let snap = observed.snapshot();
+                assert_eq!(
+                    snap.latency_histograms.get("maintenance").map(|h| h.count),
+                    Some(2),
+                    "{:?}", snap.latency_histograms.keys().collect::<Vec<_>>()
+                );
+                assert!(snap.error_counters.is_empty(), "{:?}", snap.error_counters);
             } => {}
         }
+    }
+
+    /// M3: every request kind the socket serves has a stable label, so its
+    /// latency histogram and error counter are findable by name. A kind
+    /// missing from `request_label` would silently land in "unsupported".
+    #[test]
+    fn every_served_request_kind_has_its_own_label() {
+        use neuroos_proto::v1::{
+            ForgetRequest, ListEdgesRequest, ListEntitiesRequest, MaintenanceRequest,
+            PruneEdgesRequest, QueryActivityRequest, QueryFocusHistoryRequest, QueryHybridRequest,
+            UpsertEdgeRequest,
+        };
+        let kinds = [
+            envelope::Body::QueryFocusHistoryRequest(QueryFocusHistoryRequest::default()),
+            envelope::Body::QueryActivityRequest(QueryActivityRequest::default()),
+            envelope::Body::QueryHybridRequest(QueryHybridRequest::default()),
+            envelope::Body::ForgetRequest(ForgetRequest::default()),
+            envelope::Body::ListEntitiesRequest(ListEntitiesRequest::default()),
+            envelope::Body::ListEdgesRequest(ListEdgesRequest::default()),
+            envelope::Body::UpsertEdgeRequest(UpsertEdgeRequest::default()),
+            envelope::Body::PruneEdgesRequest(PruneEdgesRequest::default()),
+            envelope::Body::MaintenanceRequest(MaintenanceRequest::default()),
+        ];
+        let labels: std::collections::BTreeSet<&str> =
+            kinds.iter().map(|b| request_label(Some(b))).collect();
+        assert_eq!(labels.len(), kinds.len(), "labels collide: {labels:?}");
+        assert!(!labels.contains("unsupported"), "{labels:?}");
+        assert_eq!(request_label(None), "unsupported");
     }
 }

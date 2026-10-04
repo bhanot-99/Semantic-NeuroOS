@@ -48,14 +48,40 @@ impl HealthServer {
         })
     }
 
+    /// The status this component reports to healthd. M3 fixed the fact
+    /// that nothing ever called this, so every endpoint always said OK:
+    /// the convention across components is now
+    ///
+    /// * a failure that costs one request -> [`Self::incr_error`] only; one
+    ///   bad request does not make the component sick, and healthd's own
+    ///   scrape is what decides when the error *rate* matters;
+    /// * a subsystem that has stopped working -- a sensor that lost its
+    ///   bus, a feed that cannot reconnect -- -> `incr_error` plus
+    ///   `set_status(Degraded)`, cleared back to `Ok` once it recovers;
+    /// * a component that cannot serve at all -> `Status::Down` is never
+    ///   self-reported: it is what healthd records when the scrape itself
+    ///   fails, since a process that cannot answer cannot say so.
     pub fn set_status(&self, status: Status) {
         self.status.store(status as i32, Ordering::Relaxed);
     }
 
+    pub fn status(&self) -> i32 {
+        self.status.load(Ordering::Relaxed)
+    }
+
+    /// Counts one occurrence of a named failure class (`name` is a stable
+    /// identifier, never user content -- rules.md R0-6).
     pub fn incr_error(&self, name: &str) {
         *lock(&self.error_counters)
             .entry(name.to_string())
             .or_insert(0) += 1;
+    }
+
+    /// Counts the failure *and* reports the component as degraded: for a
+    /// subsystem that has stopped working, not a single failed request.
+    pub fn report_degraded(&self, name: &str) {
+        self.incr_error(name);
+        self.set_status(Status::Degraded);
     }
 
     /// Records `duration` under a named latency histogram, creating it on first use.
@@ -139,6 +165,29 @@ mod tests {
     use super::*;
     use neuroos_ipc::connect;
     use neuroos_proto::v1::HealthRequest;
+
+    /// M3: nothing in production called `set_status`/`incr_error`, so
+    /// every component's endpoint reported OK no matter what. These are
+    /// the two reporting shapes the components now use.
+    #[test]
+    fn one_failed_request_counts_without_making_the_component_sick() {
+        let h = HealthServer::new("test v0");
+        h.incr_error("query");
+        let snap = h.snapshot();
+        assert_eq!(snap.error_counters.get("query"), Some(&1));
+        assert_eq!(snap.status, Status::Ok as i32);
+    }
+
+    #[test]
+    fn a_stopped_subsystem_counts_and_reports_degraded() {
+        let h = HealthServer::new("test v0");
+        h.report_degraded("sensor_mpris");
+        let snap = h.snapshot();
+        assert_eq!(snap.error_counters.get("sensor_mpris"), Some(&1));
+        assert_eq!(snap.status, Status::Degraded as i32);
+        h.set_status(Status::Ok);
+        assert_eq!(h.snapshot().status, Status::Ok as i32);
+    }
 
     #[test]
     fn snapshot_reflects_recorded_data() {

@@ -10,6 +10,7 @@ use zbus::{Connection, proxy};
 
 use crate::bus::EventBus;
 use crate::privacy::PrivacyState;
+use crate::sensor_health::{SensorHealth, supervise};
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{MprisEvent, RawTelemetryEvent};
 
@@ -43,14 +44,13 @@ trait MprisPlayer {
 /// Runs the MPRIS sensor forever, reconnecting with backoff if the D-Bus
 /// connection itself drops (AB-10; FI: "D-Bus player vanishing" is handled
 /// per-player inside the loop, not by tearing this down).
-pub async fn run_forever(bus: EventBus, privacy: PrivacyState) {
-    let mut backoff_ms = 100u64;
-    loop {
-        let e = run_once(&bus, &privacy).await;
-        tracing::warn!(error = %e, "MPRIS sensor stopped; reconnecting");
-        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(10_000);
-    }
+pub async fn run_forever(bus: EventBus, privacy: PrivacyState, health: SensorHealth) {
+    supervise("mpris", health, move || {
+        let bus = bus.clone();
+        let privacy = privacy.clone();
+        async move { Err(run_once(&bus, &privacy).await) }
+    })
+    .await;
 }
 
 /// Only ever returns once the sensor has stopped, so the return value is

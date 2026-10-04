@@ -39,8 +39,7 @@ async fn killed_mock_is_reported_down_next_cycle_without_crashing_healthd() {
     let aggregate = Arc::new(Aggregate::new(&targets));
 
     // Cycle 1: the mock is alive and healthy.
-    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300), true)
-        .await;
+    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300)).await;
     assert_eq!(aggregate.snapshot()[0].status, Status::Ok);
 
     // Kill it mid-flight, as a crash would.
@@ -49,24 +48,10 @@ async fn killed_mock_is_reported_down_next_cycle_without_crashing_healthd() {
 
     // Cycle 2: healthd itself must not panic or hang, and must reclassify
     // the target as DOWN within this one cycle.
-    neuroos_healthd::scrape_cycle(
-        &targets,
-        &aggregate,
-        None,
-        Duration::from_millis(300),
-        false,
-    )
-    .await;
+    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300)).await;
     assert_eq!(aggregate.snapshot()[0].status, Status::Down);
 
     // And healthd keeps working afterward — not stuck in a bad state.
-    neuroos_healthd::scrape_cycle(
-        &targets,
-        &aggregate,
-        None,
-        Duration::from_millis(300),
-        false,
-    )
-    .await;
+    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300)).await;
     assert_eq!(aggregate.snapshot()[0].status, Status::Down);
 }

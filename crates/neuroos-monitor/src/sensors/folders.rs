@@ -10,6 +10,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event
 
 use crate::bus::EventBus;
 use crate::privacy::PrivacyState;
+use crate::sensor_health::{SensorHealth, supervise};
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{FileActivityEvent, FileActivityKind, RawTelemetryEvent};
 
@@ -28,28 +29,34 @@ pub struct Watch {
 /// Runs the folder sensor forever, reconnecting with backoff if the watcher
 /// itself fails (AB-10). A single missing configured path is logged and
 /// skipped rather than failing the whole sensor.
-pub async fn run_forever(watches: Vec<Watch>, bus: EventBus, privacy: PrivacyState) {
+pub async fn run_forever(
+    watches: Vec<Watch>,
+    bus: EventBus,
+    privacy: PrivacyState,
+    health: SensorHealth,
+) {
     if watches.is_empty() {
+        // Configured off, not failed: it never reports to `health` at all.
         return;
     }
-    let mut backoff_ms = 100u64;
     let stop = Arc::new(AtomicBool::new(false)); // production: never asked to stop
-    loop {
+    supervise("folders", health, move || {
         let watches = watches.clone();
         let bus = bus.clone();
         let privacy = privacy.clone();
         let stop = Arc::clone(&stop);
-        let result =
-            tokio::task::spawn_blocking(move || run_with_stop(&watches, &bus, &privacy, &stop))
-                .await;
-        match result {
-            Ok(Ok(())) => unreachable!("stop is never requested outside tests"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "folder sensor stopped; reconnecting"),
-            Err(e) => tracing::warn!(error = %e, "folder sensor thread panicked; reconnecting"),
+        async move {
+            match tokio::task::spawn_blocking(move || {
+                run_with_stop(&watches, &bus, &privacy, &stop)
+            })
+            .await
+            {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(e) => Err(format!("sensor thread panicked: {e}")),
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(10_000);
-    }
+    })
+    .await;
 }
 
 /// Polling period for the cooperative-cancellation check in

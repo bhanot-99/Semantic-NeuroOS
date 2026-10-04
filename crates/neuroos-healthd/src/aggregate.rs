@@ -55,6 +55,13 @@ impl ComponentRecord {
 #[derive(Default)]
 pub struct Aggregate {
     records: Mutex<HashMap<String, ComponentRecord>>,
+    /// Targets that have answered a scrape at least once. M4: `scrape_one`
+    /// has no history of its own, so it reports every failure as DOWN --
+    /// including the very first one, which contradicts
+    /// [`ComponentRecord::unknown`]'s documented distinction ("DOWN means
+    /// was reachable, now isn't"). The aggregate is where that history
+    /// lives, so it is where the demotion to UNKNOWN happens.
+    ever_reached: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Aggregate {
@@ -65,12 +72,37 @@ impl Aggregate {
             .collect();
         Self {
             records: Mutex::new(records),
+            ever_reached: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    pub fn update(&self, record: ComponentRecord) {
+    pub fn update(&self, mut record: ComponentRecord) {
+        match record.status {
+            // Unreachable (`scrape_one` could not connect). If it answered
+            // at some point in this healthd's life, it did not fail to
+            // start -- it died, which is DOWN.
+            Status::Unknown if self.ever_reached(&record.name) => {
+                record.status = Status::Down;
+            }
+            Status::Ok | Status::Degraded => {
+                self.ever_reached
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(record.name.clone());
+            }
+            _ => {}
+        }
         let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         records.insert(record.name.clone(), record);
+    }
+
+    /// Whether `name` has answered a scrape at least once -- the soak
+    /// engine's cue that a baseline captured now would be real (M4).
+    pub fn ever_reached(&self, name: &str) -> bool {
+        self.ever_reached
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(name)
     }
 
     pub fn snapshot(&self) -> Vec<ComponentRecord> {
@@ -116,6 +148,42 @@ mod tests {
         let got = get(&agg, "a").unwrap();
         assert_eq!(got.status, Status::Ok);
         assert_eq!(got.rss_bytes, 123);
+    }
+
+    /// M4: a target that has never been reachable is UNKNOWN (it may not
+    /// be installed yet), which `ComponentRecord::unknown`'s own doc
+    /// comment already said but nothing honoured.
+    #[test]
+    fn a_target_that_was_never_reachable_stays_unknown() {
+        let agg = Aggregate::new(&[target("a", 10)]);
+        agg.update(ComponentRecord::unknown(&target("a", 10)));
+        assert_eq!(get(&agg, "a").unwrap().status, Status::Unknown);
+        assert!(!agg.ever_reached("a"));
+    }
+
+    /// Once it has answered, becoming unreachable means it died: DOWN.
+    #[test]
+    fn a_target_that_answered_once_is_down_when_it_disappears() {
+        let agg = Aggregate::new(&[target("a", 10)]);
+        let mut up = ComponentRecord::unknown(&target("a", 10));
+        up.status = Status::Ok;
+        agg.update(up);
+        assert!(agg.ever_reached("a"));
+
+        agg.update(ComponentRecord::unknown(&target("a", 10)));
+        assert_eq!(get(&agg, "a").unwrap().status, Status::Down);
+    }
+
+    /// A target that accepts the connection and then misbehaves is
+    /// reachable and broken, so `scrape_one` reports DOWN directly and the
+    /// aggregate leaves it alone.
+    #[test]
+    fn a_reachable_but_broken_target_is_down_on_the_first_failure() {
+        let agg = Aggregate::new(&[target("a", 10)]);
+        let mut rec = ComponentRecord::unknown(&target("a", 10));
+        rec.status = Status::Down;
+        agg.update(rec);
+        assert_eq!(get(&agg, "a").unwrap().status, Status::Down);
     }
 
     #[test]

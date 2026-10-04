@@ -21,19 +21,28 @@ std::uint64_t now_ns() {
                                           .count());
 }
 
+// M3: stable identifiers for C4's health counters, never user content
+// (rules.md R0-6).
+constexpr const char* kGenerateRejected = "generate_rejected";
+constexpr const char* kDistillRejected = "distill_rejected";
+constexpr const char* kLaneQueueFull = "lane_queue_full";
+constexpr const char* kUnsupportedRequest = "unsupported_request";
+
 void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envelope& resp,
                      LaneScheduler& lanes, RingRegistry& rings, const Model& model,
-                     std::uint32_t max_context_tokens) {
+                     std::uint32_t max_context_tokens, neuroos::health::HealthServer& health) {
     auto* out = resp.mutable_generate_response();
     if (req.ring_name().empty()) {
         out->set_accepted(false);
         out->set_error("ring_name is required (AttachRingRequest it first)");
+        health.incr_error(kGenerateRejected);
         return;
     }
     if (!rings.exists(req.ring_name())) {
         out->set_accepted(false);
         out->set_error("unknown ring_name: " + req.ring_name() +
                        " (call AttachRingRequest before Generate)");
+        health.incr_error(kGenerateRejected);
         return;
     }
     // phases.md §5.3 FI: "oversized prompt rejected" — reject synchronously,
@@ -47,6 +56,7 @@ void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envel
         out->set_error("prompt (" + std::to_string(prompt_tokens) +
                        " tokens) exceeds max_context_tokens (" +
                        std::to_string(max_context_tokens) + ")");
+        health.incr_error(kGenerateRejected);
         return;
     }
     auto writer = rings.get_or_create(req.ring_name(), 0, 0);
@@ -70,15 +80,18 @@ void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envel
     out->set_accepted(accepted);
     if (!accepted) {
         out->set_error("lane queue is full");
+        health.incr_error(kLaneQueueFull);
     }
 }
 
 void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelope& resp,
-                    LaneScheduler& lanes, RingRegistry& rings) {
+                    LaneScheduler& lanes, RingRegistry& rings,
+                    neuroos::health::HealthServer& health) {
     auto* out = resp.mutable_distill_response();
     if (req.ring_name().empty() || !rings.exists(req.ring_name())) {
         out->set_accepted(false);
         out->set_error("unknown or missing ring_name");
+        health.incr_error(kDistillRejected);
         return;
     }
     std::ostringstream prompt;
@@ -102,11 +115,13 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
     out->set_accepted(accepted);
     if (!accepted) {
         out->set_error("background lane queue is full");
+        health.incr_error(kLaneQueueFull);
     }
 }
 
 void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lanes,
-                       RingRegistry& rings, std::uint32_t max_context_tokens) {
+                       RingRegistry& rings, std::uint32_t max_context_tokens,
+                       neuroos::health::HealthServer& health) {
     for (;;) {
         auto req = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
         if (!req || !req.value().has_value()) {
@@ -122,7 +137,8 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
         int fd_to_send = -1;
         switch (in.body_case()) {
         case neuroos::v1::Envelope::kGenerateRequest:
-            handle_generate(in.generate_request(), resp, lanes, rings, *model, max_context_tokens);
+            handle_generate(in.generate_request(), resp, lanes, rings, *model, max_context_tokens,
+                            health);
             break;
         case neuroos::v1::Envelope::kCancelRequest: {
             bool cancelled = lanes.cancel(in.cancel_request().generation_id());
@@ -130,7 +146,7 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
             break;
         }
         case neuroos::v1::Envelope::kDistillRequest:
-            handle_distill(in.distill_request(), resp, lanes, rings);
+            handle_distill(in.distill_request(), resp, lanes, rings, health);
             break;
         case neuroos::v1::Envelope::kAttachRingRequest: {
             const auto& areq = in.attach_ring_request();
@@ -152,6 +168,7 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
             break;
         }
         default:
+            health.incr_error(kUnsupportedRequest);
             continue; // not ours (e.g. HealthRequest goes to the separate health server)
         }
 
@@ -174,7 +191,7 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
 
 void serve(const std::string& socket_path, std::vector<std::uint32_t> allowed_uids,
            std::shared_ptr<Model> model, LaneScheduler& lanes, RingRegistry& rings,
-           std::uint32_t max_context_tokens) {
+           std::uint32_t max_context_tokens, neuroos::health::HealthServer& health) {
     auto server = neuroos::ipc::UdsServer::bind(socket_path, std::move(allowed_uids));
     if (!server) {
         spdlog::error("inference.sock bind failed: {}", server.error().message);
@@ -196,7 +213,7 @@ void serve(const std::string& socket_path, std::vector<std::uint32_t> allowed_ui
         }
         int fd = accepted.value()->first;
         std::thread(handle_connection, fd, model, std::ref(lanes), std::ref(rings),
-                    max_context_tokens)
+                    max_context_tokens, std::ref(health))
             .detach();
     }
 }

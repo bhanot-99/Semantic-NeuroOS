@@ -15,12 +15,30 @@ use std::time::Duration;
 /// Runs one scrape cycle against every target, updating `aggregate` (and
 /// `soak_engine`, if given) in place. `capture_baseline` should be `true`
 /// only for the very first cycle.
+/// The soak figure for one component: the worst p99 across its latency
+/// histograms.
+///
+/// M4: this used to be `latency_histograms.values().next()` -- whichever
+/// histogram a `HashMap` iterator happened to yield first, which differs
+/// run to run and even cycle to cycle, so a component with more than one
+/// histogram was compared against a baseline taken from a *different*
+/// operation. The maximum is both deterministic and the figure a drift
+/// alert should be about: the slowest thing the component does.
+fn soak_p99_ns(
+    histograms: &std::collections::HashMap<String, neuroos_proto::v1::LatencyHistogram>,
+) -> u64 {
+    histograms
+        .values()
+        .filter_map(neuroos_health::p99_ns)
+        .max()
+        .unwrap_or(0)
+}
+
 pub async fn scrape_cycle(
     targets: &[targets::Target],
     aggregate: &aggregate::Aggregate,
     soak_engine: Option<&soak::SoakEngine>,
     per_target_timeout: Duration,
-    capture_baseline: bool,
 ) {
     let handles: Vec<_> = targets
         .iter()
@@ -39,23 +57,37 @@ pub async fn scrape_cycle(
             }
         };
 
-        if let Some(engine) = soak_engine {
-            let p99 = record
-                .latency_histograms
-                .values()
-                .next()
-                .and_then(neuroos_health::p99_ns)
-                .unwrap_or(0);
-            if capture_baseline {
+        let soak_sample = soak_engine.map(|engine| {
+            (
+                engine,
+                soak_p99_ns(&record.latency_histograms),
+                record.name.clone(),
+                record.rss_bytes,
+            )
+        });
+
+        // M4: the baseline used to be captured on the *first cycle* for
+        // every target at once, so a component that was down (or simply
+        // not started) then got a baseline of zeros -- and
+        // `check_breaches` never breaches against a zero baseline, so it
+        // was excluded from soak monitoring for the rest of the run. It is
+        // captured per component instead, on the first cycle that
+        // component actually answers.
+        let was_reached = aggregate.ever_reached(&record.name);
+        aggregate.update(record);
+
+        if let Some((engine, p99, name, rss_bytes)) = soak_sample {
+            let reached_now = aggregate.ever_reached(&name);
+            if reached_now && (!was_reached || engine.baseline_for(&name).is_none()) {
                 engine.set_baseline(
-                    &record.name,
+                    &name,
                     soak::Baseline {
-                        rss_bytes: record.rss_bytes,
+                        rss_bytes,
                         p99_ns: p99,
                     },
                 );
-            } else {
-                match engine.record(&record.name, record.rss_bytes, p99) {
+            } else if reached_now {
+                match engine.record(&name, rss_bytes, p99) {
                     Ok(breaches) => {
                         for b in breaches {
                             tracing::warn!(component = %b.component, kind = ?b.kind, pct = b.pct, "soak breach");
@@ -65,8 +97,6 @@ pub async fn scrape_cycle(
                 }
             }
         }
-
-        aggregate.update(record);
     }
 }
 
@@ -80,18 +110,18 @@ pub async fn run_forever(
     per_target_timeout: Duration,
 ) {
     let mut interval = tokio::time::interval(poll_interval);
-    let mut baseline_captured = false;
     loop {
         interval.tick().await;
+        // M4: no global "first cycle" flag any more -- `scrape_cycle`
+        // captures each component's baseline on the first cycle that
+        // component answers.
         scrape_cycle(
             &targets,
             &aggregate,
             soak_engine.as_deref(),
             per_target_timeout,
-            !baseline_captured,
         )
         .await;
-        baseline_captured = true;
     }
 }
 
@@ -120,6 +150,96 @@ pub fn current_uid() -> u32 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+
+    /// M4: the soak p99 came from `latency_histograms.values().next()` --
+    /// a `HashMap` iterator, so which operation it measured varied between
+    /// cycles and a multi-histogram component drifted against a baseline
+    /// taken from something else entirely.
+    #[test]
+    fn the_soak_p99_is_the_worst_histogram_not_an_arbitrary_one() {
+        let mut histograms = std::collections::HashMap::new();
+        let fast = neuroos_health::Histogram::new();
+        fast.record(Duration::from_micros(100));
+        let slow = neuroos_health::Histogram::new();
+        slow.record(Duration::from_millis(250));
+        histograms.insert("fast".to_string(), fast.to_proto());
+        histograms.insert("slow".to_string(), slow.to_proto());
+
+        let picked = soak_p99_ns(&histograms);
+        // Deterministic across insertion orders, and it is the slow one.
+        for _ in 0..20 {
+            assert_eq!(soak_p99_ns(&histograms), picked);
+        }
+        assert!(
+            picked >= Duration::from_millis(200).as_nanos() as u64,
+            "{picked}"
+        );
+    }
+
+    #[test]
+    fn no_histograms_is_a_zero_p99_not_a_panic() {
+        assert_eq!(soak_p99_ns(&std::collections::HashMap::new()), 0);
+    }
+
+    /// M4: a target that was unreachable on the first cycle got a baseline
+    /// of zeros, and `check_breaches` never breaches against a zero
+    /// baseline -- so it was silently excluded from soak monitoring for
+    /// the whole run. The baseline is per component, captured on the first
+    /// cycle it answers.
+    #[tokio::test]
+    async fn a_target_that_is_down_at_first_gets_its_baseline_when_it_comes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("late.health.sock");
+        let targets = vec![targets::Target {
+            name: "late".into(),
+            socket: sock.clone(),
+            budget_bytes: 100 * 1024 * 1024,
+            cgroup_path: None,
+        }];
+        let aggregate = aggregate::Aggregate::new(&targets);
+        let engine = soak::SoakEngine::new(dir.path().join("soak.csv"));
+
+        // Cycle 1: nothing is listening.
+        scrape_cycle(
+            &targets,
+            &aggregate,
+            Some(&engine),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(
+            aggregate.snapshot()[0].status,
+            neuroos_proto::v1::Status::Unknown
+        );
+        assert_eq!(
+            engine.baseline_for("late"),
+            None,
+            "a baseline of zeros would exclude it from soak monitoring forever"
+        );
+
+        // It starts, reporting a real RSS.
+        let health = neuroos_health::HealthServer::new("late v0");
+        health.record_latency("op", Duration::from_millis(5));
+        tokio::spawn(neuroos_health::HealthServer::serve(
+            Arc::clone(&health),
+            sock,
+            vec![current_uid()],
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        scrape_cycle(
+            &targets,
+            &aggregate,
+            Some(&engine),
+            Duration::from_millis(500),
+        )
+        .await;
+        let baseline = engine
+            .baseline_for("late")
+            .expect("the first answered cycle must capture the baseline");
+        assert!(baseline.rss_bytes > 0, "{baseline:?}");
+        assert!(baseline.p99_ns > 0, "{baseline:?}");
+    }
 
     #[test]
     fn sandbox_policy_writes_only_the_runtime_and_soak_dirs() {
