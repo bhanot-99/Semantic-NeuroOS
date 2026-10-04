@@ -109,7 +109,7 @@ Severity: 🔴 High · 🟠 Medium · 🟡 Low · ⚫ Dead code · 🧹 Cleanup 
 | C9 | `crates/neuroos-storage/Cargo.toml`, `neuroos-knowledge-query/Cargo.toml` | Dev-dependencies link other components' crates (storage→monitor, knowledge-query→storage/monitor), bending AB-1 for tests. | Open |
 | C10 | `cpp/neuroos-inference/CMakeLists.txt` | Writes `bitnet-lut-kernels.h` into the `third_party/bitnet.cpp` submodule worktree (dirties it). | Open |
 
-| C11 | `cpp/neuroos-inference/src/server.cpp` | Not clang-formatted (lines ~63/94, the `Job{...}` initializers) — already on `main` (0d9aae3), so `just fmt-check` fails. | Open |
+| C11 | `cpp/neuroos-inference/src/server.cpp` | Not clang-formatted (lines ~63/94, the `Job{...}` initializers) — already on `main` (0d9aae3), so `just fmt-check` fails. | **Fixed** incidentally on `medium_bugs`: the file was reformatted when M2/M3 touched it, and `just fmt-check`'s clang-format pass now exits 0 across `cpp/`. Verified that `main`'s copy of the file still fails the check and this branch's passes. |
 | C12 | `target/` | BLOCKER-001 recurred 2026-10-04: disk 100% full (`target/` 95 GB, `debug/deps` 69 GB of stale test binaries) broke linking mid-run; fixed with `cargo clean --profile dev` (freed 110 GiB, release kept). Recurred again the same day during the M1–M5 work (0 bytes free, mid-`cargo fmt`); `rm -rf target/debug/incremental` freed 8 GB, enough to finish. The underlying growth is unaddressed — this needs a real fix (a CI/`just` step that prunes stale `debug/deps` binaries, or a smaller `debug` profile), not another manual clean. | Open |
 ---
 
