@@ -39,6 +39,16 @@ const PROMOTION_DWELL_THRESHOLD: Duration = Duration::from_secs(5);
 const SELF_APP_IDS: &[&str] = &["org.neuroos.Confirm"];
 const SELF_COMM_PREFIX: &str = "neuroos-";
 
+/// Strips leading status glyphs from a window title: terminals animate a
+/// spinner (`◐`/`◑`/`✳`) and editors prefix unsaved files with `*`, which
+/// otherwise turn one window into several near-duplicate chunks (BUG-007).
+/// Keeps leading path and bracket characters, which carry meaning.
+pub fn normalize_title(title: &str) -> &str {
+    title
+        .trim_start_matches(|c: char| !(c.is_alphanumeric() || "~/.([\"'#@".contains(c)))
+        .trim_end()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterOutcome {
     /// Stage 2: this is neuroos observing itself. Never counted, never
@@ -97,9 +107,14 @@ pub struct IngestFilter {
     /// `TitleChanged` to `Closed`) so a completed dwell segment can be
     /// labeled with whatever was on screen, not just the app_id.
     toplevel_titles: HashMap<u64, String>,
-    /// toplevel_id -> the UTC-ns instant it last became activated, present
-    /// only while currently activated.
+    /// toplevel_id -> the UTC-ns instant its current focus segment began,
+    /// present only while currently activated.
     active_since_ns: HashMap<u64, u64>,
+    /// The title on screen during the segment the last `Promoted` /
+    /// `NotYetPromoted` outcome closed, read by the window adapter right
+    /// after `process` (the triggering event may already carry the *next*
+    /// title).
+    last_segment_title: Option<String>,
 }
 
 impl IngestFilter {
@@ -119,6 +134,12 @@ impl IngestFilter {
     /// that event (`StateChanged`) carries no title of its own.
     pub fn title_for(&self, toplevel_id: u64) -> Option<&str> {
         self.toplevel_titles.get(&toplevel_id).map(String::as_str)
+    }
+
+    /// The title shown during the dwell segment the most recent `process`
+    /// call closed.
+    pub fn last_segment_title(&self) -> Option<&str> {
+        self.last_segment_title.as_deref()
     }
 
     pub fn process(&mut self, event: &RawTelemetryEvent) -> FilterOutcome {
@@ -172,10 +193,26 @@ impl IngestFilter {
                 FilterOutcome::NotApplicable
             }
             Some(Kind::TitleChanged(t)) => {
-                if self.toplevel_app_ids.contains_key(&w.toplevel_id) {
-                    self.toplevel_titles.insert(w.toplevel_id, t.title.clone());
+                let Some(app_id) = self.toplevel_app_ids.get(&w.toplevel_id).cloned() else {
+                    return FilterOutcome::NotApplicable;
+                };
+                let old = self
+                    .toplevel_titles
+                    .insert(w.toplevel_id, t.title.clone())
+                    .unwrap_or_default();
+                // BUG-007: while focused, a real title change (a new page in
+                // a browser tab, not a spinner glyph) ends the old title's
+                // dwell segment and starts the new one's.
+                let Some(started_ns) = self.active_since_ns.get(&w.toplevel_id).copied() else {
+                    return FilterOutcome::NotApplicable;
+                };
+                if normalize_title(&old) == normalize_title(&t.title) {
+                    return FilterOutcome::NotApplicable;
                 }
-                FilterOutcome::NotApplicable
+                self.active_since_ns.insert(w.toplevel_id, observed_at_ns);
+                self.last_segment_title = Some(old);
+                let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
+                self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
             }
             Some(Kind::StateChanged(s)) => {
                 let Some(app_id) = self.toplevel_app_ids.get(&w.toplevel_id).cloned() else {
@@ -189,6 +226,7 @@ impl IngestFilter {
                     // raw wire events).
                     self.touch(app_id, true, Duration::ZERO, None)
                 } else if let Some(started_ns) = self.active_since_ns.remove(&w.toplevel_id) {
+                    self.last_segment_title = self.toplevel_titles.get(&w.toplevel_id).cloned();
                     let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
                     self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
                 } else {
@@ -196,10 +234,19 @@ impl IngestFilter {
                 }
             }
             Some(Kind::Closed(_)) => {
-                self.toplevel_app_ids.remove(&w.toplevel_id);
-                self.toplevel_titles.remove(&w.toplevel_id);
-                self.active_since_ns.remove(&w.toplevel_id);
-                FilterOutcome::NotApplicable
+                let app_id = self.toplevel_app_ids.remove(&w.toplevel_id);
+                let title = self.toplevel_titles.remove(&w.toplevel_id);
+                let started = self.active_since_ns.remove(&w.toplevel_id);
+                // BUG-007: most windows are closed while still focused,
+                // without a deactivate first; that close ends the segment.
+                match (app_id, started) {
+                    (Some(app_id), Some(started_ns)) => {
+                        self.last_segment_title = title;
+                        let dwell = Duration::from_nanos(observed_at_ns.saturating_sub(started_ns));
+                        self.touch(app_id, false, dwell, Some((started_ns, observed_at_ns)))
+                    }
+                    _ => FilterOutcome::NotApplicable,
+                }
             }
             _ => FilterOutcome::NotApplicable,
         }
@@ -285,6 +332,97 @@ mod tests {
                 kind: Some(kind),
             })),
         }
+    }
+
+    fn retitled(toplevel_id: u64, at_ns: u64, title: &str) -> RawTelemetryEvent {
+        window_event(
+            toplevel_id,
+            at_ns,
+            Kind::TitleChanged(neuroos_proto::v1::WindowTitleChanged {
+                title: title.to_string(),
+            }),
+        )
+    }
+
+    /// BUG-007: a browser tab navigated within one focus session used to
+    /// leave only its final page title; every page in between was lost.
+    #[test]
+    fn a_title_change_while_focused_closes_the_previous_titles_segment() {
+        const S: u64 = 1_000_000_000;
+        let mut f = IngestFilter::new();
+        f.process(&opened(1, "brave-browser"));
+        f.process(&activated(1, 0, true));
+        f.process(&retitled(1, S, "linux jarvis theme packs - Google Search"));
+        // a spinner glyph is the same page, not a new segment
+        assert_eq!(
+            f.process(&retitled(
+                1,
+                2 * S,
+                "◐ linux jarvis theme packs - Google Search"
+            )),
+            FilterOutcome::NotApplicable
+        );
+        assert_eq!(
+            f.process(&retitled(
+                1,
+                7 * S,
+                "J.A.R.V.I.S Animated Theme : r/omarchy"
+            )),
+            FilterOutcome::Promoted {
+                key: "brave-browser".into(),
+                segment: Some((S, 7 * S)),
+            }
+        );
+        assert_eq!(
+            f.last_segment_title(),
+            Some("◐ linux jarvis theme packs - Google Search")
+        );
+        assert_eq!(
+            f.process(&activated(1, 10 * S, false)),
+            FilterOutcome::Promoted {
+                key: "brave-browser".into(),
+                segment: Some((7 * S, 10 * S)),
+            }
+        );
+        assert_eq!(
+            f.last_segment_title(),
+            Some("J.A.R.V.I.S Animated Theme : r/omarchy")
+        );
+    }
+
+    /// BUG-007: 45 of 62 window closes in the KPI-1 recording happened
+    /// while the window was still focused (no deactivate first), and every
+    /// one of those final focus segments was silently dropped.
+    #[test]
+    fn closing_a_focused_window_ends_its_focus_segment() {
+        const S: u64 = 1_000_000_000;
+        let mut f = IngestFilter::new();
+        f.process(&opened(1, "gedit"));
+        f.process(&retitled(1, 0, "MASTER_PLAN.md (~/Project Custom) - gedit"));
+        f.process(&activated(1, 0, true));
+        assert_eq!(
+            f.process(&closed(1, 6 * S)),
+            FilterOutcome::Promoted {
+                key: "gedit".into(),
+                segment: Some((0, 6 * S)),
+            }
+        );
+        assert_eq!(
+            f.last_segment_title(),
+            Some("MASTER_PLAN.md (~/Project Custom) - gedit")
+        );
+        assert_eq!(f.title_for(1), None);
+    }
+
+    #[test]
+    fn a_title_change_while_unfocused_only_updates_the_title() {
+        let mut f = IngestFilter::new();
+        f.process(&opened(1, "brave-browser"));
+        assert_eq!(
+            f.process(&retitled(1, 5, "Background tab")),
+            FilterOutcome::NotApplicable
+        );
+        assert_eq!(f.title_for(1), Some("Background tab"));
     }
 
     #[test]

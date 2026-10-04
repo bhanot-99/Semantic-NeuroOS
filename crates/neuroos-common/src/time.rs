@@ -11,6 +11,19 @@ pub fn now_ns() -> u64 {
     ts.as_nanosecond().clamp(0, u64::MAX as i128) as u64
 }
 
+/// `ns` (UTC epoch nanoseconds) as wall-clock `HH:MM` in `tz`. Used to
+/// put times on evidence shown to the model ("at 22:15"), so it can answer
+/// "last"/"before" questions about the user's own day.
+pub fn hhmm_in(ns: u64, tz: &jiff::tz::TimeZone) -> String {
+    let ts = Timestamp::from_nanosecond(ns as i128).unwrap_or(Timestamp::UNIX_EPOCH);
+    ts.to_zoned(tz.clone()).strftime("%H:%M").to_string()
+}
+
+/// [`hhmm_in`] the system's local time zone (UTC if it can't be found).
+pub fn local_hhmm(ns: u64) -> String {
+    hhmm_in(ns, &jiff::tz::TimeZone::system())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
@@ -32,5 +45,14 @@ mod tests {
         let a = now_ns();
         let b = now_ns();
         assert!(b >= a);
+    }
+
+    #[test]
+    fn hhmm_formats_in_the_given_zone() {
+        // 2026-09-29T16:48:08Z
+        let ns = 1_790_700_488u64 * 1_000_000_000;
+        assert_eq!(hhmm_in(ns, &jiff::tz::TimeZone::UTC), "16:48");
+        let ist = jiff::tz::TimeZone::get("Asia/Kolkata").unwrap();
+        assert_eq!(hhmm_in(ns, &ist), "22:18");
     }
 }

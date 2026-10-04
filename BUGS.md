@@ -30,7 +30,8 @@ was evaluated).
 | BUG-004  | 2026-09-28 | P5 (root cause in P2) | **Critical** | **Fixed** (2026-09-28)                             | C4's interactive lane (`kMaxQueueDepth = 4`) reported `"lane queue is full"` under a merely sequential, spaced-out real workload — root cause was ring cross-talk, not a scheduler slot leak (see write-up below)                                                                                                                                                                                                                                           |
 | BUG-005  | 2026-09-28 | P5 (root cause in P2) | **Critical** | **Fixed** (2026-09-28)                             | `InferenceClient::generate` hardcoded greedy decoding (`temperature: 0.0`, no repetition penalty); on real, longer, substantive prompts this reliably degenerated into a repeated-token loop instead of a real answer                                                                                                                                                                                                                                       |
 | BUG-006  | 2026-09-28 | P5                    | High         | **Fixed** (2026-09-28)                             | Real `storage.sock` `read deadline exceeded` failures in `kpi1_eval.rs` (~20/51 questions) traced to system-wide CPU contention from unbounded concurrent fire-and-forget background distillation (`distill::maybe_spawn_distillation`); capped to 1 concurrent job via a semaphore, pending a real re-run of `kpi1_eval.rs` to confirm the fix at scale — see write-up below                                                                                |
-| BUG-007  | 2026-09-29 | P5                    | High         | **Open** (partly mitigated)                        | KPI-1 re-run over the fresh recording: engine no longer errors, but answers are mostly wrong or degenerate (~10/52 by first-pass grading, 7/7 negative controls declined) — see write-up below |
+| BUG-007  | 2026-09-29 | P5                    | High         | **Mitigated** (2026-10-04), owner grading pending  | KPI-1 re-run over the fresh recording: engine no longer errors, but answers are mostly wrong or degenerate (~10/52 by first-pass grading, 7/7 negative controls declined); 2026-10-03 re-run ~3/52 + 7/7 controls. Root causes fixed (storage fragmentation, broken bitnet.cpp fork, two ingest bugs dropping data, no media/keyword/aggregate retrieval). KPI-1 first-pass 48/59 = 81% tuned set, 10/15 = 67% held-out; owner grading pending — see write-up below |
+| BUG-008  | 2026-10-04 | P2 (found in P5)      | Medium       | **Open**                                           | Repinned C4 (bitnet.cpp `01eb415`, ADR-0010) segfaults with `threads = 1` on a long prompt (451-token prompt at n_ctx 512; a 71-token prompt is fine). 4 and 8 threads are fine at every size. Production uses 8 threads, so the live path is unaffected, but `neuroos-inference --bench`'s thread sweep includes 1 thread, so it crashes before writing its JSON — see write-up below |
 
 ## Open blockers (environment / tooling, not product code)
 
@@ -164,3 +165,58 @@ actual ~8h recording, to confirm BUG-006's fix actually closes the
 - **Cleanup:** removed dead `neuroos-storage/src/hnsw.rs` stub; questions now load from a machine-local `.dev-cache/telemetry-raw/questions.txt`; old recording, transcripts and diagnostics deleted.
 - **Still open:** (a) Unverified: the wrong chat template (Finding 3) probably explains most of the rambling; needs a re-run. (b) Vector-only retrieval over short window titles misses relevant chunks for name-heavy questions (NTU, Korea, dpro; distances 0.8-0.97). Candidates: bge query-instruction prefix, hybrid/FTS ranking. Re-measure on a fresh 4h recording (`scripts/record-4h.sh`).
 - **Result:** KPI-1 measured, not met. Do not start Phase 6.
+- **Re-run 2026-10-03** (after all four fixes above, over `dump-20260929-4h.bin`: 6,103 events, ~3h of the planned 4h, since the recording stopped early; 52 new questions + 7 negative controls written against it): **~3/52 positive questions acceptable, 7/7 controls declined correctly → KPI-1 still not met.** Two distinct failure modes remain:
+  - (c) **Questions 1-22 all failed with `storage.sock request failed: read deadline exceeded`**, and every query after that returned. **Root cause (measured):** telemetry ingest inserts one LanceDB row (one fragment) per event, and compaction only ran during the 6-hourly backup. Flat scans over the thousands of fragments took 140-250 ms against C5's 100 ms `STORAGE_QUERY_DEADLINE`, until HNSW promotion fired after 20 slow queries (~Q21). **Fixed:** `LanceStore::insert` now compacts a family in a detached background task every 256 inserts (`COMPACT_EVERY_INSERTS`, test `single_row_inserts_trigger_background_compaction`). Re-measured on the real recording: queries 38-70 ms from the first one (11-21 ms after HNSW), and ingest 6.5 s, down from 12-32 s.
+  - (d) **Generation degenerates** (echoes `The user asked: ...`, numbered-list loops, never stops). **Root cause (measured): the pinned `bitnet.cpp` commit `0b341e5` is broken.** Its nested llama.cpp (`isHuangXin/llama.cpp`, branch `release-bitnet-embedding-0.6b-270m`, a July 2026 re-port of BitNet onto upstream llama.cpp b9918) computes wrong results for this model. Same GGUF, same Wikipedia paragraph, `llama-perplexity -c 128`: **PPL 58.2 on the pinned fork vs 9.5 on BitNet `01eb415`** (2026-03-10, the last commit before the re-port, llama.cpp b3639 fork). The HF bf16 reference model gives 3.74. The error is deterministic: identical across ubatch 1/4/32 and 1/8 threads, and identical with GCC and the official clang build. On `01eb415` the model answers correctly and stops at `<|eot_id|>` ("The sky appears blue due to the scattering of sunlight…"), and decodes at **44.7 ms/token, meeting FR-INF-07's 45 ms target**, which ADR-0008 recorded as missed (56-72 ms) on the broken fork.
+  - (d2) **Finding 3 was wrong.** The GGUF's `Human:/BITNETAssistant:` template is a placeholder hardcoded by BitNet's `convert-ms-to-gguf-bitnet.py`. The model was trained on the HF `tokenizer_config.json` format, `User: {q}<|eot_id|>Assistant: `, and only stops (on `<|eot_id|>`, id 128009) with that format.
+  - (d3) The GGUF lacks `tokenizer.ggml.pre`, so llama.cpp falls back to the `default` (GPT-2) pre-tokenizer and logs "GENERATION QUALITY WILL BE DEGRADED". The Wikipedia paragraph becomes 262 tokens vs HF's 254. The fix is a `tokenizer.ggml.pre = llama-bpe` override at model load.
+  - **(d) fixed 2026-10-04:** repinned `cpp/third_party/bitnet.cpp` to `01eb415` and ported C4 to its llama.cpp API, which also fixed a double `llama_sampler_accept` that this API version turns into a grammar abort. Added the `tokenizer.ggml.pre=llama-bpe` override (d3) and switched `assemble.rs` to the trained `User:/Assistant:` + `<|eot_id|>` format (d2). `tests/contract/inference_smoke.sh` passes in full.
+  - **Re-run 2026-10-04, release build** (`cargo test --release`; debug builds of LanceDB alone exceed the 100 ms deadline, so earlier debug-mode runs were partly measuring the test harness): 0 storage timeouts, every answer short and terminated. First-pass grading: **26/52 positive questions correct (50%), 7/7 negative controls declined → KPI-1 still not met (33/59 = 56%).** Remaining misses:
+    - broad or aggregate questions declined by the `MAX_EVIDENCE_DISTANCE` cutoff ("What did I watch on YouTube?", "What projects did I work on?", "last episode");
+    - facts that never reach the evidence text (YouTube channel = MPRIS `artist`; Disk Usage Analyzer has only an `app_id`, no title);
+    - name-heavy lookups missed by vector-only retrieval (b);
+    - a few hallucinations (Q28, Q40, Q50).
+  - Also seen: the deictic/broad questions ("What did I watch on YouTube?", "What was I doing most of the evening?") declined because no single chunk fell under `MAX_EVIDENCE_DISTANCE`.
+- **Retrieval and evidence work, 2026-10-04 (fixes (b) and the "still open" items above):**
+  - **Two ingest bugs dropped data before search ever saw it** (`ingest/filter.rs`):
+    - A title change while a window was focused overwrote the title, so a dwell segment was labeled only with its *last* title. Every page browsed within one Brave focus session was lost (Google searches, the Reddit post, GitHub pages). Now a real title change ends the old title's segment; spinner glyphs (`◐/◑/✳`) don't count as a change.
+    - Closing a focused window (no deactivate first) silently discarded its final segment. That was **45 of 62 closes** in this recording, 155 s of dwell (gedit, Settings, Obsidian, Files).
+    - Together these took "expected answer stored at all" from 50/59 to 58/59.
+  - **Media became searchable** (`adapters::adapt_mpris`): each newly playing titled track is one chunk, e.g. `brave played "<title>" (channel: <artist>)` for browsers, `vlc played "<title>"` otherwise. Before this, MPRIS was only ever counted.
+  - **Hybrid retrieval** (`engine::query_hybrid`):
+    - SQLite FTS5 keyword index (migration `0002_chunks_fts`, porter stemming) fused with LanceDB vector search by reciprocal rank fusion (k = 60).
+    - The bge query instruction is now prepended to the question.
+    - Duplicate texts are dropped before fusion.
+    - Search-only aliases: dotted acronyms joined (`J.A.R.V.I.S` → `JARVIS`), and `r/x` → "reddit subreddit".
+    - New `ChunkMatch.keyword_score` = distinct question terms matched. C5 admits a keyword-only chunk only with 2+ terms, so a single shared word like "test" can't defeat a negative control.
+  - **Structured route for time-shaped questions** (`evidence::classify`, new `storage.sock` `QueryActivity` RPC over `focus_history` and media chunks), after TimelineQA (aggregate QA needs small, exact evidence sets):
+    - "most of / which projects" → top titles by dwell (media excluded for work questions);
+    - "last/latest" → newest first;
+    - "before/after X" → what was focused in the hour before/after X's first occurrence;
+    - watch/listen questions → media history, only when every proper noun in the question is in the record.
+    - All evidence lines carry a local `[HH:MM]`. Specific evidence is ordered most-relevant-last, next to the question.
+  - **Prompt and decoding:**
+    - Greedy decoding (the BUG-005 loops came from the broken fork; with a random seed, results flipped run to run).
+    - "Question:" wording instead of "The user asked:", which the model echoed.
+    - The "if it doesn't answer, say I do not know" instruction was removed: negatives are already declined before C4 when retrieval finds nothing, and the 2B model was declining with good evidence, or copying the instruction verbatim.
+  - **Tried and reverted (measured worse):**
+    - Humanized evidence ("Files: Trash" instead of "com.system76.CosmicFiles: Trash — COSMIC Files"): dropped auto-grade 44 → 39. The stripped suffixes were the words the questions use.
+    - A "window title shows what was open, not what was done" caution line: 44 → 40, through over-declining.
+  - **Harness** (`kpi1_eval.rs`):
+    - `## expect:` / `## evidence:` keys and first-pass auto-grading;
+    - `NEUROOS_KPI1_RETRIEVAL_ONLY=1` (evidence recall in seconds, plus an "answer not stored at all" diagnostic);
+    - `NEUROOS_KPI1_QUESTIONS` for held-out sets.
+  - **Result (release build, greedy, my first-pass hand grading; owner review still required):**
+    - **Tuned set: 48/59 = 81%** (auto-grade 48; Q12 and Q40 are false passes, Q14 and Q48 are false fails); 7/7 negative controls declined. Evidence recall 58/59.
+    - **Held-out set** (15 questions written after tuning, `.dev-cache/telemetry-raw/questions-heldout.txt`): **10/15 = 67%**.
+    - The gap is real: part of the prompt and ordering gain is tuned to the set. The structural fixes (ingest segments, media, hybrid, activity route) are what moved recall.
+  - **Remaining misses are mostly 2B-model extraction errors with correct evidence present:** wrong item picked (channel vs repo owner), "what was X about" guesses, and an occasional "deleted files" hallucination. One answer is still unstored: Disk Usage Analyzer, a 2.8 s baobab window under the promotion gate.
+
+## BUG-008 — repinned C4 segfaults with one thread on long prompts
+
+- **Found:** 2026-10-04, running `neuroos-inference --bench` after the ADR-0010 repin.
+- **Repro:** a config with `threads = 1`, `max_context_tokens = 1024` and the 2B4T i2_s model, then `NEUROOS_CONFIG=<it> neuroos-inference --bench`. The n_ctx=128 run (71-token prompt) completes; the n_ctx=512 run (451-token prompt) exits with SIGSEGV. With `threads = 4` or `8`, all three context sizes complete, and the crash comes at the thread sweep's 1-thread run.
+- **Likely area:** the old fork's i2_s batched kernels (`ggml-bitnet-mad.cpp`, `ACT_PARALLEL` / `ROW_BLOCK_SIZE` row blocking) when a single thread processes a large batch. Not yet confirmed; no gdb on this machine (`sudo apt install gdb`).
+- **Impact:** the live service runs 8 threads (`config.example.toml`), so it's unaffected. `--bench` never writes its JSON until this is fixed, or until the 1-thread sweep entry is dropped.
+- **Measured with the repinned fork** (from the bench log, 8 threads): decode 42.8 / 47.1 / 50.3 ms/token and prefill 5.2 / 6.5 / 7.6 ms/token at n_ctx 128 / 512 / 1024. 4 threads decodes faster at 128 (36.9 ms/token), suggesting the 8-thread setting oversubscribes this 8-core/16-thread CPU's hyperthreads; worth re-tuning `threads`.
+

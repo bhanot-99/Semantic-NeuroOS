@@ -19,9 +19,10 @@ pub const EVIDENCE_BUDGET_TOKENS: u32 = 320;
 pub const TOTAL_BUDGET_TOKENS: u32 =
     SYSTEM_BUDGET_TOKENS + DEICTIC_BUDGET_TOKENS + EVIDENCE_BUDGET_TOKENS; // 512, FR-KNO-06
 
-const SYSTEM_PREAMBLE: &str = "You are NeuroOS, a personal assistant. The evidence is a list of \
-window titles from the user's recent computer activity. Answer the user's question in one or two \
-short sentences using only that evidence. If the evidence does not answer it, reply: I do not know.";
+const SYSTEM_PREAMBLE: &str = "You are NeuroOS, a personal assistant. The evidence lists the \
+user's recent computer activity: window titles (app: title) and media they played, with local \
+times in [HH:MM]. Answer the user's question in one or two short sentences using only that \
+evidence.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssembledPrompt {
@@ -54,12 +55,14 @@ pub async fn assemble(
     own_compute += truncate_own_compute;
 
     let t1 = Instant::now();
-    // BitNet b1.58 2B-4T's own GGUF chat template (`tokenizer.chat_template`):
-    // `<bos>Human: {content}\n\nBITNETAssistant: `, generation ends at
-    // `<|end_of_text|>`. The template has no system role, so the
-    // instructions go inside the user turn. BOS is added by C4's tokenizer.
+    // BUG-007(d2): BitNet b1.58 2B-4T's trained chat format, from the HF
+    // model's `tokenizer_config.json`: `{Role}: {content}<|eot_id|>` per
+    // turn, then `Assistant: `; the model ends its turn with `<|eot_id|>`.
+    // The GGUF's own `Human:/BITNETAssistant:` template is a placeholder
+    // hardcoded by BitNet's converter, and the model never stops under it.
+    // BOS is added by C4's tokenizer.
     let text = format!(
-        "Human: {SYSTEM_PREAMBLE}\n\nEvidence:\n{evidence_text}\n\n{deictic_text}\n\nBITNETAssistant: "
+        "System: {SYSTEM_PREAMBLE}<|eot_id|>User: Evidence:\n{evidence_text}\n\n{deictic_text}<|eot_id|>Assistant: "
     );
     own_compute += t1.elapsed();
 
@@ -76,7 +79,7 @@ fn format_deictic(window: Option<&WindowContext>, question: &str) -> String {
             "The user is looking at \"{}\" in {} and asked: {question}",
             w.title, w.app_id
         ),
-        None => format!("The user asked: {question}"),
+        None => format!("Question: {question}"),
     }
 }
 
@@ -146,7 +149,7 @@ mod tests {
     #[test]
     fn deictic_text_falls_back_to_the_bare_question_without_a_window() {
         let text = format_deictic(None, "what's the weather");
-        assert_eq!(text, "The user asked: what's the weather");
+        assert_eq!(text, "Question: what's the weather");
     }
 
     /// FR-KNO-09 (phases.md §8.3 PF: "Own compute p99 < 5 ms, instrumented
@@ -175,6 +178,7 @@ mod tests {
                 t_ns: 0,
                 domain: "notes".to_string(),
                 distance: 0.1,
+                keyword_score: 0.0,
             })
             .collect();
         let window = WindowContext {

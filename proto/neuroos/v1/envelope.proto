@@ -53,6 +53,8 @@ message Envelope {
     UpsertEdgeResponse         upsert_edge_response = 53;
     PruneEdgesRequest          prune_edges_request  = 54;
     PruneEdgesResponse         prune_edges_response = 55;
+    QueryActivityRequest       query_activity_request  = 56;
+    QueryActivityResponse      query_activity_response = 57;
 
     GenerateRequest      generate_request     = 60;
     GenerateResponse     generate_response    = 61;

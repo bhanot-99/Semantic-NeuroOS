@@ -22,11 +22,12 @@ use tokio::net::UnixStream;
 /// 250ms; C4 generation gets 30s.
 pub const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
 pub const GENERATE_DEADLINE: Duration = Duration::from_secs(30);
-/// BUG-005: pure greedy decoding (the old hardcoded `0.0`) reliably
-/// degenerates into a repeated-token loop on real, longer BitNet 2B
-/// prompts. Non-zero but low: FR-KNO-03's answers must stay close to the
-/// grounded evidence, not get creative.
-pub const DEFAULT_TEMPERATURE: f32 = 0.2;
+/// Greedy. BUG-005 moved this off 0.0 because greedy decoding looped,
+/// but those loops came from the broken bitnet.cpp fork (BUG-007(d)); on
+/// the repinned C4, greedy plus the repetition penalty below ends cleanly.
+/// Deterministic answers also make KPI-1 runs comparable: at 0.2, the same
+/// question flipped between right and "I do not know" from run to run.
+pub const DEFAULT_TEMPERATURE: f32 = 0.0;
 /// BUG-005: llama.cpp's own CLI default (`--repeat-penalty`) for the same
 /// reason -- 1.0 disables it; the old hardcoded call passed no penalty at
 /// all.

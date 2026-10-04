@@ -8,7 +8,8 @@ use std::time::Duration;
 use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
 use neuroos_proto::v1::{
     ChunkMatch, EdgeRow, EntityRow, Envelope, FocusHistoryRow, ListEdgesRequest,
-    ListEntitiesRequest, QueryFocusHistoryRequest, QueryHybridRequest, envelope,
+    ListEntitiesRequest, QueryActivityRequest, QueryActivityResponse, QueryFocusHistoryRequest,
+    QueryHybridRequest, envelope,
 };
 
 /// rules.md §5.7: every C3 query gets a 100 ms deadline.
@@ -108,6 +109,27 @@ impl StorageClient {
             .await?;
         match body {
             envelope::Body::QueryHybridResponse(r) => Ok(r.matches),
+            _ => Err(StorageClientError::UnexpectedResponse),
+        }
+    }
+
+    /// BUG-007: structured activity (titles by dwell, media in order) in
+    /// `[since_ns, until_ns]`, `until_ns = 0` meaning unbounded.
+    pub async fn query_activity(
+        &self,
+        since_ns: u64,
+        until_ns: u64,
+        limit: u32,
+    ) -> Result<QueryActivityResponse, StorageClientError> {
+        let body = self
+            .round_trip(envelope::Body::QueryActivityRequest(QueryActivityRequest {
+                since_ns,
+                until_ns,
+                limit,
+            }))
+            .await?;
+        match body {
+            envelope::Body::QueryActivityResponse(r) => Ok(r),
             _ => Err(StorageClientError::UnexpectedResponse),
         }
     }

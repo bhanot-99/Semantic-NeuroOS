@@ -18,7 +18,7 @@ use neuroos_proto::v1::{
 };
 use neuroos_taint::TaintFlags;
 
-use crate::ingest::filter::{FilterOutcome, IngestFilter};
+use crate::ingest::filter::{FilterOutcome, IngestFilter, normalize_title};
 use crate::sqlite::{self, FocusHistoryEntry, StorageError};
 
 pub const DOMAIN_WINDOW_FOCUS: &str = "window_focus";
@@ -103,10 +103,7 @@ pub fn ingest(
             adapt_resource(conn, r, event.observed_at_ns)?;
             Ok(Vec::new())
         }
-        Some(Payload::Mpris(m)) => {
-            adapt_mpris(conn, m, event.observed_at_ns)?;
-            Ok(Vec::new())
-        }
+        Some(Payload::Mpris(m)) => adapt_mpris(conn, m, event.observed_at_ns),
         None => Ok(Vec::new()),
     }
 }
@@ -151,10 +148,10 @@ fn adapt_window(
         )?;
         if let Some((t_start_ns, t_end_ns)) = segment {
             let dwell_ms = t_end_ns.saturating_sub(*t_start_ns) / 1_000_000;
-            let title = match &w.kind {
+            let title = normalize_title(match &w.kind {
                 Some(Kind::Opened(o)) => o.title.as_str(),
-                _ => filter.title_for(w.toplevel_id).unwrap_or(""),
-            };
+                _ => filter.last_segment_title().unwrap_or(""),
+            });
             sqlite::insert_focus_history(
                 conn,
                 &FocusHistoryEntry {
@@ -279,14 +276,69 @@ fn adapt_resource(
     sqlite::touch_event_counter(conn, DOMAIN_SYSTEM_RESOURCE, "sample", observed_at_ns, 0)
 }
 
-fn adapt_mpris(conn: &Connection, m: &MprisEvent, observed_at_ns: u64) -> Result<(), StorageError> {
+/// MPRIS player names (bus-name segment) that are web browsers.
+const BROWSER_PLAYERS: &[&str] = &[
+    "brave", "chromium", "chrome", "firefox", "vivaldi", "opera", "edge", "epiphany",
+];
+
+/// Counts every MPRIS event, and the first time a titled track is seen
+/// playing, records it as a `media_playback` entity plus one searchable
+/// chunk naming the player, title and artist (for YouTube in a browser,
+/// the artist is the channel). BUG-007: before this, media history never
+/// reached search at all.
+fn adapt_mpris(
+    conn: &Connection,
+    m: &MprisEvent,
+    observed_at_ns: u64,
+) -> Result<Vec<PendingChunk>, StorageError> {
     sqlite::touch_event_counter(
         conn,
         DOMAIN_MEDIA_PLAYBACK,
         &m.player_bus_name,
         observed_at_ns,
         0,
-    )
+    )?;
+    if m.playback_status != "Playing" || m.title.is_empty() {
+        return Ok(Vec::new());
+    }
+    let is_new = !sqlite::entity_exists(conn, DOMAIN_MEDIA_PLAYBACK, &m.title)?;
+    let entity_id = sqlite::upsert_entity(
+        conn,
+        DOMAIN_MEDIA_PLAYBACK,
+        "media",
+        &m.title,
+        TaintFlags::empty(),
+        observed_at_ns,
+        false,
+    )?;
+    if !is_new {
+        return Ok(Vec::new());
+    }
+    // "org.mpris.MediaPlayer2.brave.instance6407" -> "brave"
+    let player = m
+        .player_bus_name
+        .trim_start_matches("org.mpris.MediaPlayer2.")
+        .split('.')
+        .next()
+        .unwrap_or_default();
+    let mut text = format!("{player} played \"{}\"", m.title);
+    if !m.artist.is_empty() {
+        // A browser's MPRIS "artist" is the site's uploader: for YouTube,
+        // the channel. Saying so lets "which channel" questions match.
+        if BROWSER_PLAYERS.contains(&player) {
+            text.push_str(&format!(" (channel: {})", m.artist));
+        } else {
+            text.push_str(&format!(" by {}", m.artist));
+        }
+    }
+    Ok(vec![PendingChunk {
+        family: family_for_domain(DOMAIN_MEDIA_PLAYBACK),
+        entity_id,
+        domain: DOMAIN_MEDIA_PLAYBACK,
+        taint: TaintFlags::empty(),
+        t_ns: observed_at_ns,
+        text,
+    }])
 }
 
 #[cfg(test)]
@@ -559,6 +611,83 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
             .unwrap();
         assert_eq!(entities, 0);
+    }
+
+    fn mpris(player: &str, status: &str, title: &str, artist: &str, at: u64) -> RawTelemetryEvent {
+        RawTelemetryEvent {
+            observed_at_ns: at,
+            source: "mpris".into(),
+            payload: Some(Payload::Mpris(MprisEvent {
+                player_bus_name: format!("org.mpris.MediaPlayer2.{player}"),
+                playback_status: status.into(),
+                track_id: String::new(),
+                title: title.into(),
+                artist: artist.into(),
+                album: String::new(),
+                position_us: 0,
+            })),
+        }
+    }
+
+    /// BUG-007: media history was only ever counted, never searchable, so
+    /// "which channel" / "what did I watch" had no evidence at all.
+    #[test]
+    fn a_newly_playing_track_becomes_one_searchable_chunk() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let ev = |status, at| {
+            mpris(
+                "brave.instance6407",
+                status,
+                "IELTS Task 1 Guide",
+                "IELTS Advantage",
+                at,
+            )
+        };
+        let first = ingest(&conn, &mut filter, &ev("Playing", 1)).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].domain, DOMAIN_MEDIA_PLAYBACK);
+        assert_eq!(
+            first[0].text,
+            "brave played \"IELTS Task 1 Guide\" (channel: IELTS Advantage)"
+        );
+        // replays, pauses and stops of the same track add nothing new
+        assert!(
+            ingest(&conn, &mut filter, &ev("Paused", 2))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ingest(&conn, &mut filter, &ev("Playing", 3))
+                .unwrap()
+                .is_empty()
+        );
+        // no artist: the "by" clause is omitted
+        let vlc = ingest(
+            &conn,
+            &mut filter,
+            &mpris("vlc", "Playing", "Show.S01E03", "", 4),
+        )
+        .unwrap();
+        assert_eq!(vlc[0].text, "vlc played \"Show.S01E03\"");
+    }
+
+    #[test]
+    fn status_glyphs_are_stripped_from_titles() {
+        // terminal apps animate a spinner in the title; an editor marks
+        // unsaved files with '*': neither is part of what the window is
+        assert_eq!(
+            normalize_title("◐ Bottom dock revert — COSMIC Terminal"),
+            "Bottom dock revert — COSMIC Terminal"
+        );
+        assert_eq!(normalize_title("✳ Claude Code"), "Claude Code");
+        assert_eq!(
+            normalize_title("*MASTER_PLAN.md (~/x) - gedit"),
+            "MASTER_PLAN.md (~/x) - gedit"
+        );
+        assert_eq!(normalize_title("~/notes — Files"), "~/notes — Files");
+        assert_eq!(normalize_title("(1) Inbox"), "(1) Inbox");
+        assert_eq!(normalize_title("◐"), "");
     }
 
     #[test]
