@@ -12,6 +12,6 @@ namespace neuroos::inference {
 // Returns nullptr if `grammar_gbnf` fails to parse (matches
 // llama_sampler_init_grammar's own contract). The caller adds the returned
 // sampler to a chain (llama_sampler_chain_add), which takes ownership.
-llama_sampler* build_grammar_sampler(const llama_vocab* vocab, const std::string& grammar_gbnf);
+llama_sampler* build_grammar_sampler(const llama_model* model, const std::string& grammar_gbnf);
 
 } // namespace neuroos::inference

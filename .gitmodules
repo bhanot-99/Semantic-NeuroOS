@@ -1,3 +1,4 @@
 [submodule "cpp/third_party/bitnet.cpp"]
 	path = cpp/third_party/bitnet.cpp
 	url = https://github.com/microsoft/BitNet.git
+	ignore = untracked

@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -19,14 +20,14 @@ void ensure_backend_initialized() {
     std::call_once(once, [] { llama_backend_init(); });
 }
 
-// llama.cpp's own vocab getter takes a size hint via context, but token->text
-// pieces are typically small; grow and retry once if a piece is unusually large.
-std::string token_to_text(const llama_vocab* vocab, llama_token token) {
+// Token->text pieces are typically small; grow and retry once if a piece is
+// unusually large.
+std::string token_to_text(const llama_model* model, llama_token token) {
     char buf[256];
-    int n = llama_token_to_piece(vocab, token, buf, sizeof(buf), /*lstrip=*/0, /*special=*/false);
+    int n = llama_token_to_piece(model, token, buf, sizeof(buf), /*lstrip=*/0, /*special=*/false);
     if (n < 0) {
         std::vector<char> big(static_cast<std::size_t>(-n));
-        n = llama_token_to_piece(vocab, token, big.data(), static_cast<int>(big.size()), 0, false);
+        n = llama_token_to_piece(model, token, big.data(), static_cast<int>(big.size()), 0, false);
         if (n < 0) {
             return {};
         }
@@ -35,15 +36,15 @@ std::string token_to_text(const llama_vocab* vocab, llama_token token) {
     return std::string(buf, static_cast<std::size_t>(n));
 }
 
-std::vector<llama_token> tokenize(const llama_vocab* vocab, const std::string& text,
+std::vector<llama_token> tokenize(const llama_model* model, const std::string& text,
                                   bool add_special) {
     int n_max = static_cast<int>(text.size()) + 16;
     std::vector<llama_token> tokens(static_cast<std::size_t>(n_max));
-    int n = llama_tokenize(vocab, text.data(), static_cast<int>(text.size()), tokens.data(), n_max,
+    int n = llama_tokenize(model, text.data(), static_cast<int>(text.size()), tokens.data(), n_max,
                            add_special, /*parse_special=*/true);
     if (n < 0) {
         tokens.resize(static_cast<std::size_t>(-n));
-        n = llama_tokenize(vocab, text.data(), static_cast<int>(text.size()), tokens.data(),
+        n = llama_tokenize(model, text.data(), static_cast<int>(text.size()), tokens.data(),
                            static_cast<int>(tokens.size()), add_special, true);
     }
     tokens.resize(static_cast<std::size_t>(std::max(n, 0)));
@@ -52,11 +53,11 @@ std::vector<llama_token> tokenize(const llama_vocab* vocab, const std::string& t
 
 } // namespace
 
-Model::Model(llama_model* model) : model_(model), vocab_(llama_model_get_vocab(model)) {}
+Model::Model(llama_model* model) : model_(model) {}
 
 Model::~Model() {
     if (model_ != nullptr) {
-        llama_model_free(model_);
+        llama_free_model(model_);
     }
 }
 
@@ -87,9 +88,19 @@ Model::load(const std::string& model_path, const std::string& expected_sha256) {
     params.use_mmap = true; // FR-INF-01: read-only mmap, not a full read into RAM
     params.use_mlock = false;
 
-    llama_model* model = llama_model_load_from_file(model_path.c_str(), params);
+    // BUG-007(d3): BitNet's GGUF has no `tokenizer.ggml.pre`, so llama.cpp
+    // falls back to the GPT-2 pre-tokenizer and splits text differently from
+    // the Llama 3 tokenizer the model was trained with. The list ends with an
+    // entry whose key is empty.
+    static llama_model_kv_override overrides[2] = {};
+    overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+    std::strncpy(overrides[0].key, "tokenizer.ggml.pre", sizeof(overrides[0].key) - 1);
+    std::strncpy(overrides[0].val_str, "llama-bpe", sizeof(overrides[0].val_str) - 1);
+    params.kv_overrides = overrides;
+
+    llama_model* model = llama_load_model_from_file(model_path.c_str(), params);
     if (model == nullptr) {
-        return make_unexpected(EngineError{"llama_model_load_from_file failed for " + model_path});
+        return make_unexpected(EngineError{"llama_load_model_from_file failed for " + model_path});
     }
     return std::shared_ptr<Model>(new Model(model));
 }
@@ -99,14 +110,14 @@ ModelInfo Model::info() const {
     llama_model_desc(model_, desc, sizeof(desc));
     return ModelInfo{
         .model_name = desc,
-        .context_length = static_cast<std::uint32_t>(llama_model_n_ctx_train(model_)),
-        .vocab_size = static_cast<std::uint64_t>(llama_vocab_n_tokens(vocab_)),
+        .context_length = static_cast<std::uint32_t>(llama_n_ctx_train(model_)),
+        .vocab_size = static_cast<std::uint64_t>(llama_n_vocab(model_)),
         .build_info = "neuroos-inference (BitNet b1.58, llama.cpp fork)",
     };
 }
 
 std::uint32_t Model::tokenize_count(const std::string& text) const {
-    return static_cast<std::uint32_t>(tokenize(vocab_, text, /*add_special=*/false).size());
+    return static_cast<std::uint32_t>(tokenize(model_, text, /*add_special=*/false).size());
 }
 
 Context::Context(std::shared_ptr<Model> model, llama_context* ctx, std::uint32_t /*n_ctx*/)
@@ -145,9 +156,9 @@ Context::create(std::shared_ptr<Model> model, std::uint32_t n_ctx, std::uint32_t
     params.n_threads = static_cast<std::int32_t>(n_threads);
     params.n_threads_batch = static_cast<std::int32_t>(n_threads);
 
-    llama_context* ctx = llama_init_from_model(model->raw(), params);
+    llama_context* ctx = llama_new_context_with_model(model->raw(), params);
     if (ctx == nullptr) {
-        return make_unexpected(EngineError{"llama_init_from_model failed"});
+        return make_unexpected(EngineError{"llama_new_context_with_model failed"});
     }
     return Context(std::move(model), ctx, n_ctx);
 }
@@ -163,8 +174,8 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
                   std::uint64_t seed, const std::string& grammar_gbnf, float repetition_penalty,
                   const std::function<void(const GeneratedToken&)>& on_token,
                   const std::function<bool()>& should_cancel) {
-    const llama_vocab* vocab = model_->vocab();
-    std::vector<llama_token> prompt_tokens = tokenize(vocab, prompt, /*add_special=*/true);
+    const llama_model* model = model_->raw();
+    std::vector<llama_token> prompt_tokens = tokenize(model, prompt, /*add_special=*/true);
     if (prompt_tokens.size() > n_ctx()) {
         return make_unexpected(EngineError{"prompt (" + std::to_string(prompt_tokens.size()) +
                                            " tokens) exceeds context size (" +
@@ -181,9 +192,8 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
            resident_tokens_[common] == prompt_tokens[common]) {
         ++common;
     }
-    llama_memory_t mem = llama_get_memory(ctx_);
     if (common < resident_tokens_.size()) {
-        llama_memory_seq_rm(mem, /*seq_id=*/0, static_cast<llama_pos>(common), -1);
+        llama_kv_cache_seq_rm(ctx_, /*seq_id=*/0, static_cast<llama_pos>(common), -1);
     }
     resident_tokens_.resize(common);
 
@@ -193,21 +203,18 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
     // generated token).
     if (common == prompt_tokens.size() && common > 0) {
         --common;
-        llama_memory_seq_rm(mem, /*seq_id=*/0, static_cast<llama_pos>(common), -1);
+        llama_kv_cache_seq_rm(ctx_, /*seq_id=*/0, static_cast<llama_pos>(common), -1);
         resident_tokens_.resize(common);
     }
 
     if (prompt_tokens.size() > common) {
         std::vector<llama_token> suffix(prompt_tokens.begin() + static_cast<long>(common),
                                         prompt_tokens.end());
+        // Resuming at `common`, not position 0: this llama.cpp's
+        // llama_batch_get_one takes the first position explicitly.
         llama_batch batch =
-            llama_batch_get_one(suffix.data(), static_cast<std::int32_t>(suffix.size()));
-        // positions must be set explicitly since we're resuming at `common`,
-        // not decoding from position 0 (llama_batch_get_one assumes seq 0
-        // starting fresh unless the context already tracks position — it
-        // does, via the memory's sequence position, so no manual pos array
-        // is needed here: llama_decode continues from wherever seq 0 left
-        // off after the llama_memory_seq_rm above).
+            llama_batch_get_one(suffix.data(), static_cast<std::int32_t>(suffix.size()),
+                                static_cast<llama_pos>(common), /*seq_id=*/0);
         int rc = llama_decode(ctx_, batch);
         if (rc != 0) {
             return make_unexpected(
@@ -219,7 +226,7 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
     llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     std::unique_ptr<llama_sampler, void (*)(llama_sampler*)> chain(
         llama_sampler_chain_init(sparams), &llama_sampler_free);
-    auto grammar = grammar_gbnf.empty() ? nullptr : build_grammar_sampler(vocab, grammar_gbnf);
+    auto grammar = grammar_gbnf.empty() ? nullptr : build_grammar_sampler(model, grammar_gbnf);
     if (!grammar_gbnf.empty() && grammar == nullptr) {
         return make_unexpected(EngineError{"failed to parse grammar_gbnf"});
     }
@@ -232,11 +239,12 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
         // candidates first (BUG-005's fix doesn't need to change sampling
         // quality beyond breaking loops, so a generous k is fine).
         llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(40));
-        llama_sampler_chain_add(chain.get(),
-                                llama_sampler_init_penalties(kRepetitionPenaltyLastN,
-                                                             repetition_penalty,
-                                                             /*penalty_freq=*/0.0F,
-                                                             /*penalty_present=*/0.0F));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(
+                                                 llama_n_vocab(model), llama_token_eos(model),
+                                                 llama_token_nl(model), kRepetitionPenaltyLastN,
+                                                 repetition_penalty, /*penalty_freq=*/0.0F,
+                                                 /*penalty_present=*/0.0F, /*penalize_nl=*/false,
+                                                 /*ignore_eos=*/false));
     }
     if (temperature <= 0.0F) {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
@@ -251,38 +259,29 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
             break; // FR-INF-05/06: bounded to at most one decode step
         }
         llama_token next = 0;
-        bool have_next = false;
-        bool grammar_exhausted = false;
         try {
             // rules.md §8: wrap third-party code that throws at the
-            // boundary. llama.cpp's grammar sampler (llama-grammar.cpp)
-            // throws std::runtime_error ("Unexpected empty grammar stack
-            // after accepting piece") once a GBNF rule fully completes —
-            // found via testing (a real "yes"|"no" grammar reaching "no"):
-            // it doesn't signal completion by forcing EOS, it throws from
-            // the accept() call that completes the rule, *after* already
-            // sampling the correct final token. Treated as the grammar's
-            // own way of saying "generation is done", not a real failure —
-            // `next` is still the right token, just needs to be the last one.
+            // boundary. In this llama.cpp, llama_sampler_sample already
+            // accepts the token into every sampler in the chain (grammar
+            // state, repetition history), so no separate llama_sampler_accept
+            // call: accepting twice fed the grammar each token twice and
+            // tripped its GGML_ASSERT. A completed grammar leaves only EOG
+            // allowed, so generation ends through the EOS check below.
             next = llama_sampler_sample(chain.get(), ctx_, -1);
-            have_next = true;
-            llama_sampler_accept(chain.get(), next);
         } catch (const std::exception& e) {
-            grammar_exhausted = true;
-        }
-        if (!have_next) {
             break; // sampling itself failed before producing a token
         }
 
-        bool eos = grammar_exhausted || llama_vocab_is_eog(vocab, next);
-        GeneratedToken piece{static_cast<std::uint32_t>(next), token_to_text(vocab, next), eos};
+        bool eos = llama_token_is_eog(model, next);
+        GeneratedToken piece{static_cast<std::uint32_t>(next), token_to_text(model, next), eos};
         on_token(piece);
         if (eos) {
             break;
         }
 
+        llama_batch next_batch =
+            llama_batch_get_one(&next, 1, static_cast<llama_pos>(resident_tokens_.size()), 0);
         resident_tokens_.push_back(next);
-        llama_batch next_batch = llama_batch_get_one(&next, 1);
         int rc = llama_decode(ctx_, next_batch);
         if (rc != 0) {
             return make_unexpected(

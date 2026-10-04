@@ -46,9 +46,6 @@ class Model {
     Model& operator=(const Model&) = delete;
 
     ModelInfo info() const;
-    const llama_vocab* vocab() const {
-        return vocab_;
-    }
     llama_model* raw() const {
         return model_;
     }
@@ -58,7 +55,6 @@ class Model {
     explicit Model(llama_model* model);
 
     llama_model* model_ = nullptr;
-    const llama_vocab* vocab_ = nullptr;
 };
 
 // One lane's decode state: its own llama_context (own KV cache), reused
