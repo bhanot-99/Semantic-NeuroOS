@@ -60,9 +60,8 @@ void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envel
     // not be read as "penalize with strength 0.0" -- that's not a real
     // disabled value (1.0 is), just an unset field; treat it as disabled.
     float repetition_penalty = req.repetition_penalty() > 0.0F ? req.repetition_penalty() : 1.0F;
-    Job job{generation_id,       req.prompt(),  req.max_tokens(),
-            req.temperature(),   req.seed(),    req.grammar_gbnf(),
-            req.ring_name(),     repetition_penalty};
+    Job job{generation_id, req.prompt(),       req.max_tokens(), req.temperature(),
+            req.seed(),    req.grammar_gbnf(), req.ring_name(),  repetition_penalty};
     bool accepted =
         lanes.submit(req.lane() == neuroos::v1::LANE_BACKGROUND ? neuroos::v1::LANE_BACKGROUND
                                                                 : neuroos::v1::LANE_INTERACTIVE,
@@ -90,8 +89,13 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
     // BUG-004: same fencing as handle_generate, above.
     std::uint64_t generation_id = writer.next_generation();
 
-    Job job{generation_id,      prompt.str(), req.max_tokens(), /*temperature=*/0.7F,
-            /*seed=*/0,         "",           req.ring_name(),
+    Job job{generation_id,
+            prompt.str(),
+            req.max_tokens(),
+            /*temperature=*/0.7F,
+            /*seed=*/0,
+            "",
+            req.ring_name(),
             /*repetition_penalty=*/1.1F};
     bool accepted = lanes.submit(neuroos::v1::LANE_BACKGROUND, std::move(job));
     out->set_generation_id(generation_id);
@@ -180,11 +184,15 @@ void serve(const std::string& socket_path, std::vector<std::uint32_t> allowed_ui
     for (;;) {
         auto accepted = server.value().accept();
         if (!accepted) {
-            spdlog::error("inference.sock accept failed: {}", accepted.error().message);
+            // M2: a failure that costs only this connection now returns
+            // `nullopt`, so an error means the listening socket itself is
+            // gone and retrying would spin at full CPU.
+            spdlog::error("inference.sock listener is unusable; stopped serving: {}",
+                          accepted.error().message);
             break;
         }
         if (!accepted.value().has_value()) {
-            continue;
+            continue; // this one connection failed; keep serving
         }
         int fd = accepted.value()->first;
         std::thread(handle_connection, fd, model, std::ref(lanes), std::ref(rings),

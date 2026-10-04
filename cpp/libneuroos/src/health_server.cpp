@@ -86,10 +86,15 @@ void HealthServer::serve(const std::string& socket_path, std::vector<std::uint32
     for (;;) {
         auto accepted = server.value().accept();
         if (!accepted) {
-            break; // fatal accept() error
+            // M2: `accept` now reports only an unusable *listening* socket
+            // as an error -- a failure that costs one connection returns
+            // `nullopt` instead -- so there is genuinely nothing left to
+            // serve here. libneuroos deliberately links no logger, so the
+            // component's own `serve` caller is where this gets reported.
+            break;
         }
         if (!accepted.value().has_value()) {
-            continue; // rejected peer uid; keep serving
+            continue; // this one connection failed; keep serving
         }
         int fd = accepted.value()->first;
         std::thread(handle_connection, fd, std::cref(*this)).detach();

@@ -55,9 +55,12 @@ pub async fn serve(clients: Clients, path: PathBuf, allowed_uids: Vec<u32>) {
             Ok(Some((stream, _cred))) => {
                 tokio::spawn(handle_conn(stream, clients.clone()));
             }
-            Ok(None) => continue, // rejected peer (SO_PEERCRED not in allowlist); keep serving
+            Ok(None) => continue, // this one connection failed; keep serving
             Err(e) => {
-                tracing::warn!(error = %e, "knowledge.sock accept failed");
+                // M2: `accept` reports only an unusable listening socket as
+                // an error now, so retrying would spin at full CPU forever.
+                tracing::error!(error = %e, "knowledge.sock listener is unusable; stopped serving");
+                return;
             }
         }
     }

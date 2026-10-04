@@ -118,9 +118,12 @@ async fn serve_local(
                     Arc::clone(&backups_dir),
                 ));
             }
-            Ok(None) => continue, // rejected peer (SO_PEERCRED not in allowlist); keep serving
+            Ok(None) => continue, // this one connection failed; keep serving
             Err(e) => {
-                tracing::warn!(error = %e, "storage.sock accept failed");
+                // M2: `accept` reports only an unusable listening socket as
+                // an error now, so retrying would spin at full CPU forever.
+                tracing::error!(error = %e, "storage.sock listener is unusable; stopped serving");
+                return;
             }
         }
     }
