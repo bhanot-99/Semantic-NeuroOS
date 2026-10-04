@@ -2,3 +2,6 @@
 	path = cpp/third_party/bitnet.cpp
 	url = https://github.com/microsoft/BitNet.git
 	ignore = untracked
+[submodule "cpp/third_party/whisper.cpp"]
+	path = cpp/third_party/whisper.cpp
+	url = https://github.com/ggml-org/whisper.cpp.git
