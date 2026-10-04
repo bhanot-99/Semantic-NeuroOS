@@ -7,6 +7,7 @@ pub mod bus;
 pub mod control;
 pub mod dump;
 pub mod privacy;
+pub mod sensor_health;
 pub mod sensors;
 pub mod stream;
 

@@ -206,6 +206,17 @@ async fn ask_end_to_end_real_c3_real_c4_mock_c2_c6() {
                 !result.answer.trim().is_empty(),
                 "must have produced a real generated answer"
             );
+            // M9 / Architecture.md §7.4: the answer text is C4's output,
+            // so it carries MODEL_GENERATED on top of its evidence's
+            // taint. Nothing used to set it, so C5's answers claimed a
+            // provenance they did not have.
+            assert!(
+                result
+                    .taint
+                    .contains(neuroos_taint::TaintFlags::MODEL_GENERATED),
+                "a real generated answer must be marked MODEL_GENERATED, got {:?}",
+                result.taint
+            );
             // FR-KNO-09: real, measured own-compute over the full real
             // C3+C4 path (not a mock) -- a single sample here plus
             // `assemble::tests::own_compute_...` (fast, no-IPC, n=200) for

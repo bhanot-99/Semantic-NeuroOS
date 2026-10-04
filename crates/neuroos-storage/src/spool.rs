@@ -108,7 +108,11 @@ pub async fn ingest_existing(engine: &mut StorageEngine, dir: &Path) -> Result<u
 /// Runs forever, ingesting each spool file as it's written (real inotify,
 /// via `notify`). `engine_mutex` is shared so a caller can also serve
 /// queries against the same `StorageEngine` concurrently.
-pub async fn watch_forever(engine_mutex: &tokio::sync::Mutex<StorageEngine>, dir: &Path) {
+pub async fn watch_forever(
+    engine_mutex: &tokio::sync::Mutex<StorageEngine>,
+    dir: &Path,
+    health: &neuroos_health::HealthServer,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let watcher_result = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
@@ -147,6 +151,7 @@ pub async fn watch_forever(engine_mutex: &tokio::sync::Mutex<StorageEngine>, dir
         let mut engine = engine_mutex.lock().await;
         if let Err(e) = ingest_existing(&mut engine, dir).await {
             tracing::warn!(error = %e, "failed to ingest pre-existing spool files");
+            health.incr_error(crate::server::SPOOL_FAILED);
         }
     }
 
@@ -154,6 +159,8 @@ pub async fn watch_forever(engine_mutex: &tokio::sync::Mutex<StorageEngine>, dir
         let mut engine = engine_mutex.lock().await;
         if let Err(e) = ingest_spool_file(&mut engine, &path).await {
             tracing::warn!(error = %e, path = %path.display(), "failed to ingest spool file");
+            // M3: one bad document is counted but does not make C3 sick.
+            health.incr_error(crate::server::SPOOL_FAILED);
         }
     }
 }

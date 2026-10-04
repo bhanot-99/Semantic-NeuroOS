@@ -23,8 +23,13 @@ pub async fn serve(path: PathBuf, allowed_uids: Vec<u32>, bus: EventBus) {
                 tracing::debug!(uid = cred.uid, "monitor.sock subscriber connected");
                 tokio::spawn(handle_subscriber(stream, bus.subscribe()));
             }
-            Ok(None) => continue, // rejected peer; keep serving
-            Err(e) => tracing::warn!(error = %e, "monitor.sock accept failed"),
+            Ok(None) => continue, // this one connection failed; keep serving
+            Err(e) => {
+                // M2: `accept` reports only an unusable listening socket as
+                // an error now, so retrying would spin at full CPU forever.
+                tracing::error!(error = %e, "monitor.sock listener is unusable; stopped serving");
+                return;
+            }
         }
     }
 }

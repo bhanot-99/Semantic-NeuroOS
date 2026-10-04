@@ -89,6 +89,7 @@ test-inference: build-cpp
 test-shm: build-rust build-cpp
     cargo test -p neuroos-shm --release
     ./cpp/build/shm-stress-cpp 200000
+    ./cpp/build/cpp-shm-validate
     bash tests/contract/shm_interop.sh
 
 # --- format ----------------------------------------------------------------

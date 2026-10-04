@@ -94,6 +94,9 @@ async fn run(config: neuroos_common::Config) {
     // P0-S04 convention: a health endpoint is one line.
     let health =
         neuroos_health::HealthServer::new(concat!("neuroos-storage v", env!("CARGO_PKG_VERSION")));
+    // M3: the service reports request errors, failed ingests and a dead
+    // C1 feed through this same endpoint.
+    let reporting = std::sync::Arc::clone(&health);
     tokio::spawn(health.serve(
         neuroos_common::paths::component_health_sock("neuroos-storage"),
         vec![my_uid],
@@ -108,6 +111,7 @@ async fn run(config: neuroos_common::Config) {
             backups_dir: neuroos_common::paths::backups_dir(),
         },
         vec![my_uid],
+        reporting,
     )
     .await;
 }

@@ -67,18 +67,7 @@ impl Ring {
     /// pass `ring.fd()` (via `SCM_RIGHTS`, or plain fd inheritance across a
     /// `fork`) to the peer process, which maps it with `Ring::open`.
     pub fn create(name: &str, capacity_slots: u32, slot_size: u32) -> Result<Self, RingError> {
-        if (slot_size as usize) <= SLOT_PAYLOAD_OFF {
-            return Err(RingError::BadHeader(
-                "slot_size too small to hold slot metadata",
-            ));
-        }
-        if !slot_size.is_multiple_of(8) {
-            // every slot must be 8-byte aligned for the AtomicU64 field accesses in
-            // `ring.rs`'s field helpers (HEADER_SIZE is a multiple of 8; mmap pages
-            // always are, so this is the only alignment requirement left to enforce).
-            return Err(RingError::BadHeader("slot_size must be a multiple of 8"));
-        }
-        let total = HEADER_SIZE + capacity_slots as usize * slot_size as usize;
+        let total = validate_layout(VERSION, capacity_slots, slot_size)?;
         let fd = create_memfd(name, total)?;
         let map = SharedMap::new(memfd_as_fd(&fd), total)?;
         let ring = Self {
@@ -106,14 +95,16 @@ impl Ring {
         }
         let capacity_slots = header.capacity_slots;
         let slot_size = header.slot_size;
-        let expected = HEADER_SIZE + capacity_slots as usize * slot_size as usize;
+        // M1: the header is shared memory a peer process writes, so every
+        // field it declares is untrusted input and gets the same checks
+        // `create` applies to its arguments -- including `version`, which
+        // nothing used to read: a peer built against a different slot
+        // layout would otherwise be parsed with this layout's offsets.
+        let expected = validate_layout(header.version, capacity_slots, slot_size)?;
         if expected != size {
             return Err(RingError::BadHeader(
                 "declared capacity does not match fd size",
             ));
-        }
-        if !slot_size.is_multiple_of(8) {
-            return Err(RingError::BadHeader("slot_size must be a multiple of 8"));
         }
         Ok(Self {
             map,
@@ -166,6 +157,36 @@ impl Ring {
             only_generation: Some(generation),
         }
     }
+}
+
+/// Checks a ring's layout parameters -- from `create`'s arguments or from a
+/// peer-written header (M1) -- and returns the total mapping size.
+fn validate_layout(version: u16, capacity_slots: u32, slot_size: u32) -> Result<usize, RingError> {
+    if version != VERSION {
+        return Err(RingError::BadHeader("unsupported ring version"));
+    }
+    if capacity_slots == 0 {
+        // `seq % capacity_slots` in both `RingWriter::write_as` and
+        // `RingReader::try_read` would divide by zero.
+        return Err(RingError::BadHeader("capacity_slots must be at least 1"));
+    }
+    if (slot_size as usize) <= SLOT_PAYLOAD_OFF {
+        return Err(RingError::BadHeader(
+            "slot_size too small to hold slot metadata",
+        ));
+    }
+    if !slot_size.is_multiple_of(8) {
+        // every slot must be 8-byte aligned for the AtomicU64 field accesses in
+        // `ring.rs`'s field helpers (HEADER_SIZE is a multiple of 8; mmap pages
+        // always are, so this is the only alignment requirement left to enforce).
+        return Err(RingError::BadHeader("slot_size must be a multiple of 8"));
+    }
+    (capacity_slots as usize)
+        .checked_mul(slot_size as usize)
+        .and_then(|slots| slots.checked_add(HEADER_SIZE))
+        .ok_or(RingError::BadHeader(
+            "ring layout overflows the address space",
+        ))
 }
 
 #[repr(C, align(64))]
@@ -369,14 +390,30 @@ impl RingReader<'_> {
             let flags = u16_atomic(unsafe { slot.add(SLOT_FLAGS_OFF) }).load(Ordering::Relaxed);
             let len =
                 u16_atomic(unsafe { slot.add(SLOT_UTF8_LEN_OFF) }).load(Ordering::Relaxed) as usize;
-            // SAFETY: `len` was just read from this same slot; it is at most
-            // `slot_size - SLOT_PAYLOAD_OFF` because the writer checked that
-            // bound before ever storing a `utf8_len` this large.
-            let payload = unsafe { atomic_copy_from_slot(slot.add(SLOT_PAYLOAD_OFF), len) };
+            // M1: `len` comes from shared memory, so it is untrusted even
+            // though our own writer never stores more than `max_payload`
+            // -- a torn read, a corrupted mapping or a hostile peer can
+            // all produce a larger value, and copying it would read past
+            // the slot (past the whole mapping, for the last slot). Clamp
+            // the copy, then decide below -- once the seqlock says the
+            // read was stable -- whether this was a tear to retry or a
+            // genuinely corrupt slot to skip.
+            let max = self.ring.max_payload();
+            // SAFETY: the copy length is at most `max_payload`, so it stays
+            // inside this slot, which the mapping covers in full.
+            let payload =
+                unsafe { atomic_copy_from_slot(slot.add(SLOT_PAYLOAD_OFF), len.min(max)) };
 
             let after = seqlock.load(Ordering::Acquire);
             if after != before {
                 continue; // torn read; retry the same seq
+            }
+            if len > max {
+                // A stable read of an impossible length: the slot is
+                // corrupt, so skip it rather than hand its bytes up or
+                // spin on it forever.
+                self.next_seq = seq + 1;
+                continue;
             }
 
             // The seqlock alone only proves this read wasn't torn — it does
@@ -416,6 +453,94 @@ mod tests {
 
     fn payloads(mut reader: RingReader<'_>) -> Vec<Vec<u8>> {
         std::iter::from_fn(|| reader.try_read().map(|p| p.payload)).collect()
+    }
+
+    /// M1: a zero-capacity ring would divide by zero in `write_as` /
+    /// `try_read` (`seq % capacity_slots`), so it must be rejected at
+    /// construction.
+    #[test]
+    fn create_rejects_a_zero_capacity_ring() {
+        let err = match Ring::create("zero-capacity", 0, 64) {
+            Ok(_) => panic!("expected Ring::create to reject a zero capacity"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, RingError::BadHeader(_)), "{err:?}");
+    }
+
+    /// `Ring` is not `Debug`, so `unwrap_err` is unavailable.
+    fn open_err(fd: OwnedFd) -> RingError {
+        match Ring::open(fd) {
+            Ok(_) => panic!("expected Ring::open to reject this header"),
+            Err(err) => err,
+        }
+    }
+
+    /// Builds a memfd whose header declares `capacity_slots`/`slot_size`
+    /// (and `version`) without going through `Ring::create`, so `open`'s
+    /// own validation is what is under test. `fill` sizes the fd to match
+    /// what the header declares.
+    fn raw_ring_fd(version: u16, capacity_slots: u32, slot_size: u32, size: usize) -> OwnedFd {
+        let fd = create_memfd("raw-ring", size).unwrap();
+        let map = SharedMap::new(memfd_as_fd(&fd), size).unwrap();
+        let base = map.as_ptr();
+        unsafe {
+            std::ptr::write(base.cast::<u32>(), MAGIC);
+            std::ptr::write(base.add(4).cast::<u16>(), version);
+            std::ptr::write(base.add(6).cast::<u16>(), 0u16);
+            std::ptr::write(base.add(8).cast::<u32>(), capacity_slots);
+            std::ptr::write(base.add(12).cast::<u32>(), slot_size);
+        }
+        fd
+    }
+
+    #[test]
+    fn open_rejects_a_zero_capacity_header() {
+        let fd = raw_ring_fd(VERSION, 0, 64, HEADER_SIZE);
+        let err = open_err(fd);
+        assert!(matches!(err, RingError::BadHeader(_)), "{err:?}");
+    }
+
+    /// M1: `create` rejects a slot too small to hold the 32-byte slot
+    /// metadata, but `open` trusted the header, leaving `max_payload` to
+    /// underflow.
+    #[test]
+    fn open_rejects_a_slot_size_too_small_for_metadata() {
+        let fd = raw_ring_fd(VERSION, 2, 16, HEADER_SIZE + 32);
+        let err = open_err(fd);
+        assert!(matches!(err, RingError::BadHeader(_)), "{err:?}");
+    }
+
+    /// M1: the header carries a `version` that nothing ever checked, so a
+    /// peer built against a future slot layout would be read with this
+    /// layout's offsets.
+    #[test]
+    fn open_rejects_an_unknown_version() {
+        let fd = raw_ring_fd(VERSION + 1, 2, 64, HEADER_SIZE + 128);
+        let err = open_err(fd);
+        assert!(matches!(err, RingError::BadHeader(_)), "{err:?}");
+    }
+
+    /// M1: `utf8_len` comes from shared memory a peer (or a corrupted
+    /// mapping) controls. Without a `<= max_payload` bound the reader
+    /// copies past the end of the slot -- past the end of the mapping for
+    /// the last slot. The slot is corrupt, so it is skipped, not returned.
+    #[test]
+    fn a_corrupt_utf8_len_does_not_read_past_the_slot() {
+        let ring = Ring::create("corrupt-len", 2, 64).unwrap();
+        let writer = ring.writer();
+        writer.write(0, 0, b"first").unwrap();
+        writer.write(1, 0, b"second").unwrap();
+        // Corrupt the first slot's length past the end of the mapping.
+        u16_atomic(unsafe { ring.slot_ptr(0).add(SLOT_UTF8_LEN_OFF) })
+            .store(u16::MAX, Ordering::Relaxed);
+
+        let mut reader = ring.reader();
+        let piece = reader
+            .try_read()
+            .expect("the intact slot is still readable");
+        assert_eq!(piece.token_id, 1);
+        assert_eq!(piece.payload, b"second".to_vec());
+        assert_eq!(reader.try_read(), None);
     }
 
     /// H7: job A is still decoding when job B is submitted on the same

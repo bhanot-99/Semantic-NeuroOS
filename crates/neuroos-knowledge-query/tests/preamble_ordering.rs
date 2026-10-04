@@ -91,6 +91,15 @@ async fn ask_answers_even_when_the_voice_service_is_down() {
 
     assert_eq!(result.answer, NO_EVIDENCE_ANSWER);
     assert!(!result.degraded);
+    // M9: this answer is a fixed string C5 composed, not the model's
+    // output, so claiming MODEL_GENERATED would be false provenance.
+    assert!(
+        !result
+            .taint
+            .contains(neuroos_taint::TaintFlags::MODEL_GENERATED),
+        "the no-evidence decline never reaches C4: {:?}",
+        result.taint
+    );
 }
 
 /// A storage failure is still a real error (C3 is required, C2 isn't).

@@ -63,11 +63,23 @@ async fn run(args: Args, config: neuroos_common::Config, all_targets: Vec<target
 
     let my_uid = current_uid();
     let socket_path = neuroos_common::paths::healthd_sock();
-    tokio::spawn(neuroos_healthd::server::serve(
-        aggregate.clone(),
-        socket_path,
-        vec![my_uid],
-    ));
+    // M2: binding is done here, not inside the spawned task, so a failure
+    // is fatal and visible instead of vanishing with the dropped
+    // `JoinHandle` -- healthd without `healthd.sock` cannot answer
+    // `neuroosctl status` at all (rules.md §5.4: bad environment is fatal).
+    let server = match neuroos_healthd::server::bind(socket_path, vec![my_uid]) {
+        Ok(server) => server,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to bind healthd.sock");
+            std::process::exit(1);
+        }
+    };
+    let serving = aggregate.clone();
+    tokio::spawn(async move {
+        if let Err(e) = neuroos_healthd::server::serve_on(server, serving).await {
+            tracing::error!(error = %e, "healthd.sock listener is unusable; stopped serving");
+        }
+    });
 
     let soak_engine = args.soak.then(|| {
         Arc::new(SoakEngine::new(

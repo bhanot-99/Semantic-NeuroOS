@@ -598,6 +598,8 @@ pub struct ActivityRow {
     pub first_ns: u64,
     pub last_ns: u64,
     pub dwell_ms: u64,
+    /// M9 / ADR-0012: `TaintFlags::bits()` for `text`'s provenance.
+    pub taint: u32,
 }
 
 fn upper(until_ns: u64) -> i64 {
@@ -631,6 +633,11 @@ pub fn activity_windows(
             first_ns: r.get::<_, i64>(2)? as u64,
             last_ns: r.get::<_, i64>(3)? as u64,
             dwell_ms: r.get::<_, i64>(4)? as u64,
+            // M9 / ADR-0012: `focus_history` is C1's own observation of
+            // this desktop and has no taint column -- empty is a positive
+            // statement about first-party telemetry, not a missing value.
+            // If a non-C1 writer ever lands focus rows, revisit this.
+            taint: 0,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -645,7 +652,7 @@ pub fn activity_media(
     limit: usize,
 ) -> Result<Vec<ActivityRow>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT text, t_ns FROM chunks_fts
+        "SELECT text, t_ns, taint FROM chunks_fts
          WHERE domain = 'media_playback' AND t_ns >= ?1 AND t_ns <= ?2
          ORDER BY t_ns LIMIT ?3",
     )?;
@@ -657,6 +664,10 @@ pub fn activity_media(
             first_ns: t as u64,
             last_ns: t as u64,
             dwell_ms: 0,
+            // M9 / ADR-0012: the chunk's real taint, which this path used
+            // to discard -- a media chunk derived from a C7-fetched page
+            // is EXTERNAL_UNTRUSTED and must stay so (R0-3).
+            taint: r.get(2)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -677,6 +688,66 @@ mod tests {
         // re-running migrate() on the same connection must not error or
         // re-apply (CREATE TABLE would fail the second time if it did).
         migrate(&conn).unwrap();
+    }
+
+    /// M9 / ADR-0012: `activity_media` reads `chunks_fts`, whose rows
+    /// carry a real taint, but `ActivityRow` had no taint field so the
+    /// value was dropped on the floor -- a media item derived from a
+    /// C7-fetched page lost its `EXTERNAL_UNTRUSTED` on the way to C5.
+    #[test]
+    fn activity_media_carries_each_chunks_taint() {
+        let conn = open_in_memory().unwrap();
+        let external = neuroos_taint::TaintFlags::EXTERNAL_UNTRUSTED.bits();
+        insert_chunk_fts(
+            &conn,
+            &FtsChunk {
+                chunk_id: "local",
+                entity_id: 1,
+                domain: "media_playback",
+                taint: 0,
+                t_ns: 1_000,
+                text: "vlc played a local file",
+            },
+        )
+        .unwrap();
+        insert_chunk_fts(
+            &conn,
+            &FtsChunk {
+                chunk_id: "fetched",
+                entity_id: 2,
+                domain: "media_playback",
+                taint: external,
+                t_ns: 2_000,
+                text: "browser played a web video",
+            },
+        )
+        .unwrap();
+
+        let rows = activity_media(&conn, 0, 0, 10).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].taint, 0, "the local chunk is untainted");
+        assert_eq!(
+            rows[1].taint, external,
+            "the fetched chunk must keep EXTERNAL_UNTRUSTED"
+        );
+    }
+
+    /// `focus_history` has no taint column because it is C1's own
+    /// first-party observation; empty is the correct positive value, not a
+    /// missing one (ADR-0012).
+    #[test]
+    fn activity_windows_report_empty_taint() {
+        let conn = open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO focus_history
+             (app_id, title, pid, root_pid, t_start_ns, t_end_ns, dwell_ms)
+             VALUES ('vlc', 'Show E03', 0, 0, 1000, 2000, 1000)",
+            [],
+        )
+        .unwrap();
+        let rows = activity_windows(&conn, 0, 0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].taint, 0);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use neuroos_health::HealthServer;
 use neuroos_ipc::{Backoff, DEFAULT_MAX_FRAME, FramingError, connect, read_envelope};
 use neuroos_proto::v1::envelope;
 use tokio::sync::Mutex;
@@ -20,13 +21,21 @@ const CONNECT_DEADLINE: Duration = Duration::from_millis(250);
 /// Runs forever: subscribe, ingest until the stream ends, back off,
 /// reconnect. Must run on the same `LocalSet` as `server.rs` (the engine's
 /// futures are `!Send`, see that module's doc comment).
-pub async fn subscribe_forever(engine: Arc<Mutex<StorageEngine>>, monitor_sock: PathBuf) {
+pub async fn subscribe_forever(
+    engine: Arc<Mutex<StorageEngine>>,
+    monitor_sock: PathBuf,
+    health: Arc<HealthServer>,
+) {
     let mut backoff = Backoff::new();
     loop {
-        match subscribe_once(&engine, &monitor_sock, &mut backoff).await {
+        match subscribe_once(&engine, &monitor_sock, &mut backoff, &health).await {
             Ok(()) => tracing::info!("monitor.sock stream ended; reconnecting"),
             Err(e) => tracing::debug!(error = %e, "monitor.sock unavailable; retrying"),
         }
+        // M3: C3 with no telemetry feed is a component that cannot do its
+        // main job, so it reports DEGRADED for as long as the feed is down
+        // (cleared in `subscribe_once` once it is subscribed again).
+        health.report_degraded(crate::server::MONITOR_FEED_DOWN);
         tokio::time::sleep(backoff.next_delay()).await;
     }
 }
@@ -37,9 +46,11 @@ async fn subscribe_once(
     engine: &Mutex<StorageEngine>,
     monitor_sock: &std::path::Path,
     backoff: &mut Backoff,
+    health: &HealthServer,
 ) -> Result<(), FramingError> {
     let mut stream = connect(monitor_sock, CONNECT_DEADLINE).await?;
     backoff.reset();
+    health.set_status(neuroos_proto::v1::Status::Ok);
     tracing::info!("subscribed to monitor.sock");
     while let Some(env) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await? {
         let Some(envelope::Body::Telemetry(event)) = env.body else {
@@ -49,6 +60,7 @@ async fn subscribe_once(
         // feed; the message carries no event content (R0-6).
         if let Err(e) = engine.lock().await.ingest(&event).await {
             tracing::warn!(error = %e, source = %event.source, "telemetry event not ingested");
+            health.incr_error(crate::server::INGEST_FAILED);
         }
     }
     Ok(())
@@ -165,16 +177,35 @@ mod tests {
                         session(2, "org.mozilla.firefox", 20_000_000_000),
                     ],
                 );
-                tokio::task::spawn_local(subscribe_forever(Arc::clone(&engine), sock));
+                let health = HealthServer::new("neuroos-storage test");
+                tokio::task::spawn_local(subscribe_forever(
+                    Arc::clone(&engine),
+                    sock,
+                    Arc::clone(&health),
+                ));
 
                 assert_eq!(
                     wait_for_focus(&engine, 3_000_000_000).await.as_deref(),
                     Some("org.gnome.TextEditor")
                 );
+                // M3: C3 reports OK while it is subscribed, and counts the
+                // feed going down when C1 restarts mid-stream.
+                assert_eq!(
+                    health.snapshot().status,
+                    neuroos_proto::v1::Status::Ok as i32
+                );
                 assert_eq!(
                     wait_for_focus(&engine, 22_000_000_000).await.as_deref(),
                     Some("org.mozilla.firefox"),
                     "the second C1 connection must be picked up after the first closes"
+                );
+                assert_eq!(
+                    health
+                        .snapshot()
+                        .error_counters
+                        .get(crate::server::MONITOR_FEED_DOWN),
+                    Some(&1),
+                    "the first connection closing must have been counted"
                 );
             })
             .await;

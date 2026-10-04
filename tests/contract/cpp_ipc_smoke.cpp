@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +49,7 @@ void test_envelope_round_trip() {
         auto req = neuroos::ipc::read_envelope(client_fd, neuroos::ipc::kDefaultMaxFrame);
         check(req.has_value() && req.value().has_value(), "server must read the request");
         check(req.value()->body_case() == neuroos::v1::Envelope::kHealthRequest,
-             "request must be a HealthRequest");
+              "request must be a HealthRequest");
 
         neuroos::v1::Envelope resp;
         resp.set_schema_version(1);
@@ -70,16 +71,17 @@ void test_envelope_round_trip() {
     req.set_schema_version(1);
     req.set_request_id(42);
     req.mutable_health_request();
-    auto wrote = neuroos::ipc::write_envelope(client_fd.value(), req, neuroos::ipc::kDefaultMaxFrame);
+    auto wrote =
+        neuroos::ipc::write_envelope(client_fd.value(), req, neuroos::ipc::kDefaultMaxFrame);
     check(wrote.has_value(), "client must write the request");
 
     auto resp = neuroos::ipc::read_envelope(client_fd.value(), neuroos::ipc::kDefaultMaxFrame);
     check(resp.has_value() && resp.value().has_value(), "client must read the response");
     check(resp.value()->request_id() == 42, "request_id must round-trip");
     check(resp.value()->health_response().status() == neuroos::v1::STATUS_OK,
-         "status must round-trip");
+          "status must round-trip");
     check(resp.value()->health_response().build_info() == "cpp-ipc-smoke",
-         "build_info must round-trip");
+          "build_info must round-trip");
 
     ::close(client_fd.value());
     server_thread.join();
@@ -106,8 +108,8 @@ void test_scm_rights_fd_passing() {
 
         neuroos::v1::Envelope resp;
         resp.set_schema_version(1);
-        auto wrote = neuroos::ipc::write_envelope_with_fd(client_fd, resp,
-                                                          neuroos::ipc::kDefaultMaxFrame, ring.fd());
+        auto wrote = neuroos::ipc::write_envelope_with_fd(
+            client_fd, resp, neuroos::ipc::kDefaultMaxFrame, ring.fd());
         check(wrote.has_value(), "server must write the response with the attached fd");
         ::close(client_fd);
     });
@@ -116,7 +118,8 @@ void test_scm_rights_fd_passing() {
     auto client_fd = neuroos::ipc::connect(path, std::chrono::milliseconds(1000));
     check(client_fd.has_value(), "client connect must succeed");
 
-    auto got = neuroos::ipc::read_envelope_with_fd(client_fd.value(), neuroos::ipc::kDefaultMaxFrame);
+    auto got =
+        neuroos::ipc::read_envelope_with_fd(client_fd.value(), neuroos::ipc::kDefaultMaxFrame);
     check(got.has_value() && got.value().has_value(), "client must read the response");
     check(got.value()->fd >= 0, "must have received the ring's fd via SCM_RIGHTS");
 
@@ -125,7 +128,7 @@ void test_scm_rights_fd_passing() {
     check(piece.has_value(), "reader must see the written token");
     check(piece->token_id == 7, "token_id must round-trip");
     check(piece->payload.size() == 2 && piece->payload[0] == 'h' && piece->payload[1] == 'i',
-         "payload bytes must round-trip");
+          "payload bytes must round-trip");
 
     ::close(client_fd.value());
     server_thread.join();
@@ -141,9 +144,8 @@ void test_health_server_round_trip() {
     server.record_latency("op", std::chrono::milliseconds(5));
     server.incr_error("timeout");
 
-    std::thread server_thread([&server, &path] {
-        server.serve(path, {static_cast<std::uint32_t>(::getuid())});
-    });
+    std::thread server_thread(
+        [&server, &path] { server.serve(path, {static_cast<std::uint32_t>(::getuid())}); });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     auto client_fd = neuroos::ipc::connect(path, std::chrono::milliseconds(1000));
@@ -152,7 +154,8 @@ void test_health_server_round_trip() {
     neuroos::v1::Envelope req;
     req.set_schema_version(1);
     req.mutable_health_request();
-    auto wrote = neuroos::ipc::write_envelope(client_fd.value(), req, neuroos::ipc::kDefaultMaxFrame);
+    auto wrote =
+        neuroos::ipc::write_envelope(client_fd.value(), req, neuroos::ipc::kDefaultMaxFrame);
     check(wrote.has_value(), "client must write the HealthRequest");
 
     auto resp = neuroos::ipc::read_envelope(client_fd.value(), neuroos::ipc::kDefaultMaxFrame);
@@ -170,12 +173,33 @@ void test_health_server_round_trip() {
     std::printf("OK: health server round trip over a real UDS socket\n");
 }
 
+// M2: a failure that costs one connection must not be classified as a
+// dead listener, or every C++ server dies permanently on the first one.
+// Must agree with `is_per_connection_error` in
+// crates/neuroos-ipc/src/server.rs.
+void test_accept_error_classification() {
+    for (int err : {ECONNABORTED, EINTR, EAGAIN, EPERM, ECONNRESET, ETIMEDOUT, EMFILE, ENFILE,
+                    ENOBUFS, ENOMEM}) {
+        check(neuroos::ipc::accept_errno_is_per_connection(err),
+              "a doomed connection must not doom the listener");
+    }
+    for (int err : {EBADF, EINVAL, ENOTSOCK, EFAULT}) {
+        check(!neuroos::ipc::accept_errno_is_per_connection(err),
+              "a broken listener must be reported as fatal");
+    }
+    check(neuroos::ipc::accept_errno_is_resource_exhaustion(EMFILE), "EMFILE must get the backoff");
+    check(!neuroos::ipc::accept_errno_is_resource_exhaustion(ECONNABORTED),
+          "ECONNABORTED must not get the backoff");
+    std::printf("OK: accept error classification matches the Rust side\n");
+}
+
 } // namespace
 
 int main() {
     test_envelope_round_trip();
     test_scm_rights_fd_passing();
     test_health_server_round_trip();
+    test_accept_error_classification();
     std::printf("all cpp_ipc_smoke checks passed\n");
     return 0;
 }

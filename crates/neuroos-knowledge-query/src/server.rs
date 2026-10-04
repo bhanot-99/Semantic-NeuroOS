@@ -26,6 +26,19 @@ use crate::voice_client::VoiceClient;
 /// way it already does for every other component's histograms.
 pub const OWN_COMPUTE_HISTOGRAM: &str = "ask_own_compute_ns";
 
+/// M3: C5a's endpoint reported OK no matter what, because nothing ever
+/// called `incr_error`/`set_status`. These are the counter names it now
+/// reports (stable identifiers, never user content -- rules.md R0-6).
+/// `ask()` answering degraded is the single most useful signal C5a has:
+/// it means C3, C4 or the kernel let it down.
+pub const ASK_DEGRADED: &str = "ask_degraded";
+/// `ask()` failed outright, so the caller got the apology response.
+pub const ASK_FAILED: &str = "ask_failed";
+/// FR-KNO-11's graph view could not be rendered or written.
+pub const GRAPH_VIEW_FAILED: &str = "render_graph_view_failed";
+/// A request this socket does not serve.
+pub const UNSUPPORTED_REQUEST: &str = "unsupported_request";
+
 /// Every downstream client `ask()` needs, bundled so `serve()` has one
 /// cheap-to-clone value per connection instead of five. Each client is
 /// just a socket `PathBuf` wrapper -- cloning opens no new connection.
@@ -55,9 +68,12 @@ pub async fn serve(clients: Clients, path: PathBuf, allowed_uids: Vec<u32>) {
             Ok(Some((stream, _cred))) => {
                 tokio::spawn(handle_conn(stream, clients.clone()));
             }
-            Ok(None) => continue, // rejected peer (SO_PEERCRED not in allowlist); keep serving
+            Ok(None) => continue, // this one connection failed; keep serving
             Err(e) => {
-                tracing::warn!(error = %e, "knowledge.sock accept failed");
+                // M2: `accept` reports only an unusable listening socket as
+                // an error now, so retrying would spin at full CPU forever.
+                tracing::error!(error = %e, "knowledge.sock listener is unusable; stopped serving");
+                return;
             }
         }
     }
@@ -120,6 +136,9 @@ async fn handle_request(env: Envelope, clients: &Clients) -> Envelope {
                     clients
                         .health
                         .record_latency(OWN_COMPUTE_HISTOGRAM, result.own_compute);
+                    if result.degraded {
+                        clients.health.incr_error(ASK_DEGRADED);
+                    }
                     envelope::Body::AskResponse(AskResponse {
                         answer: result.answer,
                         taint: Some(Taint {
@@ -130,6 +149,7 @@ async fn handle_request(env: Envelope, clients: &Clients) -> Envelope {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ask() failed, answering degraded");
+                    clients.health.incr_error(ASK_FAILED);
                     degraded_response()
                 }
             }
@@ -139,18 +159,24 @@ async fn handle_request(env: Envelope, clients: &Clients) -> Envelope {
                 Ok(path) => envelope::Body::RenderGraphViewResponse(RenderGraphViewResponse {
                     path: path.display().to_string(),
                 }),
-                Err(e) => envelope::Body::Error(Error {
-                    code: ErrorCode::Internal as i32,
-                    message: format!("RenderGraphView failed: {e}"),
-                    retryable: true,
-                }),
+                Err(e) => {
+                    clients.health.incr_error(GRAPH_VIEW_FAILED);
+                    envelope::Body::Error(Error {
+                        code: ErrorCode::Internal as i32,
+                        message: format!("RenderGraphView failed: {e}"),
+                        retryable: true,
+                    })
+                }
             }
         }
-        _ => envelope::Body::Error(Error {
-            code: ErrorCode::Internal as i32,
-            message: "unsupported request on knowledge.sock".to_string(),
-            retryable: true,
-        }),
+        _ => {
+            clients.health.incr_error(UNSUPPORTED_REQUEST);
+            envelope::Body::Error(Error {
+                code: ErrorCode::Internal as i32,
+                message: "unsupported request on knowledge.sock".to_string(),
+                retryable: true,
+            })
+        }
     };
     Envelope {
         schema_version: 1,
@@ -243,6 +269,7 @@ mod tests {
             health: neuroos_health::HealthServer::new("test"),
         };
 
+        let health = Arc::clone(&clients.health);
         tokio::spawn(serve(clients, knowledge_sock.clone(), vec![my_uid]));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -273,6 +300,15 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+        // M3: the degraded answer is visible on C5a's health endpoint
+        // instead of the endpoint reporting a flat OK with no counters.
+        let counters = health.snapshot().error_counters;
+        assert_eq!(
+            counters.get(ASK_DEGRADED).copied().unwrap_or(0)
+                + counters.get(ASK_FAILED).copied().unwrap_or(0),
+            1,
+            "{counters:?}"
+        );
     }
 
     #[tokio::test]
@@ -288,6 +324,7 @@ mod tests {
             distill_cache: DistillationCache::new(),
             health: neuroos_health::HealthServer::new("test"),
         };
+        let health = Arc::clone(&clients.health);
         tokio::spawn(serve(clients, knowledge_sock.clone(), vec![my_uid]));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -314,6 +351,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(resp.body, Some(envelope::Body::Error(_))));
+        assert_eq!(
+            health.snapshot().error_counters.get(UNSUPPORTED_REQUEST),
+            Some(&1)
+        );
     }
 
     /// FR-KNO-11 (P5-S08): `RenderGraphViewRequest` fetches entities/edges

@@ -68,8 +68,7 @@ async fn healthd_classifies_all_8_mock_components_correctly() {
 
     // per-target timeout well under the "slow" mocks' 10s hang, so they
     // classify as DOWN within this one cycle rather than blocking it.
-    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300), true)
-        .await;
+    neuroos_healthd::scrape_cycle(&targets, &aggregate, None, Duration::from_millis(300)).await;
 
     let snapshot = aggregate.snapshot();
     assert_eq!(snapshot.len(), 8);

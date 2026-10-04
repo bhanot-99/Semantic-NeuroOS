@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
 
     std::thread server_thread([&] {
         neuroos::inference::serve(neuroos::paths::runtime_dir() + "/inference.sock", {my_uid},
-                                  model.value(), lanes, rings, config.max_context_tokens);
+                                  model.value(), lanes, rings, config.max_context_tokens, health);
     });
 
     while (g_shutdown == 0) {

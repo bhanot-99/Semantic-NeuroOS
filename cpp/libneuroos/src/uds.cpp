@@ -9,8 +9,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 
 namespace neuroos::ipc {
 
@@ -97,15 +99,37 @@ UdsServer& UdsServer::operator=(UdsServer&& other) noexcept {
     return *this;
 }
 
+bool accept_errno_is_resource_exhaustion(int err) {
+    return err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM;
+}
+
+bool accept_errno_is_per_connection(int err) {
+    return err == ECONNABORTED || err == EINTR || err == EAGAIN || err == EWOULDBLOCK ||
+           err == EPERM || err == ECONNRESET || err == ETIMEDOUT ||
+           accept_errno_is_resource_exhaustion(err);
+}
+
 Expected<std::optional<std::pair<int, PeerCred>>, IpcError> UdsServer::accept() {
     int client_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
     if (client_fd < 0) {
-        return make_unexpected(IpcError::io(std::strerror(errno)));
+        int saved_errno = errno;
+        if (!accept_errno_is_per_connection(saved_errno)) {
+            return make_unexpected(IpcError::io(std::strerror(saved_errno)));
+        }
+        if (accept_errno_is_resource_exhaustion(saved_errno)) {
+            // Retrying immediately would spin at full CPU for as long as
+            // the shortage lasts, which is the whole point of not treating
+            // it as fatal.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return std::optional<std::pair<int, PeerCred>>{std::nullopt};
     }
+    // A failed SO_PEERCRED lookup says nothing about the listening socket,
+    // so it costs this connection and nothing more (M2).
     auto cred = peer_cred(client_fd);
     if (!cred) {
         ::close(client_fd);
-        return make_unexpected(cred.error());
+        return std::optional<std::pair<int, PeerCred>>{std::nullopt};
     }
     if (!is_allowed(cred.value(), allowed_uids_)) {
         ::close(client_fd);

@@ -12,6 +12,7 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 
 use crate::bus::EventBus;
 use crate::privacy::PrivacyState;
+use crate::sensor_health::{SensorHealth, supervise};
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{IdleEvent, RawTelemetryEvent};
 
@@ -29,21 +30,23 @@ pub enum IdleSensorError {
 
 /// Runs the idle sensor forever, reconnecting with backoff on any error
 /// (AB-10; FI: "compositor restart"). Never returns under normal operation.
-pub async fn run_forever(timeout_ms: u32, bus: EventBus, privacy: PrivacyState) {
-    let mut backoff_ms = 100u64;
-    loop {
+pub async fn run_forever(
+    timeout_ms: u32,
+    bus: EventBus,
+    privacy: PrivacyState,
+    health: SensorHealth,
+) {
+    supervise("idle", health, move || {
         let bus = bus.clone();
         let privacy = privacy.clone();
-        let result =
-            tokio::task::spawn_blocking(move || run_once(timeout_ms, &bus, &privacy)).await;
-        match result {
-            Ok(Ok(())) => unreachable!("run_once only returns on error"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "idle sensor stopped; reconnecting"),
-            Err(e) => tracing::warn!(error = %e, "idle sensor thread panicked; reconnecting"),
+        async move {
+            match tokio::task::spawn_blocking(move || run_once(timeout_ms, &bus, &privacy)).await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(e) => Err(format!("sensor thread panicked: {e}")),
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(10_000);
-    }
+    })
+    .await;
 }
 
 fn run_once(

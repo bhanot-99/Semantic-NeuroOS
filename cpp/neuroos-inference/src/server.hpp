@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "libneuroos/health_server.hpp"
+
 #include "engine.hpp"
 #include "lanes.hpp"
 #include "ring.hpp"
@@ -19,8 +21,12 @@ namespace neuroos::inference {
 // all with the same value) — used to reject an oversized prompt
 // synchronously, before it's ever queued (phases.md §5.3 FI: "oversized
 // prompt rejected").
+//
+// `health` is the same endpoint main.cpp serves on
+// `neuroos-inference.health.sock`: M3 (nothing ever reported an error, so
+// C4 always looked OK) is why every rejected request is counted there.
 void serve(const std::string& socket_path, std::vector<std::uint32_t> allowed_uids,
            std::shared_ptr<Model> model, LaneScheduler& lanes, RingRegistry& rings,
-           std::uint32_t max_context_tokens);
+           std::uint32_t max_context_tokens, neuroos::health::HealthServer& health);
 
 } // namespace neuroos::inference

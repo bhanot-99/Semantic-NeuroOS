@@ -426,7 +426,11 @@ fn fuse_rrf(
     let mut fused: Vec<(f32, crate::lance::ChunkMatch)> = Vec::new();
     let mut by_text: HashMap<String, usize> = HashMap::new();
     for (rank, m) in dense.into_iter().enumerate() {
-        if by_text.contains_key(&m.text) {
+        // M9 / Architecture.md §7.4: dropping a duplicate must not drop its
+        // taint with it -- `taint(output) = union(taint(inputs))`, and R0-3
+        // forbids any path that lowers it.
+        if let Some(&i) = by_text.get(&m.text) {
+            fused[i].1.taint |= m.taint;
             continue;
         }
         by_text.insert(m.text.clone(), fused.len());
@@ -436,6 +440,11 @@ fn fuse_rrf(
     let mut keyword_rank = 0usize;
     for hit in keyword {
         if !seen_keyword.insert(hit.text.clone()) {
+            // M9: same rule as the dense loop above -- a repeated text is
+            // not a reason to forget where one of its copies came from.
+            if let Some(&i) = by_text.get(&hit.text) {
+                fused[i].1.taint |= hit.taint;
+            }
             continue;
         }
         let rrf = 1.0 / (RRF_K + keyword_rank as f32 + 1.0);
@@ -446,6 +455,9 @@ fn fuse_rrf(
             Some(&i) => {
                 fused[i].0 += rrf;
                 fused[i].1.keyword_score = score;
+                // M9: the two hits are the same text from two indexes, so
+                // the surviving chunk carries both provenances.
+                fused[i].1.taint |= hit.taint;
             }
             None => {
                 by_text.insert(hit.text.clone(), fused.len());
@@ -692,6 +704,93 @@ mod tests {
         };
         assert!((score("a") - 2.0).abs() < f32::EPSILON, "lush + pop");
         assert!((score("b") - 1.0).abs() < f32::EPSILON, "tests ~ test");
+    }
+
+    fn dense(id: &str, text: &str, taint: u32) -> crate::lance::ChunkMatch {
+        crate::lance::ChunkMatch {
+            chunk_id: id.into(),
+            entity_id: 1,
+            text: text.into(),
+            taint,
+            t_ns: 0,
+            domain: "window_focus".into(),
+            distance: 0.1,
+            keyword_score: 0.0,
+        }
+    }
+
+    fn tainted_hit(id: &str, text: &str, taint: u32) -> crate::sqlite::FtsHit {
+        let mut h = hit(id, text);
+        h.taint = taint;
+        h
+    }
+
+    const EXTERNAL: u32 = 1; // TaintFlags::EXTERNAL_UNTRUSTED.bits()
+    const MODEL: u32 = 4; // TaintFlags::MODEL_GENERATED.bits()
+
+    /// M9: when a dense hit and a keyword hit carried the same text, the
+    /// merge kept the *dense* chunk's taint and discarded the keyword
+    /// hit's. If the keyword hit was the EXTERNAL_UNTRUSTED one, that flag
+    /// vanished -- taint lowered, which R0-3 forbids outright.
+    #[test]
+    fn merging_a_dense_and_keyword_hit_unions_their_taint() {
+        let fused = fuse_rrf(
+            vec![dense("a", "same text", 0)],
+            vec![tainted_hit("a-kw", "same text", EXTERNAL)],
+            "same text",
+            5,
+        );
+        assert_eq!(fused.len(), 1);
+        assert_eq!(
+            fused[0].taint, EXTERNAL,
+            "the keyword hit's taint must survive the merge"
+        );
+    }
+
+    /// The same leak in the other direction: a duplicate *dense* chunk was
+    /// skipped outright, taking its taint with it.
+    #[test]
+    fn dropping_a_duplicate_dense_chunk_keeps_its_taint() {
+        let fused = fuse_rrf(
+            vec![
+                dense("a", "same text", 0),
+                dense("b", "same text", EXTERNAL),
+            ],
+            Vec::new(),
+            "same text",
+            5,
+        );
+        assert_eq!(fused.len(), 1);
+        assert_eq!(
+            fused[0].taint, EXTERNAL,
+            "the dropped duplicate's taint must be unioned in"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_keyword_hit_also_contributes_its_taint() {
+        let fused = fuse_rrf(
+            Vec::new(),
+            vec![
+                tainted_hit("a", "same text", 0),
+                tainted_hit("b", "same text", EXTERNAL),
+            ],
+            "same text",
+            5,
+        );
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].taint, EXTERNAL);
+    }
+
+    #[test]
+    fn taint_flags_from_several_sources_all_accumulate() {
+        let fused = fuse_rrf(
+            vec![dense("a", "same text", MODEL)],
+            vec![tainted_hit("a-kw", "same text", EXTERNAL)],
+            "same text",
+            5,
+        );
+        assert_eq!(fused[0].taint, EXTERNAL | MODEL);
     }
 
     #[test]

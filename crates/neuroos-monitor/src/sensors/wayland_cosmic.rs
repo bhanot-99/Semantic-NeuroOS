@@ -7,6 +7,9 @@
 //! [`run_forever`] is the real push-event subscription `monitor.sock`
 //! streams from; [`list_toplevels`] remains as the original one-shot spike
 //! proof and this module's non-live unit-test surface.
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_handle_v1, zcosmic_toplevel_info_v1,
 };
@@ -15,6 +18,7 @@ use wayland_client::{Connection, Dispatch, QueueHandle, event_created_child};
 
 use crate::bus::EventBus;
 use crate::privacy::PrivacyState;
+use crate::sensor_health::{SensorHealth, supervise};
 use crate::sensors::proc;
 use neuroos_proto::v1::raw_telemetry_event::Payload;
 use neuroos_proto::v1::{
@@ -191,25 +195,29 @@ impl ToplevelState {
 
 /// Runs the push-event toplevel sensor forever, reconnecting with backoff on
 /// any error (AB-10; FI: "compositor restart").
-pub async fn run_forever(bus: EventBus, privacy: PrivacyState) {
-    let mut backoff_ms = 100u64;
-    loop {
+pub async fn run_forever(bus: EventBus, privacy: PrivacyState, health: SensorHealth) {
+    // M5: one id source for the whole process, so reconnects continue the
+    // sequence instead of restarting it.
+    let ids = ToplevelIdSource::new();
+    supervise("wayland_cosmic", health, move || {
         let bus = bus.clone();
         let privacy = privacy.clone();
-        let result = tokio::task::spawn_blocking(move || run_once(&bus, &privacy)).await;
-        match result {
-            Ok(Ok(())) => unreachable!("run_once only returns on error"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "wayland_cosmic sensor stopped; reconnecting"),
-            Err(e) => {
-                tracing::warn!(error = %e, "wayland_cosmic sensor thread panicked; reconnecting")
+        let ids = ids.clone();
+        async move {
+            match tokio::task::spawn_blocking(move || run_once(&bus, &privacy, &ids)).await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(e) => Err(format!("sensor thread panicked: {e}")),
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(10_000);
-    }
+    })
+    .await;
 }
 
-fn run_once(bus: &EventBus, privacy: &PrivacyState) -> Result<(), WaylandError> {
+fn run_once(
+    bus: &EventBus,
+    privacy: &PrivacyState,
+    ids: &ToplevelIdSource,
+) -> Result<(), WaylandError> {
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
     let mut event_queue = conn.new_event_queue();
@@ -219,6 +227,7 @@ fn run_once(bus: &EventBus, privacy: &PrivacyState) -> Result<(), WaylandError> 
     let mut state = PushState {
         bus: bus.clone(),
         privacy: privacy.clone(),
+        ids: ids.clone(),
         ..Default::default()
     };
     event_queue.roundtrip(&mut state)?;
@@ -226,12 +235,20 @@ fn run_once(bus: &EventBus, privacy: &PrivacyState) -> Result<(), WaylandError> 
         return Err(WaylandError::ProtocolUnsupported);
     }
 
-    loop {
-        event_queue.blocking_dispatch(&mut state)?;
-        if state.manager_finished {
-            return Err(WaylandError::ProtocolUnsupported);
+    let outcome = loop {
+        if let Err(e) = event_queue.blocking_dispatch(&mut state) {
+            break Err(WaylandError::from(e));
         }
-    }
+        if state.manager_finished {
+            break Err(WaylandError::ProtocolUnsupported);
+        }
+    };
+    // M5: the connection is going away and the compositor will never send
+    // `Closed` for the windows that were still open on it, so C3 would
+    // keep them open forever (and keep counting dwell). Close them out
+    // here; the ids are never reused, so these are unambiguous.
+    state.close_open_toplevels();
+    outcome
 }
 
 #[derive(Default)]
@@ -243,10 +260,39 @@ struct PushToplevel {
     app_id_for_pid: Option<String>,
 }
 
+/// Hands out `toplevel_id`s for the life of the *process*, not of one
+/// Wayland connection.
+///
+/// M5: this counter used to live in `PushState`, which `run_once` rebuilds
+/// on every reconnect, so after a compositor restart the sensor started
+/// again at 1 and handed the ids of windows C3 still had open to brand new
+/// windows. C3's ingest filter then paired a stale `active_since_ns` with
+/// a new window and reported a dwell that never happened. Ids are
+/// monotonic across reconnects now, so a new window can never be mistaken
+/// for an old one.
+#[derive(Clone, Default)]
+pub struct ToplevelIdSource {
+    next: Arc<AtomicU64>,
+}
+
+impl ToplevelIdSource {
+    pub fn new() -> Self {
+        Self {
+            next: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        // Relaxed: the only invariant is uniqueness, and ordering against
+        // other memory is established by the event queue itself.
+        self.next.fetch_add(1, Ordering::Relaxed).max(1)
+    }
+}
+
 struct PushState {
     toplevel_info: Option<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1>,
     toplevels: Vec<PushToplevel>,
-    next_id: u64,
+    ids: ToplevelIdSource,
     manager_finished: bool,
     bus: EventBus,
     privacy: PrivacyState,
@@ -257,7 +303,7 @@ impl Default for PushState {
         Self {
             toplevel_info: None,
             toplevels: Vec::new(),
-            next_id: 1,
+            ids: ToplevelIdSource::new(),
             manager_finished: false,
             bus: EventBus::new(1),
             privacy: PrivacyState::new(Vec::new()),
@@ -266,6 +312,21 @@ impl Default for PushState {
 }
 
 impl PushState {
+    /// Publishes `Closed` for every toplevel still open on this (now dead)
+    /// connection -- see `run_once`'s call site.
+    fn close_open_toplevels(&mut self) {
+        for toplevel in std::mem::take(&mut self.toplevels) {
+            // Only windows C3 was actually told about need closing.
+            if toplevel.published.is_some() {
+                self.publish(
+                    toplevel.id,
+                    Kind::Closed(WindowClosed {}),
+                    toplevel.app_id_for_pid.as_deref(),
+                );
+            }
+        }
+    }
+
     fn publish(&self, toplevel_id: u64, kind: Kind, app_id_for_gate: Option<&str>) {
         if !self
             .privacy
@@ -381,8 +442,7 @@ impl Dispatch<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for PushState
     ) {
         match event {
             zcosmic_toplevel_info_v1::Event::Toplevel { toplevel } => {
-                let id = state.next_id;
-                state.next_id += 1;
+                let id = state.ids.next_id();
                 state.toplevels.push(PushToplevel {
                     id,
                     handle: Some(toplevel),
@@ -468,6 +528,86 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
+    /// M5: `next_id` lived in `PushState`, which `run_once` rebuilds on
+    /// every reconnect, so ids restarted at 1 and the first window after a
+    /// compositor restart inherited the id of a window C3 still had open.
+    #[test]
+    fn ids_continue_across_reconnects_instead_of_restarting() {
+        let ids = ToplevelIdSource::new();
+        // One connection's worth of windows.
+        let first: Vec<u64> = (0..3).map(|_| ids.next_id()).collect();
+        assert_eq!(first, vec![1, 2, 3]);
+
+        // The compositor restarts: `run_once` builds a fresh `PushState`
+        // from the same source.
+        let after_reconnect: Vec<u64> = (0..3)
+            .map(|_| {
+                PushState {
+                    ids: ids.clone(),
+                    ..Default::default()
+                }
+                .ids
+                .next_id()
+            })
+            .collect();
+        assert_eq!(after_reconnect, vec![4, 5, 6]);
+        assert!(
+            after_reconnect.iter().all(|id| !first.contains(id)),
+            "an id was reused: {first:?} then {after_reconnect:?}"
+        );
+    }
+
+    /// M5: when the connection dies the compositor never sends `Closed`
+    /// for the windows that were open on it, so C3 kept them open (and
+    /// kept counting dwell) forever.
+    #[tokio::test]
+    async fn a_dying_connection_closes_the_windows_it_had_open() {
+        let bus = EventBus::new(16);
+        let mut sub = bus.subscribe();
+        let mut state = PushState {
+            bus,
+            ..Default::default()
+        };
+        // Two windows C3 was told about, one that was never published.
+        state.toplevels.push(PushToplevel {
+            id: 7,
+            published: Some(ToplevelInfo::default()),
+            app_id_for_pid: Some("org.mozilla.firefox".into()),
+            ..Default::default()
+        });
+        state.toplevels.push(PushToplevel {
+            id: 8,
+            published: Some(ToplevelInfo::default()),
+            ..Default::default()
+        });
+        state.toplevels.push(PushToplevel {
+            id: 9,
+            published: None,
+            ..Default::default()
+        });
+
+        state.close_open_toplevels();
+        assert!(state.toplevels.is_empty());
+
+        let mut closed = Vec::new();
+        for _ in 0..2 {
+            let event = sub.recv().await;
+            if let Some(Payload::Window(WindowEvent {
+                toplevel_id,
+                kind: Some(Kind::Closed(_)),
+            })) = event.payload
+            {
+                closed.push(toplevel_id);
+            }
+        }
+        closed.sort_unstable();
+        assert_eq!(
+            closed,
+            vec![7, 8],
+            "only windows C3 had been told about need closing"
+        );
+    }
+
     #[test]
     fn state_try_from_matches_the_wire_protocol_values() {
         assert_eq!(ToplevelState::try_from(0), Ok(ToplevelState::Maximized));
@@ -509,7 +649,8 @@ mod tests {
         let bus = EventBus::new(64);
         let privacy = PrivacyState::new(Vec::new());
         let mut sub = bus.subscribe();
-        tokio::spawn(run_forever(bus, privacy));
+        let health = SensorHealth::new(neuroos_health::HealthServer::new("test"));
+        tokio::spawn(run_forever(bus, privacy, health));
 
         let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

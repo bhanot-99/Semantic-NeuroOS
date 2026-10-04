@@ -138,6 +138,10 @@ fn collect_subtree(root_pid: i32, entries: &[(i32, i32, String)]) -> Vec<Process
 /// picks the lowest PID among matches as a stable, deterministic tie-break.
 pub fn find_pid_for_app_id(app_id: &str) -> Result<Option<u32>, ProcError> {
     let candidate = app_id_binary_guess(app_id);
+    // M6: nothing can match, so don't walk all of `/proc` to find that out.
+    if candidate.is_empty() {
+        return Ok(None);
+    }
     let mut best: Option<i32> = None;
     for proc in procfs::process::all_processes()? {
         let Ok(proc) = proc else { continue };
@@ -158,11 +162,38 @@ fn app_id_binary_guess(app_id: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The kernel's `comm` is `TASK_COMM_LEN - 1` = 15 bytes at most, so a
+/// `comm` of exactly this length is the only one that may have been
+/// truncated (M6).
+const COMM_TRUNCATED_LEN: usize = 15;
+
+/// Shortest candidate worth prefix-matching. One or two characters prefix
+/// a large share of every process table, which is evidence of nothing
+/// (M6).
+const MIN_PREFIX_LEN: usize = 3;
+
 fn comm_matches(candidate: &str, comm: &str) -> bool {
+    // M6: an empty `app_id` guesses an empty candidate, and
+    // `comm.starts_with("")` is true for *every* process -- so the old
+    // match picked PID 1 and FR-MON-05's process-tree snapshot walked the
+    // whole system. Nothing can be identified from nothing.
+    if candidate.is_empty() || comm.is_empty() {
+        return false;
+    }
     let comm = comm.to_ascii_lowercase();
-    // `comm` is kernel-truncated to 15 bytes, so match on whichever prefix
-    // relationship holds in either direction.
-    comm == candidate || comm.starts_with(candidate) || candidate.starts_with(&comm)
+    if comm == candidate {
+        return true;
+    }
+    // Candidate is the stem of a longer binary name (`firefox` ->
+    // `firefox-bin`).
+    if candidate.len() >= MIN_PREFIX_LEN && comm.starts_with(candidate) {
+        return true;
+    }
+    // The reverse only makes sense when the kernel actually truncated
+    // `comm`; a shorter `comm` is a complete process name, and treating it
+    // as a prefix of the candidate invents matches (ADR-0009's heuristic is
+    // best-effort, but it should not be arbitrary).
+    comm.len() == COMM_TRUNCATED_LEN && candidate.starts_with(&comm)
 }
 
 #[cfg(test)]
@@ -190,8 +221,55 @@ mod tests {
     #[test]
     fn comm_matches_handles_kernel_truncation_either_direction() {
         assert!(comm_matches("firefox", "firefox"));
-        assert!(comm_matches("cosmic-text-editor", "cosmic-text-ed")); // 15-char truncation
+        assert!(comm_matches("firefox", "firefox-bin")); // candidate is the stem
+        // A `comm` at the kernel's 15-byte limit is the only case where the
+        // candidate may legitimately be the longer of the two.
+        assert_eq!("cosmic-text-edi".len(), COMM_TRUNCATED_LEN);
+        assert!(comm_matches("cosmic-text-editor", "cosmic-text-edi"));
         assert!(!comm_matches("firefox", "chromium"));
+    }
+
+    /// M6: `comm.starts_with("")` is true for every string, so an empty
+    /// `app_id` matched every process on the machine; `find_pid_for_app_id`
+    /// then returned the lowest PID -- PID 1 -- and FR-MON-05's process-tree
+    /// snapshot rooted there walked the entire system.
+    #[test]
+    fn an_empty_app_id_matches_nothing() {
+        assert!(!comm_matches("", "systemd"));
+        assert!(!comm_matches("", "firefox"));
+        assert!(!comm_matches("", ""));
+        assert!(!comm_matches("firefox", ""));
+        assert_eq!(
+            app_id_binary_guess(""),
+            "",
+            "the empty app_id reaches comm_matches"
+        );
+    }
+
+    /// M6: before the fix this returned `Some(1)` -- PID 1 matched because
+    /// every `comm` starts with the empty string.
+    #[test]
+    fn an_empty_app_id_resolves_to_no_pid() {
+        assert_eq!(find_pid_for_app_id("").unwrap(), None);
+    }
+
+    /// M6: the reverse direction exists only to absorb the kernel's 15-byte
+    /// `comm` truncation. A `comm` shorter than that was not truncated, so
+    /// accepting it as a prefix of the candidate just invents matches.
+    #[test]
+    fn a_short_comm_is_not_treated_as_a_truncated_one() {
+        // "fire" is a real 4-char process name, not a truncation of anything.
+        assert!(!comm_matches("firefox", "fire"));
+        assert!(!comm_matches("cosmic-text-editor", "cosmic"));
+    }
+
+    /// M6: a one- or two-character candidate prefix-matches far too much to
+    /// be evidence of anything.
+    #[test]
+    fn a_very_short_candidate_never_prefix_matches() {
+        assert!(!comm_matches("c", "cosmic-comp"));
+        assert!(!comm_matches("co", "cosmic-comp"));
+        assert!(comm_matches("cos", "cosmic-comp"), "3 chars is the cutoff");
     }
 
     #[test]
