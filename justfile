@@ -48,6 +48,7 @@ test-contract: build-rust build-cpp build-py
 test-security:
     bash scripts/check-egress.sh
     bash tests/contract/storage_landlock.sh
+    bash tests/contract/landlock_services.sh
 
 # Phase 0 exit criterion (phases.md §3.4): a real systemd --user unit with
 # PrivateNetwork=true proves no network / UDS works / peer UID enforced, together.
@@ -71,6 +72,7 @@ test-monitor-pf:
 # health server, all real UDS round trips (not mocked).
 test-cpp-ipc: build-cpp
     ./cpp/build/cpp-ipc-smoke
+    ./cpp/build/cpp-sandbox-smoke
 
 # Phase 2 IT (phases.md §5.3): real neuroos-inference against the real
 # downloaded BitNet model — GetInfo/AttachRing/Generate/Cancel over a real
@@ -138,13 +140,16 @@ lint-manifest:
     PY
 
 # ExecStart binaries aren't installed on a dev checkout, so that one warning is expected
-# and filtered out; anything else systemd-analyze reports fails the recipe.
+# and filtered out; anything else systemd-analyze reports fails the recipe. Every unit
+# is a user unit (ADR-0002) except neuroos-fetcher.service (own system user, Zone 1).
 lint-systemd:
     #!/usr/bin/env bash
     set -euo pipefail
     fail=0
     for f in deploy/systemd/*; do
-        out="$(systemd-analyze verify --man=false "$f" 2>&1 | grep -v "not executable: No such file or directory" | grep -v "^/usr/lib/systemd/system/.*Invalid environment assignment" || true)"
+        scope=--user
+        [[ "$f" == *neuroos-fetcher.service ]] && scope=--system
+        out="$(systemd-analyze "$scope" verify --man=false "$f" 2>&1 | grep -v "not executable: No such file or directory" | grep -v "^/usr/lib/systemd/system/.*Invalid environment assignment" || true)"
         if [ -n "$out" ]; then
             echo "$out"
             fail=1

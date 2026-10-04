@@ -14,12 +14,48 @@ fn current_uid() -> u32 {
     unsafe { getuid() }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     if neuroos_common::init_logging().is_err() {
         eprintln!("neuroos-knowledge-query: logging already initialized (unexpected)");
     }
 
+    // H15: locked in before the async runtime spawns its worker threads.
+    // The graph view file is created first so the sandbox can grant
+    // exactly that one file in the data dir. Fail closed (rules.md §5.5).
+    let graph_view = neuroos_common::paths::graph_view_html_file();
+    let created = graph_view
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&graph_view)
+                .map(drop)
+        });
+    if let Err(e) = created {
+        tracing::error!(error = %e, "failed to create graph_view.html");
+        std::process::exit(1);
+    }
+    let policy = neuroos_knowledge_query::sandbox_policy();
+    if let Err(e) = neuroos_sandbox::enter(&policy, &[neuroos_common::paths::runtime_dir()]) {
+        tracing::error!(error = %e, "failed to enter the Landlock sandbox");
+        std::process::exit(1);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start the async runtime");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run());
+}
+
+async fn run() {
     let my_uid = current_uid();
 
     // P0-S04 convention: a health endpoint is one line.

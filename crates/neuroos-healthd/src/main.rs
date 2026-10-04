@@ -15,8 +15,7 @@ struct Args {
     soak: bool,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     if neuroos_common::init_logging().is_err() {
         // logging isn't up yet; this is the one place a bare eprintln is
         // acceptable (rules.md §4 governs *services*, not this one line).
@@ -32,9 +31,34 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
     let all_targets =
         targets::merge_targets(targets::default_targets(), &config.healthd.extra_targets);
+
+    // H15: locked in before the async runtime spawns its worker threads,
+    // so they all inherit it. Fail closed (rules.md §5.5).
+    let policy = neuroos_healthd::sandbox_policy(&all_targets);
+    let dirs = [
+        neuroos_common::paths::runtime_dir(),
+        neuroos_common::paths::soak_dir(),
+    ];
+    if let Err(e) = neuroos_sandbox::enter(&policy, &dirs) {
+        tracing::error!(error = %e, "failed to enter the Landlock sandbox");
+        std::process::exit(1);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start the async runtime");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run(args, config, all_targets));
+}
+
+async fn run(args: Args, config: neuroos_common::Config, all_targets: Vec<targets::Target>) {
     let aggregate = Arc::new(Aggregate::new(&all_targets));
 
     let my_uid = current_uid();

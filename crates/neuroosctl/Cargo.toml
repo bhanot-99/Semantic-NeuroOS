@@ -14,7 +14,7 @@ neuroos-health = { path = "../neuroos-health", version = "0.1.0" }
 neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

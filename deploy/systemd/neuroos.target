@@ -1,0 +1,7 @@
+# systemd user target grouping every NeuroOS Zone 2/3 service (ADR-0002).
+# `systemctl --user enable neuroos.target` starts them all at login.
+[Unit]
+Description=NeuroOS
+
+[Install]
+WantedBy=default.target

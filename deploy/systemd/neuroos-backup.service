@@ -1,0 +1,10 @@
+# systemd user unit (ADR-0002): RPCs C3's backup: wal_checkpoint + VACUUM INTO + LanceDB copy, keep 8
+# (Architecture.md §7.5) over storage.sock, via `neuroosctl storage backup`.
+[Unit]
+Description=NeuroOS storage backup (every 6h)
+After=neuroos-storage.service
+Requisite=neuroos-storage.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/neuroos/bin/neuroosctl storage backup

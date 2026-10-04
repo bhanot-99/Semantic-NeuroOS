@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Phase 4 SC exit criterion (phases.md §7.3): "Landlock denies reads outside
-# allowed paths." Architecture.md §8.2 enforces this via systemd unit
-# hardening (ProtectSystem=strict/ProtectHome=tmpfs/BindPaths=..., which
-# systemd implements using the kernel's Landlock LSM where available) rather
-# than an in-process landlock crate call — ADR-0002 already established
-# systemd-level hardening as this project's sandboxing mechanism for every
-# phase so far (see spike S-01). This proves the real
-# deploy/systemd/neuroos-storage@.service directives actually deny a read
-# outside the allowed paths and allow one inside them, run for real via
-# `systemd-run --user` (same precedent as tests/contract/sandboxed_echo.sh).
+# allowed paths" -- the systemd half. Architecture.md §8 has two
+# independent layers: this script proves the unit-hardening layer
+# (ProtectHome=tmpfs + BindPaths, which systemd implements with mount
+# namespaces -- not Landlock) from deploy/systemd/neuroos-storage.service
+# denies a read outside the allowed paths and allows one inside them, run
+# for real via `systemd-run --user` (same precedent as
+# tests/contract/sandboxed_echo.sh). The in-process Landlock layer (H15,
+# crates/neuroos-sandbox) is proven by tests/contract/landlock_services.sh.
 set -euo pipefail
 
 if ! systemctl --user status >/dev/null 2>&1; then
@@ -64,4 +63,4 @@ grep -q "^ALLOWED_PATH_READABLE$" "$tmp/stdout.log" ||
 grep -q "^OUTSIDE_PATH_DENIED$" "$tmp/stdout.log" ||
     fail "a file outside BindPaths (real \$HOME, hidden by ProtectHome=tmpfs) must NOT be readable"
 
-echo "OK: Landlock-backed systemd hardening denies reads outside BindPaths, allows reads inside them"
+echo "OK: systemd unit hardening (ProtectHome=tmpfs + BindPaths) denies reads outside BindPaths, allows reads inside them"

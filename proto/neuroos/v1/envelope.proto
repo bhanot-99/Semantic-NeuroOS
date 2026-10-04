@@ -55,6 +55,8 @@ message Envelope {
     PruneEdgesResponse         prune_edges_response = 55;
     QueryActivityRequest       query_activity_request  = 56;
     QueryActivityResponse      query_activity_response = 57;
+    MaintenanceRequest         maintenance_request  = 58; // ADR-0011
+    MaintenanceResponse        maintenance_response = 59;
 
     GenerateRequest      generate_request     = 60;
     GenerateResponse     generate_response    = 61;

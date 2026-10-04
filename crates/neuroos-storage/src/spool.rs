@@ -131,6 +131,11 @@ pub async fn watch_forever(engine_mutex: &tokio::sync::Mutex<StorageEngine>, dir
             return;
         }
     };
+    if !dir.is_dir() {
+        // Normal until C7 (Phase 8) is installed and has created it.
+        tracing::info!(path = %dir.display(), "no fetcher spool dir; external documents disabled");
+        return;
+    }
     if let Err(e) = notify::Watcher::watch(&mut watcher, dir, notify::RecursiveMode::NonRecursive) {
         tracing::error!(error = %e, path = %dir.display(), "failed to watch spool dir");
         return;

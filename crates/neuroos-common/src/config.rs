@@ -208,14 +208,23 @@ pub struct StorageConfig {
     /// populate and isn't present on this dev machine).
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
+    /// Where C7 drops fetched documents (Architecture.md §6.3/§7.1);
+    /// C3 ingests and removes them.
+    #[serde(default = "default_spool_dir")]
+    pub spool_dir: PathBuf,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             models_dir: default_models_dir(),
+            spool_dir: default_spool_dir(),
         }
     }
+}
+
+fn default_spool_dir() -> PathBuf {
+    PathBuf::from("/var/spool/neuroos-fetcher")
 }
 
 fn default_models_dir() -> PathBuf {

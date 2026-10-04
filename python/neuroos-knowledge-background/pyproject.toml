@@ -10,6 +10,11 @@ dependencies = [
     "scipy>=1.18.1",
 ]
 
+# H12: the entry point deploy/systemd/neuroos-knowledge-background.service
+# starts (installed as /opt/neuroos/bin/neuroos-knowledge-background).
+[project.scripts]
+neuroos-knowledge-background = "neuroos_bg.main:main"
+
 [dependency-groups]
 dev = [
     "ruff>=0.8",

@@ -32,6 +32,9 @@ pub fn open(path: &Path) -> Result<Connection, StorageError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // H15: temp tables/indices (and VACUUM's scratch space) in memory, not
+    // in /tmp, which C3's Landlock sandbox doesn't grant.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     migrate(&conn)?;
     Ok(conn)
 }

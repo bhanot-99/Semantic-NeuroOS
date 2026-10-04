@@ -18,8 +18,7 @@ fn onnxruntime_dylib_path(models_dir: &std::path::Path) -> std::path::PathBuf {
     models_dir.join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so")
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     if neuroos_common::init_logging().is_err() {
         // logging isn't up yet; this is the one place a bare eprintln is
         // acceptable (rules.md §4 governs *services*, not this one line).
@@ -34,6 +33,41 @@ async fn main() {
         }
     };
 
+    // H15: locked in before the async runtime spawns its worker threads.
+    // Fail closed (rules.md §5.5).
+    let policy = neuroos_storage::sandbox_policy(&config.storage);
+    // LanceDB's query spill files go to the process temp dir; keep them
+    // inside the store (the sandbox doesn't grant /tmp, and they hold
+    // user data anyway).
+    let scratch = neuroos_storage::scratch_dir();
+    if let Err(e) = tempfile::env::override_temp_dir(&scratch) {
+        tracing::error!(path = %e.display(), "temp dir was already overridden");
+        std::process::exit(1);
+    }
+    let dirs = [
+        neuroos_common::paths::runtime_dir(),
+        neuroos_common::paths::storage_dir(),
+        neuroos_common::paths::backups_dir(),
+        scratch,
+    ];
+    if let Err(e) = neuroos_sandbox::enter(&policy, &dirs) {
+        tracing::error!(error = %e, "failed to enter the Landlock sandbox");
+        std::process::exit(1);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start the async runtime");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run(config));
+}
+
+async fn run(config: neuroos_common::Config) {
     let my_uid = current_uid();
     let sqlite_path = neuroos_common::paths::storage_dir().join("meta.sqlite3");
     let lance_path = neuroos_common::paths::storage_dir().join("lance");
@@ -65,6 +99,15 @@ async fn main() {
         vec![my_uid],
     ));
 
-    neuroos_storage::server::serve(engine, neuroos_common::paths::storage_sock(), vec![my_uid])
-        .await;
+    neuroos_storage::server::run_service(
+        engine,
+        neuroos_storage::server::ServicePaths {
+            storage_sock: neuroos_common::paths::storage_sock(),
+            monitor_sock: neuroos_common::paths::monitor_sock(),
+            spool_dir: config.storage.spool_dir.clone(),
+            backups_dir: neuroos_common::paths::backups_dir(),
+        },
+        vec![my_uid],
+    )
+    .await;
 }
