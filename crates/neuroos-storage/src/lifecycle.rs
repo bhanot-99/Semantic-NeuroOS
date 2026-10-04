@@ -36,18 +36,26 @@ pub struct GcSummary {
     pub focus_history_deleted: usize,
 }
 
-/// Deletes every entity (and its `chunks_meta` rows) whose domain has a
-/// finite retention and whose `created_ns` is older than that domain's
-/// cutoff, plus expired `focus_history` rows (14-day raw retention,
-/// Architecture.md §7.2). Returns the deleted entity ids so the caller can
-/// also purge the matching LanceDB rows — mirrors `forget`'s own shape.
-pub fn gc_expired_entities(
-    conn: &Connection,
-    now_ns: u64,
-) -> Result<(GcSummary, Vec<i64>), StorageError> {
+/// What one GC run removed from SQLite, and what the caller must still
+/// remove from LanceDB: rows of `entity_ids`, and for each
+/// `(domain, cutoff_ns)` every chunk of that domain older than the cutoff.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcOutcome {
+    pub summary: GcSummary,
+    pub entity_ids: Vec<i64>,
+    pub chunk_cutoffs: Vec<(&'static str, u64)>,
+}
+
+/// Retention is per row (Architecture.md §7.2/§7.3), not per entity:
+/// for each domain with a finite retention, chunks and event counters
+/// older than the cutoff expire, and an entity expires only once it has
+/// not been *seen* within the retention window (a long-lived app that is
+/// still in use keeps its entity and its recent history). Raw
+/// `focus_history` keeps 14 days. Everything happens in one transaction.
+pub fn gc_expired_entities(conn: &Connection, now_ns: u64) -> Result<GcOutcome, StorageError> {
     const NS_PER_DAY: u64 = 86_400 * 1_000_000_000;
-    let mut summary = GcSummary::default();
-    let mut all_ids = Vec::new();
+    let mut outcome = GcOutcome::default();
+    let tx = conn.unchecked_transaction()?;
 
     let domains = [
         DOMAIN_WINDOW_FOCUS,
@@ -63,37 +71,40 @@ pub fn gc_expired_entities(
         let Some(days) = retention_days_for_domain(domain) else {
             continue; // permanent
         };
-        let cutoff = now_ns.saturating_sub(days as u64 * NS_PER_DAY) as i64;
+        let cutoff_ns = now_ns.saturating_sub(days as u64 * NS_PER_DAY);
+        let cutoff = cutoff_ns as i64;
         let mut stmt =
-            conn.prepare("SELECT id FROM entities WHERE domain = ?1 AND created_ns < ?2")?;
+            tx.prepare("SELECT id FROM entities WHERE domain = ?1 AND last_seen_ns < ?2")?;
         let ids: Vec<i64> = stmt
             .query_map((domain, cutoff), |row| row.get(0))?
             .collect::<Result<_, _>>()?;
-        if ids.is_empty() {
-            continue;
-        }
-        conn.execute(
-            "DELETE FROM chunks_meta WHERE entity_id IN (SELECT id FROM entities WHERE domain = ?1 AND created_ns < ?2)",
+        drop(stmt);
+        crate::sqlite::delete_entities(&tx, &ids)?;
+        tx.execute(
+            "DELETE FROM chunks_fts WHERE domain = ?1 AND t_ns < ?2",
             (domain, cutoff),
         )?;
-        conn.execute(
-            "DELETE FROM entities WHERE domain = ?1 AND created_ns < ?2",
+        tx.execute(
+            "DELETE FROM event_counters WHERE domain = ?1 AND last_ns < ?2",
             (domain, cutoff),
         )?;
-        summary.entities_deleted += ids.len();
-        all_ids.extend(ids);
+        outcome.summary.entities_deleted += ids.len();
+        outcome.entity_ids.extend(ids);
+        outcome.chunk_cutoffs.push((domain, cutoff_ns));
     }
 
     let focus_cutoff = now_ns.saturating_sub(14 * NS_PER_DAY) as i64;
-    summary.focus_history_deleted = conn.execute(
-        "DELETE FROM focus_history WHERE t_start_ns < ?1",
+    outcome.summary.focus_history_deleted = tx.execute(
+        "DELETE FROM focus_history WHERE t_end_ns < ?1",
         [focus_cutoff],
     )?;
+    tx.commit()?;
 
-    // GC vacuum (Architecture.md §7.5's "incremental" VACUUM step).
+    // GC vacuum (Architecture.md §7.5's "incremental" VACUUM step; the
+    // file is in incremental auto-vacuum mode, see `sqlite::open`).
     conn.execute_batch("PRAGMA incremental_vacuum;")?;
 
-    Ok((summary, all_ids))
+    Ok(outcome)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,9 +266,9 @@ mod tests {
         )
         .unwrap();
 
-        let (summary, ids) = gc_expired_entities(&conn, now).unwrap();
-        assert_eq!(summary.entities_deleted, 1);
-        assert_eq!(ids.len(), 1);
+        let outcome = gc_expired_entities(&conn, now).unwrap();
+        assert_eq!(outcome.summary.entities_deleted, 1);
+        assert_eq!(outcome.entity_ids.len(), 1);
 
         let remaining_labels: Vec<String> = {
             let mut stmt = conn
@@ -303,12 +314,126 @@ mod tests {
         )
         .unwrap();
 
-        let (summary, _) = gc_expired_entities(&conn, now).unwrap();
-        assert_eq!(summary.focus_history_deleted, 1);
+        let outcome = gc_expired_entities(&conn, now).unwrap();
+        assert_eq!(outcome.summary.focus_history_deleted, 1);
         let remaining: String = conn
             .query_row("SELECT app_id FROM focus_history", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "fresh");
+    }
+
+    const DAY: u64 = 86_400 * 1_000_000_000;
+
+    fn fts_at(conn: &rusqlite::Connection, id: &str, entity_id: i64, t_ns: u64) {
+        crate::sqlite::insert_chunk_fts(
+            conn,
+            &crate::sqlite::FtsChunk {
+                chunk_id: id,
+                entity_id,
+                domain: DOMAIN_WINDOW_FOCUS,
+                taint: 0,
+                t_ns,
+                text: id,
+            },
+        )
+        .unwrap();
+    }
+
+    /// H1: GC must not fail on the edges' foreign key.
+    #[test]
+    fn gc_succeeds_when_edges_reference_an_expired_entity() {
+        let conn = crate::sqlite::open_in_memory().unwrap();
+        let now = 100 * DAY;
+        let old = crate::sqlite::upsert_entity(
+            &conn,
+            DOMAIN_WINDOW_FOCUS,
+            "window",
+            "old-app",
+            TaintFlags::empty(),
+            now - 20 * DAY,
+            false,
+        )
+        .unwrap();
+        let fresh = crate::sqlite::upsert_entity(
+            &conn,
+            DOMAIN_WINDOW_FOCUS,
+            "window",
+            "fresh-app",
+            TaintFlags::empty(),
+            now - DAY,
+            false,
+        )
+        .unwrap();
+        crate::sqlite::upsert_edge(
+            &conn,
+            &crate::sqlite::EdgeRow {
+                src: old,
+                dst: fresh,
+                kind: "co_occurs".into(),
+                weight: 1.0,
+                reinforced_ns: now,
+                hypothesis: true,
+            },
+        )
+        .unwrap();
+
+        let outcome = gc_expired_entities(&conn, now).unwrap();
+
+        assert_eq!(outcome.entity_ids, vec![old]);
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edges, 0);
+    }
+
+    /// H4: retention is per row, not per entity. An app first seen 20 days
+    /// ago and still used yesterday keeps its entity and yesterday's chunk;
+    /// only the 20-day-old chunk expires.
+    #[test]
+    fn gc_expires_old_rows_of_a_long_lived_entity_but_keeps_recent_ones() {
+        let conn = crate::sqlite::open_in_memory().unwrap();
+        let now = 100 * DAY;
+        let app = crate::sqlite::upsert_entity(
+            &conn,
+            DOMAIN_WINDOW_FOCUS,
+            "window",
+            "browser",
+            TaintFlags::empty(),
+            now - 20 * DAY,
+            false,
+        )
+        .unwrap();
+        // seen again yesterday
+        crate::sqlite::upsert_entity(
+            &conn,
+            DOMAIN_WINDOW_FOCUS,
+            "window",
+            "browser",
+            TaintFlags::empty(),
+            now - DAY,
+            false,
+        )
+        .unwrap();
+        fts_at(&conn, "old-chunk", app, now - 20 * DAY);
+        fts_at(&conn, "fresh-chunk", app, now - DAY);
+
+        let outcome = gc_expired_entities(&conn, now).unwrap();
+
+        assert!(outcome.entity_ids.is_empty());
+        assert!(
+            outcome
+                .chunk_cutoffs
+                .contains(&(DOMAIN_WINDOW_FOCUS, now - 14 * DAY)),
+            "the LanceDB side gets the same per-domain cutoff"
+        );
+        let chunks: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT chunk_id FROM chunks_fts").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(chunks, vec!["fresh-chunk".to_string()]);
     }
 
     #[tokio::test]

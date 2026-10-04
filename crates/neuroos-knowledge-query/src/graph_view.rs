@@ -81,15 +81,39 @@ pub fn render(entities: &[EntityRow], edges: &[EdgeRow], generated_at_ns: u64) -
     // `to_string` over a plain struct of numbers/strings/bools never fails;
     // the empty-graph fallback only matters if that invariant is ever
     // broken by a future field type.
-    let data_json =
-        serde_json::to_string(&data).unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string());
+    let data_json = escape_for_script(
+        &serde_json::to_string(&data).unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string()),
+    );
 
+    // User data goes in last, so placeholder names inside a label are
+    // never substituted.
     PAGE_TEMPLATE
         .replace("__D3_JS__", D3_JS)
-        .replace("__DATA_JSON__", &data_json)
         .replace("__NODE_COUNT__", &data.nodes.len().to_string())
         .replace("__EDGE_COUNT__", &data.edges.len().to_string())
         .replace("__GENERATED_AT_NS__", &generated_at_ns.to_string())
+        .replace("__DATA_JSON__", &data_json)
+}
+
+/// H5: JSON is not safe to inline in a `<script>` block as-is -- a label
+/// containing `</script>` (or `<!--`) would end the block and let the rest
+/// run as markup. JSON's `\uXXXX` escapes keep every one of these
+/// characters as the same string data while removing it from the HTML
+/// parser's view. U+2028/U+2029 are escaped too: they end lines in older
+/// JavaScript parsers.
+fn escape_for_script(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// design.md §6: header (search + family filter + theme toggle), legend +
@@ -194,7 +218,11 @@ footer { height: 32px; display: flex; align-items: center; justify-content: cent
   var srBody = document.getElementById("sr-only-tbody");
   DATA.nodes.forEach(function (n) {
     var tr = document.createElement("tr");
-    tr.innerHTML = "<td>" + n.label + "</td><td>" + n.domain + "</td><td>" + n.family + "</td><td>" + (n.tainted ? "yes" : "no") + "</td>";
+    [n.label, n.domain, n.family, n.tainted ? "yes" : "no"].forEach(function (text) {
+      var td = document.createElement("td");
+      td.textContent = text; // labels are untrusted titles: text, never HTML
+      tr.appendChild(td);
+    });
     srBody.appendChild(tr);
   });
 
@@ -372,6 +400,47 @@ mod tests {
             reinforced_ns: 0,
             hypothesis,
         }
+    }
+
+    /// H5: labels are window/video/file titles, which any website or file
+    /// name controls. One must not be able to close the data `<script>`
+    /// block and start its own.
+    #[test]
+    fn a_label_cannot_break_out_of_the_data_script_block() {
+        let label = "</script><script>alert(1)</script><!--";
+        let html = render(&[entity(1, "window_focus", label, 0)], &[], 0);
+        assert!(
+            !html.contains("<script>alert(1)"),
+            "label broke out of the JSON <script>"
+        );
+        assert!(!html.contains("<!--"));
+        // the label still reaches the page, escaped as JSON string data
+        assert!(html.contains(r"\u003c/script\u003e\u003cscript\u003ealert(1)"));
+    }
+
+    /// H5: the screen-reader table must insert labels as text, never as
+    /// HTML (`<img src=x onerror=...>` in a title would otherwise run).
+    #[test]
+    fn labels_are_never_assigned_through_inner_html() {
+        let html = render(&[entity(1, "window_focus", "x", 0)], &[], 0);
+        assert!(!html.contains("tr.innerHTML"));
+        assert!(!html.contains("\"<td>\" + n.label"));
+    }
+
+    /// Template placeholders inside user data must not be substituted.
+    #[test]
+    fn placeholder_names_inside_a_label_are_left_alone() {
+        let html = render(
+            &[entity(
+                1,
+                "window_focus",
+                "__NODE_COUNT__ __GENERATED_AT_NS__",
+                0,
+            )],
+            &[],
+            7,
+        );
+        assert!(html.contains("\"label\":\"__NODE_COUNT__ __GENERATED_AT_NS__\""));
     }
 
     #[test]
