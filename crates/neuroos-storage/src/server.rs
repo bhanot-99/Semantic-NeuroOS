@@ -244,6 +244,9 @@ async fn handle_request(
                 first_ns: r.first_ns,
                 last_ns: r.last_ns,
                 dwell_ms: r.dwell_ms,
+                // M9 / ADR-0012: provenance travels with the item, so C5
+                // no longer has to invent `taint: None` for it.
+                taint: Some(Taint { flags: r.taint }),
             };
             match engine.query_activity(req.since_ns, req.until_ns, req.limit.max(1) as usize) {
                 Ok((windows, media)) => {

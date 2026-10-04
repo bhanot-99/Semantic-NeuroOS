@@ -15,7 +15,7 @@
 //! (chronological evidence order helps temporal QA: ChronoRAG, 2025).
 use std::collections::HashSet;
 
-use neuroos_proto::v1::{ActivityItem, ChunkMatch};
+use neuroos_proto::v1::{ActivityItem, ChunkMatch, Taint};
 
 use crate::storage_client::{StorageClient, StorageClientError};
 
@@ -222,12 +222,18 @@ fn names_are_known(question: &str, texts: &[&str]) -> bool {
         .all(|n| lower.iter().any(|t| t.contains(n.as_str())))
 }
 
-fn activity_chunk(text: String, t_ns: u64) -> ChunkMatch {
+/// M9 / ADR-0012: the activity item's own taint travels into the chunk.
+/// This used to be `taint: None`, which `prost` and
+/// `assemble`/`AskResult` both read as "clean" -- so an activity answer
+/// built from a C7-fetched media chunk reported no provenance at all, and
+/// C6 never saw the `EXTERNAL_UNTRUSTED` that should have escalated its
+/// tier (R0-3 forbids any path that lowers taint).
+fn activity_chunk(text: String, t_ns: u64, taint: Option<Taint>) -> ChunkMatch {
     ChunkMatch {
         chunk_id: String::new(),
         entity_id: 0,
         text,
-        taint: None,
+        taint,
         t_ns,
         domain: "activity".to_string(),
         distance: 0.0,
@@ -253,6 +259,7 @@ fn overview_evidence(windows: &[ActivityItem]) -> Vec<ChunkMatch> {
                     w.text
                 ),
                 w.first_ns,
+                w.taint,
             )
         })
         .collect()
@@ -261,7 +268,7 @@ fn overview_evidence(windows: &[ActivityItem]) -> Vec<ChunkMatch> {
 fn activity_chunks(windows: &[ActivityItem]) -> Vec<ChunkMatch> {
     windows
         .iter()
-        .map(|w| activity_chunk(format!("{}: {}", w.app_id, w.text), w.first_ns))
+        .map(|w| activity_chunk(format!("{}: {}", w.app_id, w.text), w.first_ns, w.taint))
         .collect()
 }
 
@@ -303,7 +310,7 @@ fn merge_media(chunks: &mut Vec<ChunkMatch>, media: &[ActivityItem]) {
             break;
         }
         if !have.contains(&m.text) {
-            chunks.push(activity_chunk(m.text.clone(), m.first_ns));
+            chunks.push(activity_chunk(m.text.clone(), m.first_ns, m.taint));
         }
     }
 }
@@ -431,11 +438,52 @@ mod tests {
             first_ns: 1,
             last_ns: 2,
             dwell_ms: 29 * 60_000 + 40_000,
+            taint: None,
         };
         assert_eq!(
             overview_evidence(&[w])[0].text,
             "30 min total: vlc: Show E03"
         );
+    }
+
+    fn activity_item(text: &str, taint_flags: u32) -> ActivityItem {
+        ActivityItem {
+            app_id: "vlc".into(),
+            text: text.into(),
+            first_ns: 1,
+            last_ns: 2,
+            dwell_ms: 60_000,
+            taint: Some(Taint { flags: taint_flags }),
+        }
+    }
+
+    /// M9 / ADR-0012: every activity-derived evidence chunk used to be
+    /// built with `taint: None`, so an answer about a C7-fetched media
+    /// item reported clean provenance and C6 never saw the
+    /// `EXTERNAL_UNTRUSTED` that should have escalated its tier.
+    #[test]
+    fn activity_evidence_carries_the_items_taint() {
+        let external = neuroos_taint::TaintFlags::EXTERNAL_UNTRUSTED.bits();
+
+        let overview = overview_evidence(&[activity_item("Show E03", external)]);
+        assert_eq!(
+            overview[0].taint.map(|t| t.flags),
+            Some(external),
+            "overview evidence must keep the item's taint"
+        );
+
+        let listed = activity_chunks(&[activity_item("Show E03", external)]);
+        assert_eq!(listed[0].taint.map(|t| t.flags), Some(external));
+
+        let mut chunks = Vec::new();
+        merge_media(&mut chunks, &[activity_item("Show E04", external)]);
+        assert_eq!(chunks[0].taint.map(|t| t.flags), Some(external));
+    }
+
+    #[test]
+    fn untainted_activity_evidence_stays_untainted() {
+        let overview = overview_evidence(&[activity_item("Show E03", 0)]);
+        assert_eq!(overview[0].taint.map(|t| t.flags), Some(0));
     }
 
     #[test]

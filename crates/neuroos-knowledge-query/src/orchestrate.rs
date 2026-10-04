@@ -82,8 +82,10 @@ async fn request_preamble(voice: &VoiceClient) {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskResult {
     pub answer: String,
-    /// FR-KNO-07: union of every evidence chunk's taint that went into
-    /// this answer.
+    /// FR-KNO-07 / Architecture.md §7.4 (`taint(output) =
+    /// union(taint(inputs))`): the union of every evidence chunk's taint
+    /// that went into this answer, plus `MODEL_GENERATED` when the answer
+    /// text is C4's output rather than a fixed string composed by C5 (M9).
     pub taint: TaintFlags,
     /// Set when C6 denied the capability -- a fail-soft apology rather
     /// than a grounded answer (rules.md §5.6), not an error, since a
@@ -185,7 +187,12 @@ pub async fn ask(
         .await?;
     Ok(AskResult {
         answer,
-        taint: prompt.taint,
+        // M9: this string is literally the model's output, so it carries
+        // `MODEL_GENERATED` on top of its evidence's taint. The two early
+        // returns above do *not*: `NO_EVIDENCE_ANSWER` and the
+        // capability-denied apology are fixed strings C5 wrote, and
+        // claiming the model produced them would be false provenance.
+        taint: prompt.taint | TaintFlags::MODEL_GENERATED,
         degraded: false,
         own_compute,
     })
