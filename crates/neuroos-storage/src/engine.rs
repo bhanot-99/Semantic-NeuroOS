@@ -21,6 +21,10 @@ pub enum EngineError {
     Lance(#[from] LanceError),
     #[error(transparent)]
     Embed(#[from] EmbedError),
+    /// M15: the embedder returned no vector for a chunk's text. Treated as
+    /// a failed ingest -- an empty vector is not a valid embedding.
+    #[error("the embedder produced no vector for this chunk")]
+    NoEmbedding,
 }
 
 pub struct StorageEngine {
@@ -125,11 +129,15 @@ impl StorageEngine {
     }
 
     async fn store_chunk(&mut self, chunk: PendingChunk) -> Result<(), EngineError> {
+        // M15: `unwrap_or_default()` here turned "the embedder returned
+        // nothing" into an empty vector, which then panicked inside
+        // Arrow's FixedSizeList builder (see `lance::records_to_batch`).
+        // A missing embedding is a failed ingest, not a zero-width vector.
         let vector = embed_blocking(&self.embedder, vec![chunk.text.clone()])
             .await?
             .into_iter()
             .next()
-            .unwrap_or_default();
+            .ok_or(EngineError::NoEmbedding)?;
         let record = ChunkRecord {
             chunk_id: format!("{}-{}-{}", chunk.domain, chunk.entity_id, chunk.t_ns),
             entity_id: chunk.entity_id,
@@ -142,7 +150,14 @@ impl StorageEngine {
         self.lance
             .insert(chunk.family, std::slice::from_ref(&record))
             .await?;
-        crate::sqlite::insert_chunk_fts(
+        // M15: the vector is in LanceDB now; the keyword row and
+        // `index_meta` (FR-STO-11: which model produced this family's
+        // vectors, so a *future* `Embedder::model_id()` change has
+        // something to compare against on the next `open()`) go in as one
+        // transaction. Two stores cannot share a transaction, so if the
+        // SQLite half fails the vector is deleted again rather than left
+        // behind as a hit no keyword row or index_meta entry knows about.
+        let meta = crate::sqlite::insert_chunk_with_index_meta(
             &self.conn,
             &crate::sqlite::FtsChunk {
                 chunk_id: &record.chunk_id,
@@ -152,23 +167,31 @@ impl StorageEngine {
                 t_ns: record.t_ns,
                 text: &record.text,
             },
-        )?;
-        // FR-STO-11: records which model produced this family's vectors,
-        // so a *future* `Embedder::model_id()` change has something to
-        // compare against on the next `open()`.
-        crate::sqlite::upsert_index_meta(
-            &self.conn,
-            chunk.family,
-            Embedder::model_id(),
-            crate::lance::EMBEDDING_DIM as i64,
-            if self.lance.is_promoted(chunk.family) {
-                "hnsw"
-            } else {
-                "flat"
+            &crate::sqlite::IndexMetaWrite {
+                collection: chunk.family,
+                embedding_model_id: Embedder::model_id(),
+                dim: crate::lance::EMBEDDING_DIM as i64,
+                index_kind: if self.lance.is_promoted(chunk.family) {
+                    "hnsw"
+                } else {
+                    "flat"
+                },
+                p99_ms: 0.0,
+                updated_ns: neuroos_common::now_ns() as i64,
             },
-            0.0,
-            neuroos_common::now_ns() as i64,
-        )?;
+        );
+        if let Err(err) = meta {
+            // `chunk_id` is our own generated `{domain}-{entity_id}-{t_ns}`
+            // (never user text), so interpolating it is safe.
+            if let Err(cleanup) = self
+                .lance
+                .delete(chunk.family, &format!("chunk_id = '{}'", record.chunk_id))
+                .await
+            {
+                tracing::error!(error = %cleanup, "failed to roll back an orphaned vector");
+            }
+            return Err(err.into());
+        }
         Ok(())
     }
 
@@ -262,26 +285,42 @@ impl StorageEngine {
     /// method's — this only touches SQLite/LanceDB.
     pub async fn ingest_external_document(
         &mut self,
-        doc_id: &str,
-        text: &str,
+        doc: &crate::spool::SpoolDocument,
         fetched_at_ns: u64,
     ) -> Result<(), EngineError> {
+        // M14: C7 re-fetches (a polled feed, a retry), and a chunk id
+        // carries its fetch time, so every re-fetch used to add another
+        // full copy of the document -- search then returned the same page
+        // several times over. The newest fetch replaces the older ones.
+        // Checked before the upsert, so a first fetch doesn't pay for a
+        // no-op delete (which would still cost a LanceDB dataset version).
+        let already_fetched = crate::sqlite::entity_exists(
+            &self.conn,
+            crate::adapters::DOMAIN_EXTERNAL_DOCUMENTS,
+            &doc.doc_id,
+        )?;
         let entity_id = crate::sqlite::upsert_entity(
             &self.conn,
             crate::adapters::DOMAIN_EXTERNAL_DOCUMENTS,
             "document",
-            doc_id,
+            &doc.doc_id,
             neuroos_taint::TaintFlags::EXTERNAL_UNTRUSTED,
             fetched_at_ns,
             true,
         )?;
+        if already_fetched {
+            self.lance
+                .delete("external", &format!("entity_id = {entity_id}"))
+                .await?;
+            crate::sqlite::delete_chunks_fts(&self.conn, &[entity_id])?;
+        }
         self.store_chunk(PendingChunk {
             family: "external",
             entity_id,
             domain: crate::adapters::DOMAIN_EXTERNAL_DOCUMENTS,
             taint: neuroos_taint::TaintFlags::EXTERNAL_UNTRUSTED,
             t_ns: fetched_at_ns,
-            text: text.to_string(),
+            text: doc.chunk_text(),
         })
         .await
     }
@@ -669,6 +708,49 @@ mod tests {
         assert!(
             results.iter().any(|r| r.text.contains("revenue")),
             "expected the ingested revenue-dashboard chunk among results: {results:?}"
+        );
+    }
+
+    /// M15: the vector insert and the SQLite metadata write were three
+    /// independent steps, so a metadata failure left a vector in LanceDB
+    /// that no keyword row and no `index_meta` entry knew about -- it
+    /// would still come back from a dense query. Live, because a real
+    /// vector needs the real embedder.
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn a_failed_metadata_write_leaves_no_orphan_vector() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        // The one metadata failure that can be provoked without a disk
+        // fault: the table the write needs is gone.
+        engine.conn.execute_batch("DROP TABLE index_meta").unwrap();
+        let err = engine
+            .ingest_external_document(
+                &crate::spool::SpoolDocument {
+                    doc_id: "doc-1".into(),
+                    url: String::new(),
+                    text: "a fetched document".into(),
+                    content_type: String::new(),
+                },
+                1,
+            )
+            .await
+            .expect_err("the metadata write must fail");
+        assert!(matches!(err, EngineError::Sqlite(_)), "unexpected: {err}");
+
+        let orphans = engine.lance.all_chunks("external").await.unwrap();
+        assert!(
+            orphans.is_empty(),
+            "a failed metadata write must not leave a searchable vector: {orphans:?}"
         );
     }
 

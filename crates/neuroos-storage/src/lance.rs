@@ -64,6 +64,15 @@ pub enum LanceError {
     InvalidPath(std::path::PathBuf),
     #[error("malformed record batch: missing or mistyped column {0:?}")]
     MalformedBatch(&'static str),
+    /// M15: the `vector` column is a `FixedSizeList<Float32, EMBEDDING_DIM>`;
+    /// anything else (notably an empty vector from a failed embed) panics
+    /// inside Arrow's builder rather than erroring, so it is rejected here.
+    #[error("chunk {chunk_id:?} has a {got}-wide embedding, expected {expected}")]
+    WrongEmbeddingWidth {
+        chunk_id: String,
+        got: usize,
+        expected: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +123,19 @@ fn empty_reader() -> RecordBatchIterator<std::vec::IntoIter<Result<RecordBatch, 
 }
 
 fn records_to_batch(chunks: &[ChunkRecord]) -> Result<RecordBatch, LanceError> {
+    // M15: Arrow's FixedSizeList builder *asserts* on a child array whose
+    // length isn't `rows * EMBEDDING_DIM`, so a single mis-sized embedding
+    // (an empty vector from a failed embed, a stale-dimension record from a
+    // reindex) would panic the task instead of failing the insert.
+    for c in chunks {
+        if c.vector.len() != EMBEDDING_DIM as usize {
+            return Err(LanceError::WrongEmbeddingWidth {
+                chunk_id: c.chunk_id.clone(),
+                got: c.vector.len(),
+                expected: EMBEDDING_DIM as usize,
+            });
+        }
+    }
     let vector = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         chunks
             .iter()
@@ -637,6 +659,40 @@ mod tests {
             t_ns: 1,
             domain: "window_focus".into(),
         }
+    }
+
+    /// M15: an embedding that is not exactly `EMBEDDING_DIM` wide used to
+    /// reach Arrow's `FixedSizeList` builder, which panics (`Invalid
+    /// argument error`/assert) instead of returning an error -- taking the
+    /// whole ingest task down. The width is a precondition of the schema,
+    /// so it is checked here, where the batch is built.
+    #[tokio::test]
+    async fn inserting_an_empty_vector_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        let err = store
+            .insert("attention", &[chunk("empty", Vec::new())])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LanceError::WrongEmbeddingWidth { ref chunk_id, got, expected }
+                if chunk_id == "empty" && got == 0 && expected == EMBEDDING_DIM as usize),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inserting_a_too_wide_vector_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        let err = store
+            .insert(
+                "attention",
+                &[chunk("wide", vec![1.0; EMBEDDING_DIM as usize + 1])],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LanceError::WrongEmbeddingWidth { .. }));
     }
 
     #[tokio::test]

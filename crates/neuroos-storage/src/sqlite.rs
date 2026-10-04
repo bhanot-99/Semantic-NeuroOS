@@ -511,6 +511,58 @@ pub fn search_aliases(text: &str) -> String {
     out.join(" ")
 }
 
+/// The `index_meta` row to write alongside a chunk (see
+/// [`insert_chunk_with_index_meta`]); the borrowed counterpart of
+/// [`IndexMeta`], which is what a *read* returns.
+pub struct IndexMetaWrite<'a> {
+    pub collection: &'a str,
+    pub embedding_model_id: &'a str,
+    pub dim: i64,
+    pub index_kind: &'a str,
+    pub p99_ms: f64,
+    pub updated_ns: i64,
+}
+
+/// M15: writes a chunk's keyword row and its family's `index_meta` row in
+/// one transaction. They used to be two independent statements, so a
+/// failure on the second (a disk error, a `SQLITE_BUSY`) left a searchable
+/// chunk behind whose family's recorded index state no longer matched what
+/// had just been written -- which is exactly what FR-STO-11's re-index
+/// decision reads.
+pub fn insert_chunk_with_index_meta(
+    conn: &Connection,
+    chunk: &FtsChunk<'_>,
+    meta: &IndexMetaWrite<'_>,
+) -> Result<(), StorageError> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        insert_chunk_fts(conn, chunk)?;
+        upsert_index_meta(
+            conn,
+            meta.collection,
+            meta.embedding_model_id,
+            meta.dim,
+            meta.index_kind,
+            meta.p99_ms,
+            meta.updated_ns,
+        )
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            // The rollback itself failing would mask the real cause, so it
+            // is logged rather than returned (rules.md R0-6: no payloads).
+            if let Err(rollback) = conn.execute_batch("ROLLBACK") {
+                tracing::error!(error = %rollback, "failed to roll back a partial chunk write");
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Removes every keyword row for `entity_ids` (forget/GC, alongside the
 /// matching LanceDB rows).
 pub fn delete_chunks_fts(conn: &Connection, entity_ids: &[i64]) -> Result<(), StorageError> {
@@ -677,6 +729,80 @@ pub fn activity_media(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+
+    /// M15: a chunk's keyword row and its family's `index_meta` row were
+    /// two separate statements, so a failure on the second left a
+    /// searchable chunk whose family claims no (or a stale) index. Both
+    /// now land in one transaction.
+    #[test]
+    fn a_failed_index_meta_write_rolls_back_the_keyword_row() {
+        let conn = open_in_memory().unwrap();
+        conn.execute_batch("DROP TABLE index_meta").unwrap();
+        let err = insert_chunk_with_index_meta(
+            &conn,
+            &FtsChunk {
+                chunk_id: "c1",
+                entity_id: 1,
+                domain: "window_focus",
+                taint: 0,
+                t_ns: 1,
+                text: "a searchable chunk",
+            },
+            &IndexMetaWrite {
+                collection: "attention",
+                embedding_model_id: "m",
+                dim: 384,
+                index_kind: "flat",
+                p99_ms: 0.0,
+                updated_ns: 1,
+            },
+        );
+        assert!(
+            err.is_err(),
+            "the missing index_meta table must be an error"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the keyword row must not survive the rollback");
+    }
+
+    #[test]
+    fn a_chunk_and_its_index_meta_are_written_together() {
+        let conn = open_in_memory().unwrap();
+        insert_chunk_with_index_meta(
+            &conn,
+            &FtsChunk {
+                chunk_id: "c1",
+                entity_id: 1,
+                domain: "window_focus",
+                taint: 0,
+                t_ns: 1,
+                text: "a searchable chunk",
+            },
+            &IndexMetaWrite {
+                collection: "attention",
+                embedding_model_id: "m",
+                dim: 384,
+                index_kind: "flat",
+                p99_ms: 0.0,
+                updated_ns: 1,
+            },
+        )
+        .unwrap();
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+            .unwrap();
+        let meta: String = conn
+            .query_row(
+                "SELECT index_kind FROM index_meta WHERE collection = 'attention'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunks, 1);
+        assert_eq!(meta, "flat");
+    }
 
     #[test]
     fn open_applies_migrations_and_is_idempotent() {

@@ -191,6 +191,36 @@ class RingWriter {
         return write_as(generation_id(), token_id, flags, payload, len);
     }
 
+    // M12: writes `payload` across as many consecutive slots as it needs,
+    // all stamped with `generation` and `token_id`; `flags` go on the last
+    // slot only, so an end-of-stream marker still means "the stream ends
+    // here". A piece wider than one slot's payload (`max_payload()`, 224 B
+    // for the default 256 B slots) used to be dropped on the floor by the
+    // single-slot `write_as`, silently losing text from the answer. A
+    // reader concatenates payload bytes across slots (so does C5's
+    // `read_all_tokens`), so a split piece is indistinguishable from
+    // several pieces -- which is also why a multi-byte character may be
+    // cut here without harm. Returns false only if a slot write itself
+    // fails; an empty payload still writes exactly one slot (H8's terminal
+    // marker).
+    bool write_split(std::uint64_t generation, std::uint32_t token_id, std::uint16_t flags,
+                     const std::uint8_t* payload, std::size_t len) {
+        std::size_t max = view_.max_payload();
+        if (len == 0) {
+            return write_as(generation, token_id, flags, payload, 0);
+        }
+        std::size_t offset = 0;
+        while (offset < len) {
+            std::size_t take = len - offset < max ? len - offset : max;
+            bool last = offset + take >= len;
+            if (!write_as(generation, token_id, last ? flags : 0, payload + offset, take)) {
+                return false;
+            }
+            offset += take;
+        }
+        return true;
+    }
+
     // H7: stamps the slot with `generation` -- the job's own id, fixed when
     // the job was submitted -- rather than whatever the header holds at
     // write time. A ring name is shared by many requests, and the header

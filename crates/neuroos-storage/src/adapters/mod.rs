@@ -85,9 +85,11 @@ pub fn ingest(
     let outcome = filter.process(event);
     match &event.payload {
         Some(Payload::Window(w)) => adapt_window(conn, w, &outcome, event.observed_at_ns, filter),
-        Some(Payload::ProcTree(p)) => adapt_proc_tree(conn, p, &outcome, event.observed_at_ns),
+        Some(Payload::ProcTree(p)) => {
+            adapt_proc_tree(conn, p, &outcome, event.observed_at_ns, filter)
+        }
         Some(Payload::FileActivity(f)) => {
-            adapt_file_activity(conn, f, &outcome, event.observed_at_ns)
+            adapt_file_activity(conn, f, &outcome, event.observed_at_ns, filter)
         }
         Some(Payload::Idle(_)) => {
             sqlite::touch_event_counter(
@@ -184,6 +186,7 @@ fn adapt_proc_tree(
     snapshot: &ProcessTreeSnapshot,
     outcome: &FilterOutcome,
     observed_at_ns: u64,
+    filter: &mut IngestFilter,
 ) -> Result<Vec<PendingChunk>, StorageError> {
     let FilterOutcome::Promoted { key, .. } = outcome else {
         return Ok(Vec::new());
@@ -212,16 +215,70 @@ fn adapt_proc_tree(
     let mut chunks = Vec::new();
     if is_build_job {
         sqlite::touch_event_counter(conn, DOMAIN_BUILD_JOB, root_comm, observed_at_ns, 0)?;
-        chunks.push(PendingChunk {
-            family: family_for_domain(DOMAIN_BUILD_JOB),
-            entity_id,
-            domain: DOMAIN_BUILD_JOB,
-            taint: TaintFlags::empty(),
-            t_ns: observed_at_ns,
-            text: format!("build job under {root_comm}"),
-        });
+        // M13: the same tree is re-sampled every 5s for as long as the
+        // build runs, and this text is derived from the tree alone -- so
+        // every sample used to produce an identical chunk. The counter
+        // above is what records "a build was running at this time"; the
+        // chunk only has to be searchable once.
+        let text = format!("build job under {root_comm}");
+        if filter.accept_chunk(&text, observed_at_ns) {
+            chunks.push(PendingChunk {
+                family: family_for_domain(DOMAIN_BUILD_JOB),
+                entity_id,
+                domain: DOMAIN_BUILD_JOB,
+                taint: TaintFlags::empty(),
+                t_ns: observed_at_ns,
+                text,
+            });
+        }
     }
     Ok(chunks)
+}
+
+/// Path components that only ever hold machine-generated churn: a build
+/// directory, a package cache, a VCS's own object store. M13: every file
+/// event used to become an embedded chunk, so one `cargo build` (or one
+/// `git gc`) buried the user's real file activity under thousands of paths
+/// that say nothing about what they were doing.
+const CHURN_COMPONENTS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".cache",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+];
+
+/// The files *inside* `.git` that git writes on the user's behalf, rather
+/// than as bookkeeping -- the one part of an excluded directory that is
+/// real `git_activity` signal.
+const GIT_USER_FILES: &[&str] = &["COMMIT_EDITMSG", "MERGE_MSG", "TAG_EDITMSG", "SQUASH_MSG"];
+
+/// Editor and tooling scratch files: an autosave, a swapfile, a lockfile.
+fn is_scratch_file(name: &str) -> bool {
+    name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swx")
+        || name.ends_with(".tmp")
+        || name.ends_with(".lock")
+        || name.starts_with(".#")
+        || (name.starts_with(".") && name.ends_with(".kate-swp"))
+}
+
+/// Whether `path` is machine churn rather than something the user did
+/// (see [`CHURN_COMPONENTS`]).
+pub fn is_churn_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if is_scratch_file(name) {
+        return true;
+    }
+    if GIT_USER_FILES.contains(&name) {
+        return false;
+    }
+    path.split('/')
+        .any(|component| CHURN_COMPONENTS.contains(&component))
 }
 
 fn adapt_file_activity(
@@ -229,10 +286,14 @@ fn adapt_file_activity(
     f: &FileActivityEvent,
     outcome: &FilterOutcome,
     observed_at_ns: u64,
+    filter: &mut IngestFilter,
 ) -> Result<Vec<PendingChunk>, StorageError> {
     let FilterOutcome::Promoted { .. } = outcome else {
         return Ok(Vec::new());
     };
+    if is_churn_path(&f.path) {
+        return Ok(Vec::new());
+    }
     let domain = match f.watch_label.as_str() {
         "git" => DOMAIN_GIT_ACTIVITY,
         "notes" => DOMAIN_NOTES,
@@ -258,6 +319,13 @@ fn adapt_file_activity(
     // The path itself, not the file's contents — reading arbitrary watched
     // files (size limits, encoding, binary detection) is real scope beyond
     // what FileActivityEvent carries; tracked as a known simplification.
+    // M13: an editor autosaving writes the same path over and over, and
+    // the path is the whole chunk, so repeats within the cooldown add
+    // nothing but an embedding call. The entity's `last_seen_ns` and the
+    // event counter above still move on every write.
+    if !filter.accept_chunk(&f.path, observed_at_ns) {
+        return Ok(Vec::new());
+    }
     Ok(vec![PendingChunk {
         family: family_for_domain(domain),
         entity_id,
@@ -510,6 +578,174 @@ mod tests {
             )
             .unwrap();
         assert_eq!(build_job_count, 3);
+    }
+
+    fn proc_tree_event(at_ns: u64, root_pid: u32, procs: &[(u32, &str)]) -> RawTelemetryEvent {
+        RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "proc".into(),
+            payload: Some(Payload::ProcTree(ProcessTreeSnapshot {
+                root_pid,
+                root_pid_known: true,
+                processes: procs
+                    .iter()
+                    .map(|(pid, comm)| ProcessInfo {
+                        pid: *pid,
+                        ppid: 1,
+                        comm: (*comm).to_string(),
+                    })
+                    .collect(),
+            })),
+        }
+    }
+
+    /// M13: C1 re-samples the process tree every 5 s, so a 10-minute
+    /// build produced ~120 identical "build job under make" chunks --
+    /// each one a real embedding call, a LanceDB row and an FTS row, all
+    /// saying the same thing.
+    #[test]
+    fn an_ongoing_build_is_embedded_once_not_once_per_sample() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let mut chunks = 0;
+        // 5s apart, as C1 samples; the first 3 cross the promotion gate.
+        for sample in 0..24u64 {
+            chunks += ingest(
+                &conn,
+                &mut filter,
+                &proc_tree_event(sample * 5_000_000_000, 100, &[(100, "make"), (101, "cc1")]),
+            )
+            .unwrap()
+            .len();
+        }
+        assert_eq!(
+            chunks, 1,
+            "one chunk for one build, not one per /proc sample"
+        );
+        // The event counter is still per sample: that is the signal it
+        // exists to carry.
+        let build_job_count: i64 = conn
+            .query_row(
+                "SELECT count FROM event_counters WHERE domain = ?1",
+                [DOMAIN_BUILD_JOB],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(build_job_count, 22);
+    }
+
+    #[test]
+    fn a_different_build_tool_is_still_its_own_chunk() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let mut texts = Vec::new();
+        for sample in 0..3u64 {
+            for (root, tool) in [(100u32, "make"), (200, "ninja")] {
+                texts.extend(
+                    ingest(
+                        &conn,
+                        &mut filter,
+                        &proc_tree_event(sample * 5_000_000_000, root, &[(root, tool)]),
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.text),
+                );
+            }
+        }
+        assert_eq!(texts, vec!["build job under make", "build job under ninja"]);
+    }
+
+    /// M13: every file event became a chunk, so a `cargo build` writing
+    /// thousands of files under `target/`, or git rewriting `.git/index`,
+    /// filled LanceDB with paths that say nothing about what the user was
+    /// doing -- and cost an embedding each.
+    #[test]
+    fn machine_churn_paths_are_not_embedded() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let event = |label: &str, path: &str, at_ns: u64| RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "folders".into(),
+            payload: Some(Payload::FileActivity(FileActivityEvent {
+                path: path.into(),
+                kind: FileActivityKind::Modified as i32,
+                watch_label: label.into(),
+            })),
+        };
+        let noisy = [
+            "/home/u/p/.git/index",
+            "/home/u/p/.git/objects/ab/cdef",
+            "/home/u/p/target/debug/build/x.o",
+            "/home/u/p/node_modules/left-pad/index.js",
+            "/home/u/p/__pycache__/x.pyc",
+            "/home/u/notes/draft.md~",
+            "/home/u/notes/.draft.md.swp",
+        ];
+        // Three events first so the watch label is past the promotion gate.
+        for i in 0..3u64 {
+            ingest(&conn, &mut filter, &event("notes", "/home/u/notes/a.md", i)).unwrap();
+        }
+        for (i, path) in noisy.iter().enumerate() {
+            let chunks = ingest(&conn, &mut filter, &event("git", path, 1_000 + i as u64)).unwrap();
+            assert!(chunks.is_empty(), "{path} should not be embedded");
+        }
+    }
+
+    /// `.git` is also where the *meaningful* git signal lives, so the
+    /// files git writes for the user are kept.
+    #[test]
+    fn a_real_commit_message_under_dot_git_is_still_embedded() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let event = |path: &str, at_ns: u64| RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "folders".into(),
+            payload: Some(Payload::FileActivity(FileActivityEvent {
+                path: path.into(),
+                kind: FileActivityKind::Modified as i32,
+                watch_label: "git".into(),
+            })),
+        };
+        for i in 0..3u64 {
+            ingest(
+                &conn,
+                &mut filter,
+                &event("/home/u/p/.git/COMMIT_EDITMSG", i),
+            )
+            .unwrap();
+        }
+        let chunks = ingest(
+            &conn,
+            &mut filter,
+            &event("/home/u/p/.git/COMMIT_EDITMSG", 10_000_000_000_000),
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+    }
+
+    /// The same path touched over and over (an editor autosaving) is one
+    /// chunk per cooldown window, not one per write.
+    #[test]
+    fn the_same_file_path_is_not_embedded_on_every_write() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let event = |at_ns: u64| RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "folders".into(),
+            payload: Some(Payload::FileActivity(FileActivityEvent {
+                path: "/home/u/notes/plan.md".into(),
+                kind: FileActivityKind::Modified as i32,
+                watch_label: "notes".into(),
+            })),
+        };
+        let mut chunks = 0;
+        for i in 0..20u64 {
+            chunks += ingest(&conn, &mut filter, &event(i * 1_000_000_000))
+                .unwrap()
+                .len();
+        }
+        assert_eq!(chunks, 1);
     }
 
     #[test]
