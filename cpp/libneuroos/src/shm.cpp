@@ -29,6 +29,29 @@ void* map_shared(int fd, std::size_t len) {
     return p;
 }
 
+// M1: the layout checks `Ring::create`'s arguments and an opened ring's
+// (peer-written, untrusted) header both go through. Must stay in step with
+// `validate_layout` in crates/neuroos-shm/src/ring.rs: either side may
+// create a ring the other opens. Returns the total mapping size.
+std::size_t validate_layout(std::uint16_t version, std::uint32_t capacity_slots,
+                            std::uint32_t slot_size) {
+    if (version != kVersion) {
+        throw RingError("unsupported ring version");
+    }
+    if (capacity_slots == 0) {
+        // `seq % capacity_slots` in both `RingWriter::write_as` and
+        // `RingReader::try_read` would divide by zero.
+        throw RingError("capacity_slots must be at least 1");
+    }
+    if (static_cast<std::size_t>(slot_size) <= kSlotPayloadOff) {
+        throw RingError("slot_size too small to hold slot metadata");
+    }
+    if (slot_size % 8 != 0) {
+        throw RingError("slot_size must be a multiple of 8");
+    }
+    return kHeaderSize + static_cast<std::size_t>(capacity_slots) * slot_size;
+}
+
 std::size_t fd_size(int fd) {
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
@@ -44,13 +67,7 @@ Ring::Ring(int fd, void* base, std::size_t len, std::uint32_t capacity_slots,
     : fd_(fd), base_(base), len_(len), view_(RingView(base, capacity_slots, slot_size)) {}
 
 Ring Ring::create(const std::string& name, std::uint32_t capacity_slots, std::uint32_t slot_size) {
-    if (static_cast<std::size_t>(slot_size) <= kSlotPayloadOff) {
-        throw RingError("slot_size too small to hold slot metadata");
-    }
-    if (slot_size % 8 != 0) {
-        throw RingError("slot_size must be a multiple of 8");
-    }
-    std::size_t total = kHeaderSize + static_cast<std::size_t>(capacity_slots) * slot_size;
+    std::size_t total = validate_layout(kVersion, capacity_slots, slot_size);
     int fd = create_memfd_checked(name);
     if (::ftruncate(fd, static_cast<off_t>(total)) != 0) {
         int err = errno;
@@ -77,16 +94,14 @@ Ring Ring::open(int fd) {
     }
     std::uint32_t capacity_slots = RingView::read_capacity_slots(base);
     std::uint32_t slot_size = RingView::read_slot_size(base);
-    std::size_t expected = kHeaderSize + static_cast<std::size_t>(capacity_slots) * slot_size;
-    if (expected != size) {
+    try {
+        if (validate_layout(RingView::read_version(base), capacity_slots, slot_size) != size) {
+            throw RingError("declared capacity does not match fd size");
+        }
+    } catch (...) {
         ::munmap(base, size);
         ::close(fd);
-        throw RingError("declared capacity does not match fd size");
-    }
-    if (slot_size % 8 != 0) {
-        ::munmap(base, size);
-        ::close(fd);
-        throw RingError("slot_size must be a multiple of 8");
+        throw;
     }
     return Ring(fd, base, size, capacity_slots, slot_size);
 }

@@ -68,6 +68,10 @@ target_link_libraries(cpp-ipc-smoke PRIVATE libneuroos Threads::Threads)
 add_executable(cpp-sandbox-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_sandbox_smoke.cpp)
 target_link_libraries(cpp-sandbox-smoke PRIVATE libneuroos Threads::Threads)
 
+# M1: the ring rejects an untrusted header and never reads past a slot.
+add_executable(cpp-shm-validate ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_shm_validate.cpp)
+target_link_libraries(cpp-shm-validate PRIVATE libneuroos Threads::Threads)
+
 # Phase 2 IT: drives a real running neuroos-inference (real model) over inference.sock.
 add_executable(cpp-inference-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_inference_smoke.cpp)
 target_link_libraries(cpp-inference-smoke PRIVATE libneuroos Threads::Threads)

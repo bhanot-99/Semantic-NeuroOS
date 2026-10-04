@@ -97,6 +97,11 @@ class RingView {
         std::memcpy(&magic, static_cast<const std::uint8_t*>(base) + 0, sizeof(magic));
         return magic;
     }
+    static std::uint16_t read_version(const void* base) {
+        std::uint16_t v;
+        std::memcpy(&v, static_cast<const std::uint8_t*>(base) + 4, sizeof(v));
+        return v;
+    }
     static std::uint32_t read_capacity_slots(const void* base) {
         std::uint32_t v;
         std::memcpy(&v, static_cast<const std::uint8_t*>(base) + 8, sizeof(v));
@@ -255,8 +260,17 @@ class RingReader {
             std::uint32_t token_id = token_id_atomic(slot)->load(std::memory_order_relaxed);
             std::uint16_t flags = flags_atomic(slot)->load(std::memory_order_relaxed);
             std::size_t len = utf8_len_atomic(slot)->load(std::memory_order_relaxed);
+            // M1: `len` lives in shared memory, so it is untrusted even
+            // though our own writer never stores more than `max_payload`
+            // -- a torn read, a corrupted mapping or a hostile peer can
+            // all produce a larger value, and copying it would read past
+            // the slot (past the whole mapping, for the last slot). Clamp
+            // the copy, then decide below -- once the seqlock says the
+            // read was stable -- whether this was a tear to retry or a
+            // genuinely corrupt slot to skip.
+            std::size_t max = view_.max_payload();
             std::vector<std::uint8_t> payload;
-            atomic_copy_from_slot(payload, slot + kSlotPayloadOff, len);
+            atomic_copy_from_slot(payload, slot + kSlotPayloadOff, len < max ? len : max);
 
             std::uint32_t after = seqlock->load(std::memory_order_acquire);
             if (after != before) {
@@ -264,6 +278,13 @@ class RingReader {
             }
             if (slot_seq != seq) {
                 continue; // lapped mid-read; top-of-loop resync handles it next iteration
+            }
+            if (len > max) {
+                // A stable read of an impossible length: the slot is
+                // corrupt, so skip it rather than hand its bytes up or
+                // spin on it forever.
+                next_seq_ = seq + 1;
+                continue;
             }
 
             next_seq_ = seq + 1;
