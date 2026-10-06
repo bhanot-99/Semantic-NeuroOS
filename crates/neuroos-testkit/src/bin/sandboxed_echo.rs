@@ -39,7 +39,7 @@ async fn main() {
     use std::io::Write;
     std::io::stdout().flush().unwrap();
 
-    let Some((mut stream, cred)) = server.accept().await.unwrap() else {
+    let Some((mut stream, cred, _permit)) = server.accept().await.unwrap() else {
         println!("PEER_REJECTED");
         return;
     };

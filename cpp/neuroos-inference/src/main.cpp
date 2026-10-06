@@ -29,7 +29,16 @@ void on_signal(int) {
 int main(int argc, char** argv) {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] neuroos-inference: %v");
 
-    auto config = neuroos::inference::load_config();
+    // L5: bad config is fatal (rules.md §5.4), not a warning followed by a
+    // C4 running on defaults nobody asked for. systemd sees the non-zero
+    // exit and stops the unit instead of restarting it into the same
+    // broken config.
+    auto loaded = neuroos::inference::load_config();
+    if (!loaded) {
+        spdlog::error("{}", loaded.error().message);
+        return 1;
+    }
+    const auto& config = loaded.value();
 
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         return neuroos::inference::run_benchmark(config);

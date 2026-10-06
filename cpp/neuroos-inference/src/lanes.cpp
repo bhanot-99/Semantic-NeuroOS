@@ -104,9 +104,16 @@ void LaneScheduler::refresh_interactive_active() {
 
 void LaneScheduler::write_terminal(const std::string& ring_name, std::uint64_t generation_id,
                                    std::uint16_t flags) {
+    // L3: the ring was created when the job was accepted, so this is a
+    // lookup, not a creation -- but `get_or_create` can now refuse, so a
+    // ring that somehow is not there is reported rather than assumed.
     auto sink = rings_.get_or_create(ring_name, /*capacity_slots=*/0, /*slot_size=*/0);
+    if (!sink) {
+        spdlog::warn("no ring for generation {}; end-of-stream slot not written", generation_id);
+        return;
+    }
     std::lock_guard<std::mutex> lock(ring_mutex_);
-    if (!sink.write_split(generation_id, 0, flags, nullptr, 0)) {
+    if (!sink->write_split(generation_id, 0, flags, nullptr, 0)) {
         spdlog::warn("failed to write the end-of-stream slot for generation {}", generation_id);
     }
 }
@@ -171,8 +178,22 @@ void LaneScheduler::worker_loop(std::deque<QueueEntry>& queue, std::mutex& queue
             }
         }
 
-        auto sink =
+        // L3: as in `write_terminal`, the job's ring already exists; a
+        // refusal here would mean there is nowhere to put this job's
+        // tokens, so it is dropped with a log instead of generating into
+        // nothing.
+        auto sink_opt =
             rings_.get_or_create(entry.job.ring_name, /*capacity_slots=*/0, /*slot_size=*/0);
+        if (!sink_opt) {
+            spdlog::warn("generation {} dropped: no ring to write into", entry.job.generation_id);
+            if (is_interactive) {
+                std::lock_guard<std::mutex> lock(interactive_mutex_);
+                interactive_running_ = false;
+                refresh_interactive_active();
+            }
+            continue;
+        }
+        auto& sink = *sink_opt;
         int tokens_produced = 0;
         bool eos_written = false;
         auto should_cancel = [&entry, &extra_yield_check, this] {

@@ -1,9 +1,11 @@
 #include "config.hpp"
 
-#include <spdlog/spdlog.h>
 #include <toml.hpp>
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include "libneuroos/paths.hpp"
 
@@ -13,42 +15,87 @@ std::string config_file_path() {
     return neuroos::paths::config_file();
 }
 
-Config load_config() {
-    Config config;
-    const std::string path = config_file_path();
-    if (!std::filesystem::exists(path)) {
-        return config; // no config file: every field keeps its default
-    }
+const std::vector<std::string>& known_inference_keys() {
+    static const std::vector<std::string> keys = {"model_path", "model_sha256", "threads",
+                                                  "max_context_tokens"};
+    return keys;
+}
 
+neuroos::Expected<Config, ConfigError> parse_config(const std::string& toml_text) {
+    Config config;
     try {
-        const auto data = toml::parse(path);
+        std::istringstream stream(toml_text);
+        const auto data = toml::parse(stream, "config.toml");
         if (!data.is_table() || data.as_table().count("inference") == 0) {
             return config; // no [inference] table: defaults
         }
-        // Fetch the [inference] sub-table once and use single-key find_or on
-        // it: toml11's variadic multi-key find_or(data, "inference", "key",
-        // fallback) fails to deduce when `fallback` is an lvalue reference
-        // (as `config.threads` is here), so this sidesteps that entirely.
         const auto& inference = data.as_table().at("inference");
-        config.threads = toml::find_or<std::uint32_t>(inference, "threads", 8u);
-        config.max_context_tokens =
-            toml::find_or<std::uint32_t>(inference, "max_context_tokens", 512u);
-        std::string model_path = toml::find_or<std::string>(inference, "model_path", std::string{});
-        if (!model_path.empty()) {
-            config.model_path = model_path;
+        if (!inference.is_table()) {
+            return make_unexpected(ConfigError{"[inference] is not a table"});
         }
-        std::string model_sha256 =
-            toml::find_or<std::string>(inference, "model_sha256", std::string{});
-        if (!model_sha256.empty()) {
-            config.model_sha256 = model_sha256;
+        // L5: reject an unrecognised key instead of ignoring it. A typo'd
+        // `model_sha256` used to disable the model integrity check in
+        // silence; now it stops startup, the way the Rust-side strict
+        // parser already does for every other section.
+        for (const auto& [key, value] : inference.as_table()) {
+            (void)value;
+            const auto& known = known_inference_keys();
+            if (std::find(known.begin(), known.end(), key) == known.end()) {
+                return make_unexpected(ConfigError{"unknown key in [inference]: " + key});
+            }
+        }
+        // L5: `toml::find_or` returns its fallback for a key of the *wrong
+        // type* just as readily as for a missing one, so `threads =
+        // "eight"` used to read as the default 8. `toml::find` throws
+        // instead, and the catch below turns that into a startup error.
+        // The presence check keeps a missing key on its default.
+        const auto& table = inference.as_table();
+        if (table.count("threads") != 0) {
+            config.threads = toml::find<std::uint32_t>(inference, "threads");
+        }
+        if (table.count("max_context_tokens") != 0) {
+            config.max_context_tokens = toml::find<std::uint32_t>(inference, "max_context_tokens");
+        }
+        if (table.count("model_path") != 0) {
+            std::string model_path = toml::find<std::string>(inference, "model_path");
+            if (!model_path.empty()) {
+                config.model_path = model_path;
+            }
+        }
+        if (table.count("model_sha256") != 0) {
+            std::string model_sha256 = toml::find<std::string>(inference, "model_sha256");
+            if (!model_sha256.empty()) {
+                config.model_sha256 = model_sha256;
+            }
         }
     } catch (const std::exception& e) {
         // rules.md §8: wrap third-party code that throws at the boundary.
-        // A malformed config.toml is a startup-fatal condition for every
-        // other component (neuroos_common::load_config errors out too), so
-        // this logs and falls back to defaults rather than crashing —
-        // engine.cpp's own model-path/sha256 checks are the real gate.
-        spdlog::warn("failed to parse {}: {}; using inference config defaults", path, e.what());
+        // L5: converted to an error rather than a warning plus defaults --
+        // a malformed config.toml is startup-fatal for every other
+        // component (neuroos_common::load_config errors out too), and
+        // falling back to defaults here meant a broken [inference] table
+        // produced a *running* C4 with the wrong settings.
+        return make_unexpected(
+            ConfigError{std::string("failed to parse config.toml: ") + e.what()});
+    }
+    return config;
+}
+
+neuroos::Expected<Config, ConfigError> load_config() {
+    const std::string path = config_file_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return Config{}; // no config file: every field keeps its default
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return make_unexpected(ConfigError{"failed to read " + path});
+    }
+    std::ostringstream text;
+    text << file.rdbuf();
+    auto config = parse_config(text.str());
+    if (!config) {
+        return make_unexpected(ConfigError{config.error().message + " (" + path + ")"});
     }
     return config;
 }

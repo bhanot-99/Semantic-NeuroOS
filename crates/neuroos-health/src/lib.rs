@@ -26,7 +26,9 @@ pub use histogram::Histogram;
 pub use percentile::{p50_ns, p99_ns, percentile_ns};
 pub use rss::rss_bytes;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
+use neuroos_ipc::{
+    DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope_deadline, write_envelope,
+};
 use neuroos_proto::v1::{Envelope, HealthResponse, Status, envelope};
 
 pub struct HealthServer {
@@ -118,24 +120,38 @@ impl HealthServer {
         allowed_uids: Vec<u32>,
     ) -> io::Result<()> {
         let server = UdsServer::bind(UdsServerConfig::new(socket_path, allowed_uids))?;
+        let idle_timeout = server.idle_timeout();
         loop {
-            let Some((mut stream, _cred)) = server.accept().await? else {
+            let Some((mut stream, _cred, permit)) = server.accept().await? else {
                 continue; // rejected peer; keep serving
             };
             let this = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = this.handle_connection(&mut stream).await {
+                // L2: held for the connection's lifetime (see
+                // `ConnectionPermit`), so the slot frees when it ends.
+                let _permit = permit;
+                if let Err(e) = this.handle_connection(&mut stream, idle_timeout).await {
                     tracing::debug!(error = %e, "health connection ended");
                 }
             });
         }
     }
 
-    async fn handle_connection<S>(&self, stream: &mut S) -> Result<(), neuroos_ipc::FramingError>
+    /// L2: `idle_timeout` bounds the wait for the *next* request on an
+    /// already-accepted connection. healthd scrapes on a period far
+    /// shorter than [`neuroos_ipc::DEFAULT_IDLE_TIMEOUT`], so a
+    /// connection that goes quiet for that long is a dead scraper.
+    async fn handle_connection<S>(
+        &self,
+        stream: &mut S,
+        idle_timeout: std::time::Duration,
+    ) -> Result<(), neuroos_ipc::FramingError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        while let Some(req) = read_envelope(stream, DEFAULT_MAX_FRAME).await? {
+        while let Some(req) =
+            read_envelope_deadline(stream, DEFAULT_MAX_FRAME, idle_timeout).await?
+        {
             if !matches!(req.body, Some(envelope::Body::HealthRequest(_))) {
                 continue;
             }
@@ -143,7 +159,7 @@ impl HealthServer {
                 schema_version: 1,
                 trace_id: req.trace_id,
                 request_id: req.request_id,
-                sent_at_ns: now_ns(),
+                sent_at_ns: neuroos_common::now_ns(),
                 body: Some(envelope::Body::HealthResponse(self.snapshot())),
             };
             write_envelope(stream, &resp, DEFAULT_MAX_FRAME).await?;
@@ -152,18 +168,11 @@ impl HealthServer {
     }
 }
 
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
-    use neuroos_ipc::connect;
+    use neuroos_ipc::{connect, read_envelope};
     use neuroos_proto::v1::HealthRequest;
 
     /// M3: nothing in production called `set_status`/`incr_error`, so
@@ -226,7 +235,7 @@ mod tests {
             schema_version: 1,
             trace_id: "t".into(),
             request_id: 1,
-            sent_at_ns: now_ns(),
+            sent_at_ns: neuroos_common::now_ns(),
             body: Some(envelope::Body::HealthRequest(HealthRequest {})),
         };
         write_envelope(&mut client, &req, DEFAULT_MAX_FRAME)

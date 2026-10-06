@@ -3,7 +3,9 @@
 //! slow client only drops its own backlog (see `bus.rs`'s doc comment).
 use std::path::PathBuf;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, write_envelope};
+use neuroos_ipc::{
+    ConnectionPermit, DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, write_envelope,
+};
 use neuroos_proto::v1::{Envelope, envelope};
 use tokio::net::UnixStream;
 
@@ -19,9 +21,9 @@ pub async fn serve(path: PathBuf, allowed_uids: Vec<u32>, bus: EventBus) {
     };
     loop {
         match server.accept().await {
-            Ok(Some((stream, cred))) => {
+            Ok(Some((stream, cred, permit))) => {
                 tracing::debug!(uid = cred.uid, "monitor.sock subscriber connected");
-                tokio::spawn(handle_subscriber(stream, bus.subscribe()));
+                tokio::spawn(handle_subscriber(stream, bus.subscribe(), permit));
             }
             Ok(None) => continue, // this one connection failed; keep serving
             Err(e) => {
@@ -34,7 +36,15 @@ pub async fn serve(path: PathBuf, allowed_uids: Vec<u32>, bus: EventBus) {
     }
 }
 
-async fn handle_subscriber(mut stream: UnixStream, mut sub: crate::bus::EventSubscriber) {
+/// L2: this socket is server-push -- a subscriber never sends a request,
+/// so there is no idle *read* to time out and the connection cap is the
+/// whole of its back pressure. The `_permit` is dropped when the
+/// subscriber goes away, freeing its slot.
+async fn handle_subscriber(
+    mut stream: UnixStream,
+    mut sub: crate::bus::EventSubscriber,
+    _permit: ConnectionPermit,
+) {
     loop {
         let event = sub.recv().await;
         let env = Envelope {

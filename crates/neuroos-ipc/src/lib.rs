@@ -15,4 +15,6 @@ pub use framing::{
     DEFAULT_MAX_FRAME, FramingError, read_envelope, read_frame, write_envelope, write_frame,
 };
 pub use peercred::{PeerCred, is_allowed, peer_cred};
-pub use server::{UdsServer, UdsServerConfig};
+pub use server::{
+    ConnectionPermit, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, UdsServer, UdsServerConfig,
+};

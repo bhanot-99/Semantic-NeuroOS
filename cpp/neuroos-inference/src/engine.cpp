@@ -116,8 +116,8 @@ ModelInfo Model::info() const {
     };
 }
 
-std::uint32_t Model::tokenize_count(const std::string& text) const {
-    return static_cast<std::uint32_t>(tokenize(model_, text, /*add_special=*/false).size());
+std::uint32_t Model::tokenize_count(const std::string& text, bool add_special) const {
+    return static_cast<std::uint32_t>(tokenize(model_, text, add_special).size());
 }
 
 Context::Context(std::shared_ptr<Model> model, llama_context* ctx, std::uint32_t /*n_ctx*/)
@@ -168,6 +168,14 @@ namespace {
 // penalty (BUG-005) looks when deciding a token is a repeat.
 constexpr std::int32_t kRepetitionPenaltyLastN = 64;
 } // namespace
+
+std::uint32_t sampler_seed(std::uint64_t seed) {
+    if (seed == 0) {
+        return std::random_device{}();
+    }
+    auto folded = static_cast<std::uint32_t>(seed ^ (seed >> 32));
+    return folded == 0 ? 1U : folded;
+}
 
 neuroos::Expected<void, EngineError>
 Context::generate(const std::string& prompt, std::uint32_t max_tokens, float temperature,
@@ -250,8 +258,7 @@ Context::generate(const std::string& prompt, std::uint32_t max_tokens, float tem
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
     } else {
         llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(temperature));
-        llama_sampler_chain_add(chain.get(),
-                                llama_sampler_init_dist(seed == 0 ? std::random_device{}() : seed));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(sampler_seed(seed)));
     }
 
     for (std::uint32_t generated = 0; generated < max_tokens; ++generated) {

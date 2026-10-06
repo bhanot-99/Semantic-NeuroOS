@@ -128,7 +128,7 @@ mod tests {
         tokio::task::spawn_local(async move {
             let server = UdsServer::bind(UdsServerConfig::new(sock, vec![uid])).unwrap();
             for batch in batches {
-                let (mut stream, _) = server.accept().await.unwrap().unwrap();
+                let (mut stream, _, _permit) = server.accept().await.unwrap().unwrap();
                 for env in batch {
                     write_envelope(&mut stream, &env, DEFAULT_MAX_FRAME)
                         .await

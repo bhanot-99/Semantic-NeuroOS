@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use neuroos_health::HealthServer;
-use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
+use neuroos_ipc::{
+    ConnectionPermit, DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope_deadline,
+    write_envelope,
+};
 use neuroos_proto::v1::{
     ActivityItem, ChunkMatch, EdgeRow, EntityRow, Envelope, Error, ErrorCode, FocusHistoryRow,
     ForgetResponse, ListEdgesResponse, ListEntitiesResponse, MaintenanceResponse,
@@ -16,6 +19,27 @@ use neuroos_proto::v1::{
 
 /// Architecture.md §7.5: "keep 8".
 const DEFAULT_BACKUPS_KEPT: usize = 8;
+
+/// L1: `QueryHybridRequest.top_k` is an untrusted `uint32`, and
+/// `StorageEngine::query_hybrid` multiplies it by `CANDIDATE_OVERFETCH`
+/// before handing it to Lance and to the FTS `LIMIT` -- a caller asking
+/// for `u32::MAX` would overflow that product and ask C3 to materialise
+/// every chunk it has. The real caller (C5a's `evidence`) asks for
+/// `DEFAULT_TOP_K * OVERFETCH_FACTOR` = 20, so this ceiling is ~13x
+/// more headroom than production needs.
+const MAX_TOP_K: u32 = 256;
+
+/// L1: same for `QueryActivityRequest.limit`, which becomes a SQL
+/// `LIMIT` and sizes the response `Vec`. C5a's real request is 18
+/// (`ACTIVITY_LIMIT * 3`).
+const MAX_ACTIVITY_LIMIT: u32 = 1024;
+
+/// L1: clamps an untrusted request count into `1..=max`. `0` means
+/// "unset" on the wire (proto3 has no field presence for scalars), which
+/// every caller of these two RPCs already treated as 1.
+fn clamp_count(requested: u32, max: u32) -> usize {
+    requested.clamp(1, max) as usize
+}
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
@@ -147,14 +171,17 @@ async fn serve_local(
             return;
         }
     };
+    let idle_timeout = server.idle_timeout();
     loop {
         match server.accept().await {
-            Ok(Some((stream, _cred))) => {
+            Ok(Some((stream, _cred, permit))) => {
                 tokio::task::spawn_local(handle_conn(
                     stream,
                     Arc::clone(&engine),
                     Arc::clone(&backups_dir),
                     Arc::clone(&health),
+                    idle_timeout,
+                    permit,
                 ));
             }
             Ok(None) => continue, // this one connection failed; keep serving
@@ -173,13 +200,19 @@ async fn handle_conn(
     engine: Arc<Mutex<StorageEngine>>,
     backups_dir: Arc<PathBuf>,
     health: Arc<HealthServer>,
+    idle_timeout: std::time::Duration,
+    // L2: dropped when this connection ends, freeing its slot.
+    _permit: ConnectionPermit,
 ) {
     loop {
-        let env = match read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
+        // L2: an idle connection is closed rather than held forever. Each
+        // of C3's four callers opens a connection per request, so the only
+        // thing this can cost is a reconnect.
+        let env = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, idle_timeout).await {
             Ok(Some(env)) => env,
             Ok(None) => return, // peer closed cleanly
             Err(e) => {
-                tracing::debug!(error = %e, "storage.sock read failed");
+                tracing::debug!(error = %e, "storage.sock read failed or went idle");
                 return;
             }
         };
@@ -201,11 +234,29 @@ async fn handle_conn(
     }
 }
 
-fn internal_error(message: impl Into<String>) -> envelope::Body {
+/// L1: the IPC `message` is a stable identifier and nothing else
+/// (rules.md §5.3). The underlying rusqlite/FTS/Lance `Display` text can
+/// quote user content -- a failing `INSERT`'s bound window title, the FTS
+/// match expression built from the caller's query -- so it goes to a
+/// `debug` log (below R0-6's `info` bar) and never into the envelope.
+fn internal_error(what: &'static str, detail: &dyn std::fmt::Display) -> envelope::Body {
+    tracing::debug!(request = what, error = %detail, "storage.sock request failed");
     envelope::Body::Error(Error {
         code: ErrorCode::Internal as i32,
-        message: message.into(),
+        message: format!("{what} failed"),
         retryable: true,
+    })
+}
+
+/// L1: a request this socket cannot serve, or one whose body is missing a
+/// required field. rules.md §5.4 classifies it as fatal, not retryable --
+/// resending the same malformed request can only fail the same way, and
+/// the old `Internal, retryable=true` made callers retry it forever.
+fn invalid_argument(message: &'static str) -> envelope::Body {
+    envelope::Body::Error(Error {
+        code: ErrorCode::InvalidArgument as i32,
+        message: message.to_string(),
+        retryable: false,
     })
 }
 
@@ -233,7 +284,7 @@ async fn handle_request(
                 // rules.md §5.5: fail closed -- a query error must not read
                 // as "no window was focused" to a caller doing a deictic
                 // snap for a capability decision.
-                Err(e) => internal_error(format!("QueryFocusHistory failed: {e}")),
+                Err(e) => internal_error("QueryFocusHistory", &e),
             }
         }
         Some(envelope::Body::QueryActivityRequest(req)) => {
@@ -248,20 +299,24 @@ async fn handle_request(
                 // no longer has to invent `taint: None` for it.
                 taint: Some(Taint { flags: r.taint }),
             };
-            match engine.query_activity(req.since_ns, req.until_ns, req.limit.max(1) as usize) {
+            match engine.query_activity(
+                req.since_ns,
+                req.until_ns,
+                clamp_count(req.limit, MAX_ACTIVITY_LIMIT),
+            ) {
                 Ok((windows, media)) => {
                     envelope::Body::QueryActivityResponse(QueryActivityResponse {
                         windows: windows.into_iter().map(item).collect(),
                         media: media.into_iter().map(item).collect(),
                     })
                 }
-                Err(e) => internal_error(format!("QueryActivity failed: {e}")),
+                Err(e) => internal_error("QueryActivity", &e),
             }
         }
         Some(envelope::Body::QueryHybridRequest(req)) => {
             let mut engine = engine.lock().await;
             match engine
-                .query_hybrid(&req.text, req.top_k.max(1) as usize)
+                .query_hybrid(&req.text, clamp_count(req.top_k, MAX_TOP_K))
                 .await
             {
                 Ok(matches) => envelope::Body::QueryHybridResponse(QueryHybridResponse {
@@ -279,7 +334,7 @@ async fn handle_request(
                         })
                         .collect(),
                 }),
-                Err(e) => internal_error(format!("QueryHybridVectorText failed: {e}")),
+                Err(e) => internal_error("QueryHybridVectorText", &e),
             }
         }
         Some(envelope::Body::ForgetRequest(req)) => {
@@ -295,7 +350,7 @@ async fn handle_request(
                 Ok(forgotten) => envelope::Body::ForgetResponse(ForgetResponse {
                     forgotten: forgotten as u64,
                 }),
-                Err(e) => internal_error(format!("Forget failed: {e}")),
+                Err(e) => internal_error("Forget", &e),
             }
         }
         Some(envelope::Body::ListEntitiesRequest(req)) => {
@@ -316,7 +371,7 @@ async fn handle_request(
                         })
                         .collect(),
                 }),
-                Err(e) => internal_error(format!("ListEntities failed: {e}")),
+                Err(e) => internal_error("ListEntities", &e),
             }
         }
         Some(envelope::Body::ListEdgesRequest(_)) => {
@@ -335,7 +390,7 @@ async fn handle_request(
                         })
                         .collect(),
                 }),
-                Err(e) => internal_error(format!("ListEdges failed: {e}")),
+                Err(e) => internal_error("ListEdges", &e),
             }
         }
         Some(envelope::Body::UpsertEdgeRequest(req)) => {
@@ -353,14 +408,14 @@ async fn handle_request(
             };
             match result {
                 Ok(()) => envelope::Body::UpsertEdgeResponse(UpsertEdgeResponse { ok: true }),
-                Err(e) => internal_error(format!("UpsertEdge failed: {e}")),
+                Err(e) => internal_error("UpsertEdge", &e),
             }
         }
         Some(envelope::Body::PruneEdgesRequest(req)) => {
             let engine = engine.lock().await;
             match engine.prune_hypothesis_edges(req.older_than_ns) {
                 Ok(pruned) => envelope::Body::PruneEdgesResponse(PruneEdgesResponse { pruned }),
-                Err(e) => internal_error(format!("PruneEdges failed: {e}")),
+                Err(e) => internal_error("PruneEdges", &e),
             }
         }
         Some(envelope::Body::MaintenanceRequest(req)) => {
@@ -372,7 +427,7 @@ async fn handle_request(
                         focus_history_deleted: summary.focus_history_deleted as u64,
                         backup_path: String::new(),
                     }),
-                    Err(e) => internal_error(format!("GC failed: {e}")),
+                    Err(e) => internal_error("GC", &e),
                 },
                 Some(maintenance_request::Job::Backup(job)) => {
                     let keep = match job.keep {
@@ -386,13 +441,13 @@ async fn handle_request(
                             focus_history_deleted: 0,
                             backup_path: path.display().to_string(),
                         }),
-                        Err(e) => internal_error(format!("backup failed: {e}")),
+                        Err(e) => internal_error("backup", &e),
                     }
                 }
-                None => internal_error("MaintenanceRequest without a job"),
+                None => invalid_argument("MaintenanceRequest without a job"),
             }
         }
-        _ => internal_error("unsupported request on storage.sock"),
+        _ => invalid_argument("unsupported request on storage.sock"),
     };
     Envelope {
         schema_version: 1,
@@ -419,6 +474,50 @@ mod tests {
             fn getuid() -> u32;
         }
         unsafe { getuid() }
+    }
+
+    /// L1: `top_k`/`limit` arrive as untrusted `uint32`s. `0` still
+    /// means "unset" (and so 1), and an absurd value is clamped to the
+    /// ceiling instead of being multiplied by `CANDIDATE_OVERFETCH` into
+    /// an overflowing Lance/FTS limit.
+    #[test]
+    fn request_counts_are_clamped_into_range() {
+        assert_eq!(clamp_count(0, MAX_TOP_K), 1);
+        assert_eq!(clamp_count(1, MAX_TOP_K), 1);
+        assert_eq!(clamp_count(20, MAX_TOP_K), 20);
+        assert_eq!(clamp_count(u32::MAX, MAX_TOP_K), MAX_TOP_K as usize);
+        assert_eq!(
+            clamp_count(u32::MAX, MAX_ACTIVITY_LIMIT),
+            MAX_ACTIVITY_LIMIT as usize
+        );
+    }
+
+    /// L1 / rules.md §5.3: the envelope `message` must be a stable
+    /// identifier, never the underlying error's text -- that text can
+    /// quote user content (a bound window title, an FTS match string).
+    #[test]
+    fn internal_error_message_never_carries_the_underlying_error_text() {
+        let detail = "no such column: \"a secret window title\"";
+        match internal_error("QueryHybridVectorText", &detail) {
+            envelope::Body::Error(e) => {
+                assert_eq!(e.message, "QueryHybridVectorText failed");
+                assert!(!e.message.contains("secret"), "{}", e.message);
+                assert_eq!(e.code, ErrorCode::Internal as i32);
+                assert!(e.retryable);
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_argument_is_not_retryable() {
+        match invalid_argument("unsupported request on storage.sock") {
+            envelope::Body::Error(e) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument as i32);
+                assert!(!e.retryable);
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
     }
 
     fn dev_models_dir() -> std::path::PathBuf {
@@ -591,7 +690,16 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                assert!(matches!(resp.body, Some(envelope::Body::Error(_))));
+                // L1: a request this socket does not serve is an
+                // InvalidArgument the caller must not retry, not the old
+                // `Internal, retryable=true`.
+                match resp.body {
+                    Some(envelope::Body::Error(e)) => {
+                        assert_eq!(e.code, ErrorCode::InvalidArgument as i32);
+                        assert!(!e.retryable, "an unserved request type is fatal");
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
             } => {}
         }
     }

@@ -49,13 +49,27 @@ class Model {
     llama_model* raw() const {
         return model_;
     }
-    std::uint32_t tokenize_count(const std::string& text) const;
+    // L5: `add_special` must match what `Context::generate` does with the
+    // same text, or a count used as an admission gate is off by the BOS
+    // token. `generate` tokenizes with add_special=true, so a prompt
+    // measured with `false` could pass a max_context_tokens check and then
+    // overflow the context by one. Defaults to the generate-equivalent.
+    std::uint32_t tokenize_count(const std::string& text, bool add_special = true) const;
 
   private:
     explicit Model(llama_model* model);
 
     llama_model* model_ = nullptr;
 };
+
+// L5: `llama_sampler_init_dist` takes a uint32_t, so a request's 64-bit
+// seed was being narrowed by a plain implicit conversion -- two seeds
+// differing only in their high 32 bits produced byte-identical output,
+// which defeats the point of letting a caller pin one. Both halves are
+// folded in instead. `0` keeps its documented "pick a random seed"
+// meaning, and a non-zero seed whose fold is 0 is nudged off it so it can
+// never silently become "random".
+std::uint32_t sampler_seed(std::uint64_t seed);
 
 // One lane's decode state: its own llama_context (own KV cache), reused
 // across requests. Not thread-safe — each lane (lanes.cpp) owns exactly one
@@ -82,7 +96,10 @@ class Context {
     // PRD FR-INF-05/FR-INF-06).
     //
     // `grammar_gbnf` empty => unconstrained sampling. `temperature` 0.0 =>
-    // greedy. `seed` 0 => a random seed. `repetition_penalty` 1.0 =>
+    // greedy. `seed` 0 => a random seed; any other value is folded to the
+    // 32 bits llama_sampler_init_dist takes (L5: it used to be silently
+    // truncated, so two seeds differing only above bit 31 produced the
+    // same stream). `repetition_penalty` 1.0 =>
     // disabled (BUG-005: penalizes the last kRepetitionPenaltyLastN sampled
     // tokens so decoding on real, longer prompts doesn't degenerate into a
     // repeated-token loop).

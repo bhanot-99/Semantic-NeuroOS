@@ -58,11 +58,24 @@ fn down_record(target: &Target) -> ComponentRecord {
     }
 }
 
+/// L8: `timeout` is the budget for the whole scrape, so each step gets
+/// what is left of it rather than a fresh copy. The module doc has always
+/// said "connect, send `HealthRequest`, read `HealthResponse`, all within
+/// one deadline", but passing `timeout` to all three meant a target that
+/// stalled at every step could hold a scrape task for 3x the configured
+/// budget -- and `scrape_cycle` waits on every target's task, so one slow
+/// component stretched the whole cycle.
+fn remaining(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
 async fn scrape_one_inner(
     target: &Target,
     timeout: Duration,
 ) -> Result<ComponentRecord, ScrapeError> {
-    let mut stream = connect(&target.socket, timeout)
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let mut stream = connect(&target.socket, remaining(deadline))
         .await
         .map_err(ScrapeError::Connect)?;
 
@@ -73,11 +86,16 @@ async fn scrape_one_inner(
         sent_at_ns: neuroos_common::now_ns(),
         body: Some(envelope::Body::HealthRequest(HealthRequest {})),
     };
-    write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, timeout)
-        .await
-        .map_err(ScrapeError::Write)?;
+    write_envelope_deadline(
+        &mut stream,
+        &request,
+        DEFAULT_MAX_FRAME,
+        remaining(deadline),
+    )
+    .await
+    .map_err(ScrapeError::Write)?;
 
-    let response = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, timeout)
+    let response = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, remaining(deadline))
         .await
         .map_err(ScrapeError::Read)?
         .ok_or(ScrapeError::ConnectionClosed)?;
@@ -271,6 +289,50 @@ mod tests {
         let record = scrape_one(&t, Duration::from_secs(1)).await;
         assert_eq!(record.status, neuroos_proto::v1::Status::Degraded);
         assert_eq!(record.rss_bytes, 95 * 1024 * 1024);
+    }
+
+    /// L8: one deadline for the whole scrape, not one per step. The peer
+    /// here stalls at the *read* step after a slow accept, which under the
+    /// old code gave connect its full budget and then read a fresh full
+    /// budget on top. The assertion is on wall-clock time, so it fails if
+    /// any step is handed a fresh copy of the timeout.
+    #[tokio::test]
+    async fn the_whole_scrape_shares_one_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stalling.health.sock");
+
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Accept, then never answer: the read step must give up on
+                // what is left of the budget, not start a new one.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(stream);
+            }
+        });
+
+        let budget = Duration::from_millis(300);
+        let t = target("stalling", sock);
+        let started = std::time::Instant::now();
+        let record = scrape_one(&t, budget).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(record.status, neuroos_proto::v1::Status::Down);
+        // Generous slack for scheduling, but far below the 2x a per-step
+        // budget would cost (connect returns promptly here, so the old
+        // code's worst case was ~2x; with a slow connect it was 3x).
+        assert!(
+            elapsed < budget * 2,
+            "scrape took {elapsed:?}, which is past the single {budget:?} budget"
+        );
+    }
+
+    /// L8: a budget already spent leaves nothing for the later steps,
+    /// rather than silently granting them a fresh one.
+    #[test]
+    fn remaining_saturates_at_zero_for_a_spent_deadline() {
+        let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+        assert_eq!(remaining(deadline), Duration::ZERO);
     }
 
     fn current_uid() -> u32 {

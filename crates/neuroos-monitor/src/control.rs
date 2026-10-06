@@ -3,7 +3,12 @@
 //! `monitor.sock`'s push-event stream (Architecture.md §5.2).
 use std::path::PathBuf;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
+use std::time::Duration;
+
+use neuroos_ipc::{
+    ConnectionPermit, DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope_deadline,
+    write_envelope,
+};
 use neuroos_proto::v1::{
     Envelope, Error, ErrorCode, MonitorPauseResponse, MonitorStatusResponse, envelope,
 };
@@ -20,26 +25,48 @@ pub async fn serve(path: PathBuf, allowed_uids: Vec<u32>, privacy: PrivacyState,
             return;
         }
     };
+    let idle_timeout = server.idle_timeout();
     loop {
         match server.accept().await {
-            Ok(Some((stream, _cred))) => {
-                tokio::spawn(handle_conn(stream, privacy.clone(), bus.clone()));
+            Ok(Some((stream, _cred, permit))) => {
+                tokio::spawn(handle_conn(
+                    stream,
+                    privacy.clone(),
+                    bus.clone(),
+                    idle_timeout,
+                    permit,
+                ));
             }
             Ok(None) => continue, // rejected peer (SO_PEERCRED not in allowlist); keep serving
             Err(e) => {
-                tracing::warn!(error = %e, "monitor.control.sock accept failed");
+                // L17: this arm used to `warn!` and loop. After M2 that is
+                // reachable only for a listening socket that is broken for
+                // good, so it spun at full CPU logging forever -- the exact
+                // failure M2 fixed in every other server's accept loop.
+                tracing::error!(error = %e, "monitor.control.sock listener is unusable; stopped serving");
+                return;
             }
         }
     }
 }
 
-async fn handle_conn(mut stream: UnixStream, privacy: PrivacyState, bus: EventBus) {
+async fn handle_conn(
+    mut stream: UnixStream,
+    privacy: PrivacyState,
+    bus: EventBus,
+    idle_timeout: Duration,
+    // L2: dropped when this connection ends, freeing its slot.
+    _permit: ConnectionPermit,
+) {
     loop {
-        let env = match read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
+        // L2: an accepted connection that never sends another request is
+        // closed instead of pinning a task and an fd until the process
+        // exits. `neuroosctl` opens one connection per command.
+        let env = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, idle_timeout).await {
             Ok(Some(env)) => env,
             Ok(None) => return, // peer closed cleanly
             Err(e) => {
-                tracing::debug!(error = %e, "monitor.control.sock read failed");
+                tracing::debug!(error = %e, "monitor.control.sock read failed or went idle");
                 return;
             }
         };

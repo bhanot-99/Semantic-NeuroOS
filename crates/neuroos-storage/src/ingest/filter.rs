@@ -124,6 +124,14 @@ pub struct IngestFilter {
     /// `TitleChanged` to `Closed`) so a completed dwell segment can be
     /// labeled with whatever was on screen, not just the app_id.
     toplevel_titles: HashMap<u64, String>,
+    /// L12: toplevel_id -> the window's pid, tracked `Opened` to `Closed`
+    /// exactly like the app_id and title above. Only `WindowOpened`
+    /// carries a pid, and only when `pid_known` (ADR-0009: Wayland gives
+    /// no pid for a foreign toplevel, so C1 resolves it best-effort), so
+    /// without this the adapter writing a `focus_history` row at segment
+    /// close -- always a `StateChanged` or `Closed` -- had nothing to put
+    /// in its `pid`/`root_pid` columns and wrote 0.
+    toplevel_pids: HashMap<u64, u32>,
     /// toplevel_id -> the UTC-ns instant its current focus segment began,
     /// present only while currently activated.
     active_since_ns: HashMap<u64, u64>,
@@ -180,6 +188,14 @@ impl IngestFilter {
             now_ns,
         );
         true
+    }
+
+    /// L12: the pid of a still-open toplevel, when C1 could resolve one
+    /// (`None` otherwise, which is what the old hard-coded 0 meant for
+    /// every window). Read together with [`Self::collapse_pid`], which
+    /// maps it onto its process-tree root.
+    pub fn pid_for(&self, toplevel_id: u64) -> Option<u32> {
+        self.toplevel_pids.get(&toplevel_id).copied()
     }
 
     /// The last-known title for a still-open toplevel (`None` if it was
@@ -264,6 +280,12 @@ impl IngestFilter {
                 self.toplevel_app_ids
                     .insert(w.toplevel_id, o.app_id.clone());
                 self.toplevel_titles.insert(w.toplevel_id, o.title.clone());
+                // L12: `pid_known == false` means C1 could not resolve one
+                // (ADR-0009); recording the 0 it sends would be inventing
+                // a pid, so the entry is simply absent.
+                if o.pid_known {
+                    self.toplevel_pids.insert(w.toplevel_id, o.pid);
+                }
                 FilterOutcome::NotApplicable // opening isn't necessarily focusing
             }
             Some(Kind::AppIdChanged(a)) => {
@@ -329,6 +351,10 @@ impl IngestFilter {
             Some(Kind::Closed(_)) => {
                 let app_id = self.toplevel_app_ids.remove(&w.toplevel_id);
                 let title = self.toplevel_titles.remove(&w.toplevel_id);
+                // L12: dropped with the rest of this toplevel's state, so
+                // the map cannot grow across a session (and the kernel
+                // reuses pids, as `pid_roots` already notes).
+                self.toplevel_pids.remove(&w.toplevel_id);
                 let started = self.active_since_ns.remove(&w.toplevel_id);
                 // BUG-007: most windows are closed while still focused,
                 // without a deactivate first; that close ends the segment.

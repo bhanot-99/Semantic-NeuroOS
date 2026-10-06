@@ -154,13 +154,27 @@ fn adapt_window(
                 Some(Kind::Opened(o)) => o.title.as_str(),
                 _ => filter.last_segment_title().unwrap_or(""),
             });
+            // L12: both columns used to be hard-coded 0 for every row, so
+            // `focus_history.pid`/`root_pid` -- and `QueryFocusHistoryResponse`'s
+            // copies of them, which C6 reads for a deictic snap -- carried
+            // no information at all. The pid comes from the `WindowOpened`
+            // event the filter remembers for this toplevel, and `root_pid`
+            // from the process-tree collapse that exists for exactly this
+            // (`IngestFilter::collapse_pid`). 0 still means "C1 could not
+            // resolve a pid for this window" (ADR-0009).
+            let pid = filter.pid_for(w.toplevel_id).unwrap_or(0);
+            let root_pid = if pid == 0 {
+                0
+            } else {
+                filter.collapse_pid(pid)
+            };
             sqlite::insert_focus_history(
                 conn,
                 &FocusHistoryEntry {
                     app_id,
                     title,
-                    pid: 0,
-                    root_pid: 0,
+                    pid,
+                    root_pid,
                     t_start_ns: *t_start_ns,
                     t_end_ns: *t_end_ns,
                     dwell_ms,
@@ -336,12 +350,79 @@ fn adapt_file_activity(
     }])
 }
 
+/// L12: CPU bands for [`adapt_resource`]. The `system_resource` domain
+/// exists to answer "was the machine busy around then", so the sample is
+/// recorded as the band it falls in rather than thrown away. Bands, not
+/// the raw percentages, because `event_counters` (the only table this
+/// domain has -- a per-sample table would need a new migration, see
+/// BUGS.md D3) keys on a string, and because a sample every
+/// `resource_sample_interval_s` (default 5s, 17k/day) is far too many to
+/// embed as chunks.
+const CPU_BAND_IDLE_MAX: f64 = 10.0;
+const CPU_BAND_LIGHT_MAX: f64 = 40.0;
+const CPU_BAND_BUSY_MAX: f64 = 80.0;
+
+/// L12: memory bands, as a percentage of `system_mem_total_bytes`.
+const MEM_BAND_LOW_MAX: f64 = 50.0;
+const MEM_BAND_HIGH_MAX: f64 = 85.0;
+
+fn cpu_band(percent: f64) -> &'static str {
+    // NaN (a bad /proc/stat delta) sorts into no band and is reported as
+    // unknown rather than silently counted as idle.
+    if percent.is_nan() {
+        "cpu:unknown"
+    } else if percent < CPU_BAND_IDLE_MAX {
+        "cpu:idle"
+    } else if percent < CPU_BAND_LIGHT_MAX {
+        "cpu:light"
+    } else if percent < CPU_BAND_BUSY_MAX {
+        "cpu:busy"
+    } else {
+        "cpu:saturated"
+    }
+}
+
+fn mem_band(used_bytes: u64, total_bytes: u64) -> &'static str {
+    if total_bytes == 0 {
+        return "mem:unknown"; // C1 could not read /proc/meminfo
+    }
+    let percent = (used_bytes as f64 / total_bytes as f64) * 100.0;
+    if percent < MEM_BAND_LOW_MAX {
+        "mem:low"
+    } else if percent < MEM_BAND_HIGH_MAX {
+        "mem:high"
+    } else {
+        "mem:pressure"
+    }
+}
+
+/// L12: this used to take the `ResourceSample` and ignore every field in
+/// it, recording only that *a* sample had arrived -- so the whole
+/// `system_resource` domain held one ever-growing number and could not
+/// answer anything about the machine's actual load. The sample's CPU and
+/// memory figures are now each recorded under their band's key, which the
+/// existing `event_counters` schema supports as-is.
 fn adapt_resource(
     conn: &Connection,
-    _r: &ResourceSample,
+    r: &ResourceSample,
     observed_at_ns: u64,
 ) -> Result<(), StorageError> {
-    sqlite::touch_event_counter(conn, DOMAIN_SYSTEM_RESOURCE, "sample", observed_at_ns, 0)
+    // Kept so the total sample count stays continuous across this change.
+    sqlite::touch_event_counter(conn, DOMAIN_SYSTEM_RESOURCE, "sample", observed_at_ns, 0)?;
+    sqlite::touch_event_counter(
+        conn,
+        DOMAIN_SYSTEM_RESOURCE,
+        cpu_band(r.system_cpu_percent),
+        observed_at_ns,
+        0,
+    )?;
+    sqlite::touch_event_counter(
+        conn,
+        DOMAIN_SYSTEM_RESOURCE,
+        mem_band(r.system_mem_used_bytes, r.system_mem_total_bytes),
+        observed_at_ns,
+        0,
+    )
 }
 
 /// MPRIS player names (bus-name segment) that are web browsers.
@@ -453,6 +534,167 @@ mod tests {
             at_ns,
             Kind::StateChanged(WindowStateChanged { states }),
         )
+    }
+
+    /// L12: a window whose pid C1 could resolve.
+    fn opened_with_pid(toplevel_id: u64, app_id: &str, at_ns: u64, pid: u32) -> RawTelemetryEvent {
+        window_event(
+            toplevel_id,
+            at_ns,
+            Kind::Opened(WindowOpened {
+                app_id: app_id.to_string(),
+                title: "a title".into(),
+                pid,
+                pid_known: true,
+            }),
+        )
+    }
+
+    fn counter_for(conn: &Connection, domain: &str, key: &str) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE((SELECT count FROM event_counters WHERE domain = ?1 AND key = ?2), 0)",
+            (domain, key),
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn resource_event(at_ns: u64, cpu: f64, used: u64, total: u64) -> RawTelemetryEvent {
+        RawTelemetryEvent {
+            observed_at_ns: at_ns,
+            source: "proc".into(),
+            payload: Some(Payload::Resource(ResourceSample {
+                system_cpu_percent: cpu,
+                system_mem_used_bytes: used,
+                system_mem_total_bytes: total,
+            })),
+        }
+    }
+
+    /// L12: `adapt_resource` took the `ResourceSample` and ignored every
+    /// field, so the whole `system_resource` domain was one counter that
+    /// said only "samples are arriving". Each sample's CPU and memory
+    /// figures now land under their band's key.
+    #[test]
+    fn a_resource_sample_records_its_cpu_and_memory_bands() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        let gib = 1024 * 1024 * 1024;
+
+        ingest(
+            &conn,
+            &mut filter,
+            &resource_event(0, 2.0, 4 * gib, 16 * gib),
+        )
+        .unwrap();
+        ingest(
+            &conn,
+            &mut filter,
+            &resource_event(1, 95.0, 15 * gib, 16 * gib),
+        )
+        .unwrap();
+
+        assert_eq!(counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "sample"), 2);
+        assert_eq!(counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "cpu:idle"), 1);
+        assert_eq!(
+            counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "cpu:saturated"),
+            1
+        );
+        assert_eq!(counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "mem:low"), 1);
+        assert_eq!(
+            counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "mem:pressure"),
+            1
+        );
+    }
+
+    /// L12: a sample C1 could not compute must not be counted as idle.
+    #[test]
+    fn an_unreadable_resource_sample_is_recorded_as_unknown() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        ingest(&conn, &mut filter, &resource_event(0, f64::NAN, 0, 0)).unwrap();
+        assert_eq!(counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "cpu:unknown"), 1);
+        assert_eq!(counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "mem:unknown"), 1);
+        assert_eq!(counter_for(&conn, DOMAIN_SYSTEM_RESOURCE, "cpu:idle"), 0);
+    }
+
+    #[test]
+    fn cpu_and_mem_bands_cover_their_ranges() {
+        assert_eq!(cpu_band(0.0), "cpu:idle");
+        assert_eq!(cpu_band(9.9), "cpu:idle");
+        assert_eq!(cpu_band(10.0), "cpu:light");
+        assert_eq!(cpu_band(39.9), "cpu:light");
+        assert_eq!(cpu_band(40.0), "cpu:busy");
+        assert_eq!(cpu_band(79.9), "cpu:busy");
+        assert_eq!(cpu_band(80.0), "cpu:saturated");
+        assert_eq!(cpu_band(100.0), "cpu:saturated");
+
+        assert_eq!(mem_band(0, 100), "mem:low");
+        assert_eq!(mem_band(49, 100), "mem:low");
+        assert_eq!(mem_band(50, 100), "mem:high");
+        assert_eq!(mem_band(84, 100), "mem:high");
+        assert_eq!(mem_band(85, 100), "mem:pressure");
+        assert_eq!(mem_band(100, 100), "mem:pressure");
+        assert_eq!(mem_band(1, 0), "mem:unknown");
+    }
+
+    /// L12: `focus_history.pid`/`root_pid` were hard-coded 0 on every row,
+    /// so C6's deictic snap (which reads them back off
+    /// `QueryFocusHistoryResponse`) got nothing. The pid now comes from
+    /// the `WindowOpened` event the filter remembered for this toplevel.
+    #[test]
+    fn focus_history_records_the_windows_pid() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+
+        // Three focus sessions, so the key passes the promotion gate and a
+        // `focus_history` row is actually written.
+        ingest(
+            &conn,
+            &mut filter,
+            &opened_with_pid(1, "org.mozilla.firefox", 0, 4242),
+        )
+        .unwrap();
+        for i in 0..3u64 {
+            let base = 1 + i * 1_000_000_000;
+            ingest(&conn, &mut filter, &activated(1, base, true)).unwrap();
+            ingest(&conn, &mut filter, &activated(1, base + 500_000_000, false)).unwrap();
+        }
+
+        let (pid, root_pid): (i64, i64) = conn
+            .query_row(
+                "SELECT pid, root_pid FROM focus_history ORDER BY t_end_ns DESC LIMIT 1",
+                (),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, 4242, "the window's own pid must be recorded");
+        // No ProcessTreeSnapshot has been seen, so the pid is its own root
+        // (`IngestFilter::collapse_pid`'s identity case).
+        assert_eq!(root_pid, 4242);
+    }
+
+    /// L12: when C1 could not resolve a pid (`pid_known == false`,
+    /// ADR-0009) the columns stay 0 rather than recording C1's placeholder
+    /// as if it were a real pid.
+    #[test]
+    fn focus_history_pid_stays_zero_when_the_pid_is_unknown() {
+        let conn = sqlite::open_in_memory().unwrap();
+        let mut filter = IngestFilter::new();
+        ingest(&conn, &mut filter, &opened(1, "org.mozilla.firefox", 0)).unwrap();
+        for i in 0..3u64 {
+            let base = 1 + i * 1_000_000_000;
+            ingest(&conn, &mut filter, &activated(1, base, true)).unwrap();
+            ingest(&conn, &mut filter, &activated(1, base + 500_000_000, false)).unwrap();
+        }
+        let (pid, root_pid): (i64, i64) = conn
+            .query_row(
+                "SELECT pid, root_pid FROM focus_history ORDER BY t_end_ns DESC LIMIT 1",
+                (),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pid, root_pid), (0, 0));
     }
 
     #[test]
@@ -828,10 +1070,14 @@ mod tests {
             },
         )
         .unwrap();
-        for domain in [
-            DOMAIN_IDLE_PRESENCE,
-            DOMAIN_SYSTEM_RESOURCE,
-            DOMAIN_MEDIA_PLAYBACK,
+        // The point is that each domain is counted at all, without needing
+        // promotion. L12: `system_resource` now writes three keys per
+        // sample (`sample` plus the CPU and memory bands) instead of one,
+        // so this counts keys per domain rather than pinning it to 1.
+        for (domain, expected_keys) in [
+            (DOMAIN_IDLE_PRESENCE, 1),
+            (DOMAIN_SYSTEM_RESOURCE, 3),
+            (DOMAIN_MEDIA_PLAYBACK, 1),
         ] {
             let count: i64 = conn
                 .query_row(
@@ -840,7 +1086,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(count, 1, "expected {domain} to be counted");
+            assert_eq!(count, expected_keys, "expected {domain} to be counted");
         }
         // and none of these ever create an entity (never "promoted" nodes)
         let entities: i64 = conn
