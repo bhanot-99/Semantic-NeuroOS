@@ -32,13 +32,57 @@ if timeout 2 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
     fail "raw TCP connect succeeded from inside an isolated netns"
 fi
 
-if ! getent hosts example.com >/dev/null 2>&1; then
-    fail "DNS resolved even though /run/systemd/resolve was not yet masked (test setup is wrong)"
-fi
+# L9: this used to assert `getent hosts example.com` SUCCEEDS here, to show
+# the leak before masking. That made the whole script require working
+# internet DNS -- it failed on an offline machine with "test setup is
+# wrong" -- which breaks rules.md §7.4 ("no test may use the internet").
+#
+# The leak being proved is a *socket*, not a name: glibc's `resolve` NSS
+# module reaches systemd-resolved over /run/systemd/resolve/io.systemd.Resolve,
+# a filesystem path the network namespace does not touch. So the check is
+# that the socket is reachable before masking and gone after -- the same
+# property, with no network at all.
+resolve_sock=/run/systemd/resolve/io.systemd.Resolve
 
-mount -t tmpfs tmpfs /run/systemd/resolve
-if getent hosts example.com >/dev/null 2>&1; then
-    fail "DNS resolution still succeeded after masking /run/systemd/resolve"
+can_reach_resolved() {
+    timeout 3 python3 -c "
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    s.connect(sys.argv[1])
+    s.close()
+except OSError:
+    sys.exit(1)
+sys.exit(0)
+" "$resolve_sock"
+}
+
+if [ ! -S "$resolve_sock" ]; then
+    echo "SKIP: $resolve_sock does not exist (systemd-resolved is not running); nothing to mask" >&2
+elif ! can_reach_resolved; then
+    fail "$resolve_sock exists but is unreachable before masking (test setup is wrong)"
+else
+    # The leak is real: a netns-isolated unit can still talk to resolved.
+    #
+    # If this machine happens to be online, also show the leak end to end
+    # by resolving a name through it. Offline that check is simply not
+    # run -- it is never a failure (rules.md §7.4).
+    if getent hosts example.com >/dev/null 2>&1; then
+        resolved_a_name=1
+    else
+        resolved_a_name=0
+        echo "note: no upstream DNS reachable, so only the resolved socket leak is shown" >&2
+    fi
+
+    mount -t tmpfs tmpfs /run/systemd/resolve
+
+    if [ -S "$resolve_sock" ] && can_reach_resolved; then
+        fail "$resolve_sock is still reachable after masking /run/systemd/resolve"
+    fi
+    if [ "$resolved_a_name" = 1 ] && getent hosts example.com >/dev/null 2>&1; then
+        fail "DNS resolution still succeeded after masking /run/systemd/resolve"
+    fi
 fi
 
 sock="$(mktemp -u)"
@@ -66,4 +110,4 @@ s.sendall(b'hello')
 fi
 wait "$server_pid"
 
-echo "OK: curl/raw-TCP blocked by netns isolation; DNS blocked only once /run/systemd/resolve is masked; UDS still works"
+echo "OK: curl/raw-TCP blocked by netns isolation; the systemd-resolved socket leak is closed only once /run/systemd/resolve is masked; UDS still works"

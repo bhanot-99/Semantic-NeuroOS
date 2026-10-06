@@ -9,8 +9,22 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
+
+#include "libneuroos/expected.hpp"
 
 namespace neuroos::inference {
+
+// L5: what went wrong parsing [inference]. A malformed table or an
+// unrecognised key used to be a `spdlog::warn` followed by silently
+// running on the defaults, which is how a typo'd `model_sha256` could
+// skip the model integrity check without anyone noticing. The Rust-side
+// schema this mirrors is a strict `#[serde(deny_unknown_fields)]` parse
+// that fails startup (crates/neuroos-common/src/config.rs), and
+// rules.md §5.4 calls bad config fatal.
+struct ConfigError {
+    std::string message;
+};
 
 struct Config {
     // Absolute path override; empty means "derive from models_dir() and
@@ -29,7 +43,20 @@ struct Config {
 // resolution order as neuroos_common::paths::config_file().
 std::string config_file_path();
 
-Config load_config();
+// L5: the keys [inference] accepts, field-for-field with
+// `InferenceConfig` in crates/neuroos-common/src/config.rs. Anything else
+// in the table is an error, not a shrug.
+const std::vector<std::string>& known_inference_keys();
+
+// L5: `Err` for a config.toml that exists but cannot be parsed, or whose
+// [inference] table holds a key this binary does not know. A missing file
+// or a file with no [inference] table is still `Ok` with every field at
+// its default, matching neuroos_common::load_config.
+neuroos::Expected<Config, ConfigError> load_config();
+
+// L5: the parse step on its own, so a test can drive it without a real
+// file on disk. `toml_text` is the whole config.toml.
+neuroos::Expected<Config, ConfigError> parse_config(const std::string& toml_text);
 
 // Resolves the real model path used at startup: `config.model_path` if set,
 // else `<models_dir>/bitnet-b1.58-2B-4T/ggml-model-i2_s.gguf`

@@ -30,7 +30,7 @@ pub fn spawn_focus_history_recorder(
             return;
         };
         loop {
-            let Ok(Some((mut stream, _cred))) = server.accept().await else {
+            let Ok(Some((mut stream, _cred, _permit))) = server.accept().await else {
                 continue;
             };
             while let Ok(Some(env)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
@@ -78,7 +78,7 @@ pub fn spawn_fixed_graph(
             return;
         };
         loop {
-            let Ok(Some((mut stream, _cred))) = server.accept().await else {
+            let Ok(Some((mut stream, _cred, _permit))) = server.accept().await else {
                 continue;
             };
             let entities = entities.clone();
@@ -128,7 +128,7 @@ pub fn spawn_empty(sock_path: impl AsRef<Path>, allowed_uid: u32) {
             return;
         };
         loop {
-            let Ok(Some((mut stream, _cred))) = server.accept().await else {
+            let Ok(Some((mut stream, _cred, _permit))) = server.accept().await else {
                 continue;
             };
             tokio::spawn(async move {

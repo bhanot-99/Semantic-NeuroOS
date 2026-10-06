@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use neuroos_health::HealthServer;
-use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
+use neuroos_ipc::{
+    ConnectionPermit, DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope_deadline,
+    write_envelope,
+};
 use neuroos_proto::v1::{
     AskResponse, Envelope, Error, ErrorCode, RenderGraphViewResponse, Taint, envelope,
 };
@@ -63,10 +66,11 @@ pub async fn serve(clients: Clients, path: PathBuf, allowed_uids: Vec<u32>) {
             return;
         }
     };
+    let idle_timeout = server.idle_timeout();
     loop {
         match server.accept().await {
-            Ok(Some((stream, _cred))) => {
-                tokio::spawn(handle_conn(stream, clients.clone()));
+            Ok(Some((stream, _cred, permit))) => {
+                tokio::spawn(handle_conn(stream, clients.clone(), idle_timeout, permit));
             }
             Ok(None) => continue, // this one connection failed; keep serving
             Err(e) => {
@@ -79,13 +83,22 @@ pub async fn serve(clients: Clients, path: PathBuf, allowed_uids: Vec<u32>) {
     }
 }
 
-async fn handle_conn(mut stream: UnixStream, clients: Clients) {
+async fn handle_conn(
+    mut stream: UnixStream,
+    clients: Clients,
+    idle_timeout: std::time::Duration,
+    // L2: dropped when this connection ends, freeing its slot.
+    _permit: ConnectionPermit,
+) {
     loop {
-        let env = match read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {
+        // L2: `neuroosctl ask` opens one connection per question, so an
+        // idle connection is a client that has gone away (or is holding
+        // the socket open for nothing) and is closed.
+        let env = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, idle_timeout).await {
             Ok(Some(env)) => env,
             Ok(None) => return, // peer closed cleanly
             Err(e) => {
-                tracing::debug!(error = %e, "knowledge.sock read failed");
+                tracing::debug!(error = %e, "knowledge.sock read failed or went idle");
                 return;
             }
         };
@@ -161,9 +174,14 @@ async fn handle_request(env: Envelope, clients: &Clients) -> Envelope {
                 }),
                 Err(e) => {
                     clients.health.incr_error(GRAPH_VIEW_FAILED);
+                    // L1 / rules.md §5.3: the envelope carries a stable
+                    // identifier only. `RenderGraphViewError` quotes a
+                    // storage-client error or an output path, so the
+                    // detail goes to a `debug` log instead.
+                    tracing::debug!(error = %e, "RenderGraphView failed");
                     envelope::Body::Error(Error {
                         code: ErrorCode::Internal as i32,
-                        message: format!("RenderGraphView failed: {e}"),
+                        message: "RenderGraphView failed".to_string(),
                         retryable: true,
                     })
                 }
@@ -171,10 +189,13 @@ async fn handle_request(env: Envelope, clients: &Clients) -> Envelope {
         }
         _ => {
             clients.health.incr_error(UNSUPPORTED_REQUEST);
+            // L1 / rules.md §5.4: fatal, not retryable -- resending the
+            // same request this socket does not serve can only fail the
+            // same way, so a backing-off caller would retry forever.
             envelope::Body::Error(Error {
-                code: ErrorCode::Internal as i32,
+                code: ErrorCode::InvalidArgument as i32,
                 message: "unsupported request on knowledge.sock".to_string(),
-                retryable: true,
+                retryable: false,
             })
         }
     };
@@ -350,7 +371,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(resp.body, Some(envelope::Body::Error(_))));
+        // L1: InvalidArgument + retryable=false, so a backing-off caller
+        // stops instead of resending a request this socket never serves.
+        match resp.body {
+            Some(envelope::Body::Error(e)) => {
+                assert_eq!(e.code, ErrorCode::InvalidArgument as i32);
+                assert!(!e.retryable, "an unserved request type is fatal");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
         assert_eq!(
             health.snapshot().error_counters.get(UNSUPPORTED_REQUEST),
             Some(&1)

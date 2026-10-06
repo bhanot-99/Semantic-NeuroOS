@@ -13,6 +13,10 @@ endif()
 # neuroos.v1 proto bindings, generated at configure/build time into the build dir
 find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
+# Needed at this level too (not only in neuroos-inference/) for the
+# cpp-inference-unit test target below.
+find_package(spdlog REQUIRED)
+find_package(toml11 REQUIRED)
 
 set(NEUROOS_PROTO_DIR ${CMAKE_SOURCE_DIR}/../proto)
 file(GLOB NEUROOS_PROTO_FILES ${NEUROOS_PROTO_DIR}/neuroos/v1/*.proto)
@@ -71,6 +75,19 @@ target_link_libraries(cpp-sandbox-smoke PRIVATE libneuroos Threads::Threads)
 # M1: the ring rejects an untrusted header and never reads past a slot.
 add_executable(cpp-shm-validate ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_shm_validate.cpp)
 target_link_libraries(cpp-shm-validate PRIVATE libneuroos Threads::Threads)
+
+# L3/L5: neuroos-inference's model-free logic -- RingRegistry's ceilings,
+# the strict [inference] config parser, and the 64-bit seed fold.
+add_executable(cpp-inference-unit
+    ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_inference_unit.cpp
+    ${CMAKE_SOURCE_DIR}/neuroos-inference/src/config.cpp
+    ${CMAKE_SOURCE_DIR}/neuroos-inference/src/engine.cpp
+    ${CMAKE_SOURCE_DIR}/neuroos-inference/src/grammar.cpp
+    ${CMAKE_SOURCE_DIR}/neuroos-inference/src/ring.cpp
+)
+target_include_directories(cpp-inference-unit PRIVATE ${CMAKE_SOURCE_DIR}/neuroos-inference/src)
+target_link_libraries(cpp-inference-unit
+    PRIVATE libneuroos llama spdlog::spdlog toml11::toml11 Threads::Threads)
 
 # Phase 2 IT: drives a real running neuroos-inference (real model) over inference.sock.
 add_executable(cpp-inference-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_inference_smoke.cpp)

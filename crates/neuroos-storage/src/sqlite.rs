@@ -15,6 +15,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_chunks_fts",
         include_str!("migrations/0002_chunks_fts.sql"),
     ),
+    // L13: enforces (domain, label) uniqueness, which `upsert_entity`
+    // always assumed but nothing guaranteed.
+    (
+        "0003_entities_unique",
+        include_str!("migrations/0003_entities_unique.sql"),
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -152,13 +158,18 @@ pub fn upsert_entity(
     at_ns: u64,
     permanent: bool,
 ) -> Result<i64, StorageError> {
+    // L13: `.ok()` here discarded *every* error as "no such entity", so a
+    // real SELECT failure (I/O error, a corrupt page, a busy lock) fell
+    // through to the INSERT below and created a duplicate entity -- which
+    // then split one thing's edges, chunks and taint across two ids.
+    // `.optional()` keeps only "no rows" as None and propagates the rest.
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM entities WHERE domain = ?1 AND label = ?2",
             (domain, label),
             |row| row.get(0),
         )
-        .ok();
+        .optional()?;
     if let Some(id) = existing {
         conn.execute(
             "UPDATE entities SET last_seen_ns = ?1, taint = taint | ?2 WHERE id = ?3",
@@ -588,12 +599,27 @@ pub fn insert_chunk_with_index_meta(
     }
 }
 
+/// L13: `entity_id` is an `UNINDEXED` fts5 column, so there is no index to
+/// seek on and every `DELETE ... WHERE entity_id = ?` is a full scan of
+/// `chunks_fts`. Deleting one id at a time therefore cost one whole scan
+/// per id -- and `forget_by_app` passes every entity an app ever produced,
+/// so a `neuroosctl forget --app` was O(entities x chunks). Batching them
+/// into one `IN (...)` is one scan for the whole call.
+///
+/// SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 32,766 on modern
+/// builds (999 on much older ones), so the ids are chunked well below the
+/// lower figure rather than assuming either.
+const FTS_DELETE_BATCH: usize = 512;
+
 /// Removes every keyword row for `entity_ids` (forget/GC, alongside the
 /// matching LanceDB rows).
 pub fn delete_chunks_fts(conn: &Connection, entity_ids: &[i64]) -> Result<(), StorageError> {
-    let mut stmt = conn.prepare("DELETE FROM chunks_fts WHERE entity_id = ?1")?;
-    for id in entity_ids {
-        stmt.execute([id])?;
+    for batch in entity_ids.chunks(FTS_DELETE_BATCH) {
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM chunks_fts WHERE entity_id IN ({placeholders})");
+        conn.execute(&sql, rusqlite::params_from_iter(batch))?;
     }
     Ok(())
 }
@@ -866,6 +892,170 @@ mod tests {
         let fixed: &[(&str, &str)] = &[("0001_initial", "CREATE TABLE things (x INTEGER);")];
         apply_migrations(&conn, fixed).expect("the retry must not hit 'table already exists'");
         assert!(table_exists(&conn, "things"));
+    }
+
+    /// L13: a database written by a pre-0003 build can already hold
+    /// duplicate `(domain, label)` entities (the old `.ok()` SELECT made
+    /// one on any read error), so the migration has to merge them before
+    /// it can create the UNIQUE index -- otherwise `open()` would fail
+    /// forever on exactly the databases that need the fix.
+    #[test]
+    fn migration_0003_merges_pre_existing_duplicate_entities() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // Everything up to, but not including, 0003.
+        apply_migrations(&conn, &MIGRATIONS[..2]).unwrap();
+
+        // Two rows for the same (domain, label) -- impossible to create
+        // once 0003 has run, which is the point.
+        conn.execute(
+            "INSERT INTO entities (id, domain, kind, label, taint, created_ns, last_seen_ns, permanent)
+             VALUES (1, 'window_focus', 'window', 'firefox', 1, 100, 200, 0),
+                    (2, 'window_focus', 'window', 'firefox', 2, 50, 900, 1),
+                    (3, 'window_focus', 'window', 'editor', 0, 10, 20, 0)",
+            (),
+        )
+        .unwrap();
+        // References to the duplicate that must survive the merge, plus a
+        // pair that will collide once both ends are repointed.
+        conn.execute(
+            "INSERT INTO edges (src, dst, kind, weight, reinforced_ns, hypothesis)
+             VALUES (1, 3, 'co_occurs', 1.0, 5, 0),
+                    (2, 3, 'co_occurs', 2.0, 7, 0)",
+            (),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_meta (chunk_id, entity_id, source, taint, token_count, created_ns)
+             VALUES ('c1', 2, 'window_focus', 2, 4, 300)",
+            (),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts (text, aliases, chunk_id, entity_id, domain, taint, t_ns)
+             VALUES ('firefox: a page', '', 'c1', 2, 'window_focus', 2, 300)",
+            (),
+        )
+        .unwrap();
+
+        apply_migrations(&conn, MIGRATIONS).expect("0003 must survive existing duplicates");
+
+        // One row left for the pair, and it is the lowest id.
+        let ids: Vec<i64> = collect_ids(
+            &conn,
+            "SELECT id FROM entities WHERE domain = 'window_focus' AND label = 'firefox'",
+            (),
+        )
+        .unwrap();
+        assert_eq!(ids, vec![1]);
+
+        // Taint unioned (never lowered, R0-3), span widened, permanent sticky.
+        let (taint, created, last_seen, permanent): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT taint, created_ns, last_seen_ns, permanent FROM entities WHERE id = 1",
+                (),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(taint, 3, "taint must be the union of both rows");
+        assert_eq!(created, 50, "the earlier created_ns wins");
+        assert_eq!(last_seen, 900, "the later last_seen_ns wins");
+        assert_eq!(permanent, 1, "permanent is sticky");
+
+        // References were repointed, and the colliding edge did not
+        // duplicate or break the (src, dst, kind) primary key.
+        let edge_srcs: Vec<i64> = collect_ids(&conn, "SELECT src FROM edges", ()).unwrap();
+        assert_eq!(edge_srcs, vec![1]);
+        let meta_owner: i64 = conn
+            .query_row("SELECT entity_id FROM chunks_meta", (), |r| r.get(0))
+            .unwrap();
+        assert_eq!(meta_owner, 1);
+        let fts_owner: i64 = conn
+            .query_row("SELECT entity_id FROM chunks_fts", (), |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_owner, 1);
+    }
+
+    /// L13: the index `upsert_entity` always assumed now exists, so a
+    /// second row for the same pair is rejected by the database rather
+    /// than quietly created.
+    #[test]
+    fn a_duplicate_entity_is_rejected_by_the_schema() {
+        let conn = open_in_memory().unwrap();
+        let id = upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "firefox",
+            TaintFlags::empty(),
+            1,
+            false,
+        )
+        .unwrap();
+
+        let err = conn.execute(
+            "INSERT INTO entities (domain, kind, label, taint, created_ns, last_seen_ns, permanent)
+             VALUES ('window_focus', 'window', 'firefox', 0, 1, 1, 0)",
+            (),
+        );
+        assert!(err.is_err(), "a duplicate (domain, label) must be rejected");
+
+        // And the upsert itself still returns the same row, not a new one.
+        let again = upsert_entity(
+            &conn,
+            "window_focus",
+            "window",
+            "firefox",
+            TaintFlags::empty(),
+            2,
+            false,
+        )
+        .unwrap();
+        assert_eq!(again, id);
+    }
+
+    /// L13: the batched FTS delete must remove exactly the ids asked for,
+    /// including across more than one batch.
+    #[test]
+    fn batched_fts_delete_removes_only_the_given_entities() {
+        let conn = open_in_memory().unwrap();
+        let total = FTS_DELETE_BATCH + 7; // forces a second batch
+        for i in 0..total as i64 {
+            insert_chunk_fts(
+                &conn,
+                &FtsChunk {
+                    chunk_id: &format!("c{i}"),
+                    entity_id: i,
+                    domain: "window_focus",
+                    taint: 0,
+                    t_ns: 1,
+                    text: "firefox a page",
+                },
+            )
+            .unwrap();
+        }
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM chunks_fts", (), |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&conn), total as i64);
+
+        // Delete everything except the last two ids.
+        let doomed: Vec<i64> = (0..total as i64 - 2).collect();
+        delete_chunks_fts(&conn, &doomed).unwrap();
+        assert_eq!(count(&conn), 2);
+
+        let survivors: Vec<i64> = collect_ids(
+            &conn,
+            "SELECT entity_id FROM chunks_fts ORDER BY entity_id",
+            (),
+        )
+        .unwrap();
+        assert_eq!(survivors, vec![total as i64 - 2, total as i64 - 1]);
+
+        // An empty list is a no-op, not a delete-everything.
+        delete_chunks_fts(&conn, &[]).unwrap();
+        assert_eq!(count(&conn), 2);
     }
 
     fn table_exists(conn: &Connection, name: &str) -> bool {

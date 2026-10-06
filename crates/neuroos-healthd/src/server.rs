@@ -2,7 +2,9 @@
 //! to `neuroosctl status` (Architecture.md §5.2).
 use std::sync::Arc;
 
-use neuroos_ipc::{DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope};
+use neuroos_ipc::{
+    DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope_deadline, write_envelope,
+};
 use neuroos_proto::v1::{AggregateStatusResponse, ComponentStatus, Envelope, envelope};
 
 use crate::aggregate::Aggregate;
@@ -28,13 +30,17 @@ pub async fn serve(
 
 /// Serves an already-bound socket until its listener becomes unusable.
 pub async fn serve_on(server: UdsServer, aggregate: Arc<Aggregate>) -> std::io::Result<()> {
+    let idle_timeout = server.idle_timeout();
     loop {
-        let Some((mut stream, _cred)) = server.accept().await? else {
+        let Some((mut stream, _cred, permit)) = server.accept().await? else {
             continue;
         };
         let aggregate = aggregate.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut stream, &aggregate).await {
+            // L2: held for the connection's lifetime, so the slot is
+            // released only when this task ends.
+            let _permit = permit;
+            if let Err(e) = handle_connection(&mut stream, &aggregate, idle_timeout).await {
                 tracing::debug!(error = %e, "healthd.sock connection ended");
             }
         });
@@ -44,11 +50,14 @@ pub async fn serve_on(server: UdsServer, aggregate: Arc<Aggregate>) -> std::io::
 async fn handle_connection<S>(
     stream: &mut S,
     aggregate: &Aggregate,
+    // L2: `neuroosctl status` sends one request and closes; a connection
+    // that goes quiet for this long is dropped instead of held open.
+    idle_timeout: std::time::Duration,
 ) -> Result<(), neuroos_ipc::FramingError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    while let Some(req) = read_envelope(stream, DEFAULT_MAX_FRAME).await? {
+    while let Some(req) = read_envelope_deadline(stream, DEFAULT_MAX_FRAME, idle_timeout).await? {
         if !matches!(req.body, Some(envelope::Body::AggregateStatusRequest(_))) {
             continue;
         }
@@ -87,6 +96,8 @@ where
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+    use neuroos_ipc::read_envelope;
+
     use super::*;
 
     /// M2: `main` used to `tokio::spawn(serve(..))` and drop the handle, so

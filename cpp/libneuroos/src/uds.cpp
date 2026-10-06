@@ -18,14 +18,27 @@ namespace neuroos::ipc {
 
 namespace {
 
+// L16: 0700, not whatever the service's umask happens to be. Mirrors
+// `create_dir_all_private` in crates/neuroos-ipc/src/server.rs: an
+// existing directory is left alone, since the runtime dir is normally
+// $XDG_RUNTIME_DIR, which systemd already owns and created 0700.
 Expected<void, IpcError> make_parent_dirs(const std::string& path) {
     std::filesystem::path p(path);
-    if (p.has_parent_path()) {
-        std::error_code ec;
-        std::filesystem::create_directories(p.parent_path(), ec);
-        if (ec) {
-            return make_unexpected(IpcError::io("create parent dirs: " + ec.message()));
-        }
+    if (!p.has_parent_path()) {
+        return {};
+    }
+    std::error_code ec;
+    if (std::filesystem::is_directory(p.parent_path(), ec)) {
+        return {};
+    }
+    std::filesystem::create_directories(p.parent_path(), ec);
+    if (ec) {
+        return make_unexpected(IpcError::io("create parent dirs: " + ec.message()));
+    }
+    // std::filesystem has no mode argument, so the umask is undone after
+    // the fact. The window is narrow and the directory is empty in it.
+    if (::chmod(p.parent_path().c_str(), S_IRWXU) != 0) {
+        return make_unexpected(IpcError::io(std::strerror(errno)));
     }
     return {};
 }
@@ -43,8 +56,61 @@ Expected<sockaddr_un, IpcError> make_sockaddr(const std::string& path) {
 
 } // namespace
 
+void ConnectionLimiter::acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    free_slot_.wait(lock, [this] { return in_use_ < max_; });
+    ++in_use_;
+}
+
+void ConnectionLimiter::release() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (in_use_ > 0) {
+            --in_use_;
+        }
+    }
+    free_slot_.notify_one();
+}
+
+std::size_t ConnectionLimiter::in_use() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return in_use_;
+}
+
+void Connection::reset() {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+    if (limiter_) {
+        limiter_->release();
+        limiter_.reset();
+    }
+}
+
+Connection::~Connection() {
+    reset();
+}
+
+Connection::Connection(Connection&& other) noexcept
+    : fd_(other.fd_), limiter_(std::move(other.limiter_)) {
+    other.fd_ = -1;
+}
+
+Connection& Connection::operator=(Connection&& other) noexcept {
+    if (this != &other) {
+        reset();
+        fd_ = other.fd_;
+        limiter_ = std::move(other.limiter_);
+        other.fd_ = -1;
+    }
+    return *this;
+}
+
 Expected<UdsServer, IpcError> UdsServer::bind(const std::string& path,
-                                              std::vector<std::uint32_t> allowed_uids) {
+                                              std::vector<std::uint32_t> allowed_uids,
+                                              std::size_t max_connections,
+                                              std::chrono::seconds idle_timeout) {
     if (auto r = make_parent_dirs(path); !r) {
         return make_unexpected(r.error());
     }
@@ -73,7 +139,14 @@ Expected<UdsServer, IpcError> UdsServer::bind(const std::string& path,
         ::close(fd);
         return make_unexpected(IpcError::io(std::strerror(saved_errno)));
     }
-    return UdsServer(fd, std::move(allowed_uids));
+    // L16: 0600 on the socket file, after bind(2) created it — it does not
+    // exist before then, and a umask-dependent window is what this closes.
+    if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+        int saved_errno = errno;
+        ::close(fd);
+        return make_unexpected(IpcError::io(std::strerror(saved_errno)));
+    }
+    return UdsServer(fd, std::move(allowed_uids), max_connections, idle_timeout);
 }
 
 UdsServer::~UdsServer() {
@@ -83,7 +156,8 @@ UdsServer::~UdsServer() {
 }
 
 UdsServer::UdsServer(UdsServer&& other) noexcept
-    : listen_fd_(other.listen_fd_), allowed_uids_(std::move(other.allowed_uids_)) {
+    : listen_fd_(other.listen_fd_), allowed_uids_(std::move(other.allowed_uids_)),
+      limiter_(std::move(other.limiter_)), idle_timeout_(other.idle_timeout_) {
     other.listen_fd_ = -1;
 }
 
@@ -94,6 +168,8 @@ UdsServer& UdsServer::operator=(UdsServer&& other) noexcept {
         }
         listen_fd_ = other.listen_fd_;
         allowed_uids_ = std::move(other.allowed_uids_);
+        limiter_ = std::move(other.limiter_);
+        idle_timeout_ = other.idle_timeout_;
         other.listen_fd_ = -1;
     }
     return *this;
@@ -109,10 +185,15 @@ bool accept_errno_is_per_connection(int err) {
            accept_errno_is_resource_exhaustion(err);
 }
 
-Expected<std::optional<std::pair<int, PeerCred>>, IpcError> UdsServer::accept() {
+Expected<std::optional<std::pair<Connection, PeerCred>>, IpcError> UdsServer::accept() {
+    using Accepted = std::optional<std::pair<Connection, PeerCred>>;
+    // L2: take a slot *before* accepting, so surplus peers wait in the
+    // kernel's listen backlog rather than each costing a thread and an fd.
+    limiter_->acquire();
     int client_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
     if (client_fd < 0) {
         int saved_errno = errno;
+        limiter_->release();
         if (!accept_errno_is_per_connection(saved_errno)) {
             return make_unexpected(IpcError::io(std::strerror(saved_errno)));
         }
@@ -122,20 +203,33 @@ Expected<std::optional<std::pair<int, PeerCred>>, IpcError> UdsServer::accept() 
             // it as fatal.
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        return std::optional<std::pair<int, PeerCred>>{std::nullopt};
+        return Accepted{std::nullopt};
     }
+    // From here on the fd and the slot are owned together, so every exit
+    // path below frees both (L2).
+    Connection conn(client_fd, limiter_);
+
+    // L2: a blocking read on this fd gives up after `idle_timeout_` with
+    // EAGAIN, which `read_envelope` reports as a read error and every
+    // serving loop treats as "connection over". Without it a peer that
+    // connects and says nothing pins a detached thread for the lifetime
+    // of the process. A failure here is not worth dropping the
+    // connection over -- it just leaves this one unbounded, as before.
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(idle_timeout_.count());
+    timeout.tv_usec = 0;
+    ::setsockopt(conn.fd(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
     // A failed SO_PEERCRED lookup says nothing about the listening socket,
     // so it costs this connection and nothing more (M2).
-    auto cred = peer_cred(client_fd);
+    auto cred = peer_cred(conn.fd());
     if (!cred) {
-        ::close(client_fd);
-        return std::optional<std::pair<int, PeerCred>>{std::nullopt};
+        return Accepted{std::nullopt};
     }
     if (!is_allowed(cred.value(), allowed_uids_)) {
-        ::close(client_fd);
-        return std::optional<std::pair<int, PeerCred>>{std::nullopt};
+        return Accepted{std::nullopt};
     }
-    return std::optional<std::pair<int, PeerCred>>{std::make_pair(client_fd, cred.value())};
+    return Accepted{std::make_pair(std::move(conn), cred.value())};
 }
 
 Expected<int, IpcError> connect(const std::string& path, std::chrono::milliseconds timeout) {

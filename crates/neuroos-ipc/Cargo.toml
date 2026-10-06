@@ -14,7 +14,7 @@ prost = "0.13"
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 thiserror = "2"
 tracing = "0.1"
-rustix = { version = "1", features = ["fs", "net"] }
+rustix = { version = "1", features = ["fs", "net", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "test-util"] }

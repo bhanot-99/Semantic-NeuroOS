@@ -3856,6 +3856,7 @@ version = "0.1.0"
 name = "neuroos-health"
 version = "0.1.0"
 dependencies = [
+ "neuroos-common",
  "neuroos-ipc",
  "neuroos-proto",
  "prost 0.13.5",

@@ -20,7 +20,19 @@ pub fn config_dir() -> PathBuf {
 /// The config file path: `$NEUROOS_CONFIG` if set (rules.md §4: the only
 /// other allowed env var besides `NEUROOS_LOG`), else `~/.config/neuroos/config.toml`.
 pub fn config_file() -> PathBuf {
-    std::env::var_os("NEUROOS_CONFIG")
+    config_file_from(std::env::var_os("NEUROOS_CONFIG"))
+}
+
+/// L6: the override decision, split out from reading the environment, so
+/// the test for it needs no `std::env::set_var`. That call is unsound in a
+/// multi-threaded process -- `cargo test` runs the whole module's tests as
+/// threads of one binary, and every other path function here reads
+/// `$HOME`/`$XDG_*` concurrently -- and the old test's `// SAFETY:
+/// single-threaded test process` claim was simply untrue under `cargo
+/// test` (it holds only under `cargo nextest`, the project's runner, which
+/// is why the race never surfaced here the way it did in `neuroosctl`).
+fn config_file_from(override_var: Option<std::ffi::OsString>) -> PathBuf {
+    override_var
         .map(PathBuf::from)
         .unwrap_or_else(|| config_dir().join("config.toml"))
 }
@@ -148,19 +160,35 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
 
+    /// L6: no `set_var`, so nothing here can race another test in this
+    /// binary. `config_file()` is `config_file_from(var_os(...))` and
+    /// nothing else, so testing the decision tests the function.
     #[test]
     fn config_file_respects_neuroos_config_override() {
-        // SAFETY: single-threaded test process; no other thread reads env vars concurrently.
-        unsafe {
-            std::env::set_var("NEUROOS_CONFIG", "/tmp/neuroos-test-config.toml");
-        }
         assert_eq!(
-            config_file(),
+            config_file_from(Some(std::ffi::OsString::from(
+                "/tmp/neuroos-test-config.toml"
+            ))),
             PathBuf::from("/tmp/neuroos-test-config.toml")
         );
-        unsafe {
-            std::env::remove_var("NEUROOS_CONFIG");
-        }
+    }
+
+    /// L6: without the override it falls through to `config_dir()`, which
+    /// is what `config_file()` does when `$NEUROOS_CONFIG` is unset.
+    #[test]
+    fn config_file_without_the_override_is_under_the_config_dir() {
+        assert_eq!(config_file_from(None), config_dir().join("config.toml"));
+    }
+
+    /// L6: and the live function still agrees with the helper for whatever
+    /// the real environment happens to say -- reading an env var is safe,
+    /// it was only writing one that was not.
+    #[test]
+    fn config_file_reads_the_real_environment() {
+        assert_eq!(
+            config_file(),
+            config_file_from(std::env::var_os("NEUROOS_CONFIG"))
+        );
     }
 
     #[test]

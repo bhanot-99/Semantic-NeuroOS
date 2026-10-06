@@ -2,7 +2,7 @@
 //! configured git repos, the notes vault and ICS calendar files.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -65,6 +65,20 @@ pub async fn run_forever(
 /// is noticed.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// L11: inotify events pending between the watcher callback and the drain
+/// loop below. This used to be `mpsc::channel()`, which is unbounded: a
+/// burst that outruns the consumer -- a `git clone` or a build landing
+/// thousands of events into a watched tree in a few milliseconds -- grew
+/// the queue with no ceiling, inside C1's 25 MiB RSS budget (PRD §6.2).
+/// The drain loop is tight, so a thousand pending events is already far
+/// more headroom than a healthy burst needs.
+const EVENT_QUEUE_CAPACITY: usize = 1024;
+
+/// L11: how many dropped events between `warn!` lines, so a sustained
+/// flood reports itself without becoming the flood. The message carries a
+/// count and nothing else -- never a path (rules.md R0-6).
+const DROP_LOG_EVERY: u64 = 256;
+
 /// `Ok(())` only when `stop` is observed set (cooperative cancellation, used
 /// by tests so the blocking OS thread this runs on actually exits — without
 /// it, tokio's multi-thread `Runtime::drop` blocks forever waiting for a
@@ -76,9 +90,19 @@ fn run_with_stop(
     privacy: &PrivacyState,
     stop: &AtomicBool,
 ) -> Result<(), FolderSensorError> {
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    // L11: bounded, and the watcher callback drops rather than blocks.
+    // Blocking it would stall the thread reading the inotify fd, which
+    // makes the *kernel* queue overflow instead -- losing the same events
+    // with less control and no count. Dropping the newest event under
+    // flood is the same choice `bus.rs` makes for a slow subscriber.
+    let (tx, rx) = mpsc::sync_channel::<notify::Result<Event>>(EVENT_QUEUE_CAPACITY);
+    // `AtomicU64`, not a plain counter: `notify` takes an `Fn` callback, so
+    // the count has to be mutable through a shared reference.
+    let dropped = AtomicU64::new(0);
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
+        // `notify`'s handler returns (); the bool says whether the event
+        // was queued, which only the test needs.
+        let _queued = offer_event(&tx, res, &dropped);
     })?;
     for w in watches {
         if let Err(e) = watcher.watch(&w.path, RecursiveMode::Recursive) {
@@ -125,6 +149,35 @@ fn run_with_stop(
     }
 }
 
+/// L11: queues one watcher event, or drops it when the bounded queue is
+/// full. Returns whether it was queued. A full queue is a flood -- the
+/// event is dropped and counted, never blocked on, because blocking the
+/// watcher callback stalls the thread reading the inotify fd and makes the
+/// *kernel* queue overflow instead: the same events lost, with no count
+/// and no control. `Disconnected` means the receiver is gone, which only
+/// happens as [`run_with_stop`] returns, and needs no counting.
+fn offer_event(
+    tx: &mpsc::SyncSender<notify::Result<Event>>,
+    res: notify::Result<Event>,
+    dropped: &AtomicU64,
+) -> bool {
+    match tx.try_send(res) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(_)) => {
+            let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % DROP_LOG_EVERY == 1 {
+                tracing::warn!(
+                    dropped_total = n,
+                    capacity = EVENT_QUEUE_CAPACITY,
+                    "folder event queue is full; dropping file-activity events"
+                );
+            }
+            false
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
 fn classify(kind: &EventKind) -> Option<FileActivityKind> {
     match kind {
         EventKind::Create(_) => Some(FileActivityKind::Created),
@@ -149,6 +202,43 @@ fn label_for(watches: &[Watch], path: &Path) -> Option<String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+
+    /// L11: the queue used to be `mpsc::channel()` -- unbounded -- so a
+    /// burst of inotify events grew it without limit inside C1's 25 MiB
+    /// budget. It is now `sync_channel(EVENT_QUEUE_CAPACITY)` and the
+    /// surplus is dropped and counted rather than queued or blocked on.
+    #[test]
+    fn a_flood_of_events_is_dropped_rather_than_queued_without_limit() {
+        let (tx, rx) = mpsc::sync_channel::<notify::Result<Event>>(EVENT_QUEUE_CAPACITY);
+        let dropped = AtomicU64::new(0);
+        let event = || {
+            Ok(Event {
+                kind: EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![PathBuf::from("/home/u/proj/f")],
+                attrs: Default::default(),
+            })
+        };
+
+        // Exactly the capacity is accepted...
+        for i in 0..EVENT_QUEUE_CAPACITY {
+            assert!(offer_event(&tx, event(), &dropped), "event {i} must queue");
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        // ...and everything past it is dropped, not queued and not blocked
+        // on (this call returning at all is the no-blocking proof).
+        for _ in 0..5_000 {
+            assert!(!offer_event(&tx, event(), &dropped));
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 5_000);
+
+        // The queue itself never grew past the bound.
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, EVENT_QUEUE_CAPACITY);
+    }
 
     fn watches() -> Vec<Watch> {
         vec![

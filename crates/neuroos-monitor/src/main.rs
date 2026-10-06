@@ -240,8 +240,16 @@ async fn record_loop(path: PathBuf, mut sub: neuroos_monitor::bus::EventSubscrib
     };
     loop {
         let event = sub.recv().await;
+        // L14: `write_event` no longer flushes on its own, so the
+        // durability choice is made here: `--record` is used to capture a
+        // repro, and an operator who kills the process wants the events it
+        // already saw to be on disk, so every event is flushed.
         if let Err(e) = writer.write_event(&event).await {
             tracing::warn!(error = %e, "failed to write telemetry event to --record dump");
+            continue;
+        }
+        if let Err(e) = writer.flush().await {
+            tracing::warn!(error = %e, "failed to flush the --record dump");
         }
     }
 }

@@ -35,7 +35,7 @@ async fn echo_over_real_uds_socket() {
 
     let server = UdsServer::bind(UdsServerConfig::new(&sock_path, vec![my_uid])).unwrap();
     let server_task = tokio::spawn(async move {
-        let (mut stream, _cred) = server
+        let (mut stream, _cred, _permit) = server
             .accept()
             .await
             .unwrap()

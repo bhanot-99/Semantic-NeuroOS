@@ -97,12 +97,12 @@ test-shm: build-rust build-cpp
 fmt:
     cargo fmt --all
     find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 -i
-    cd {{py_dir}} && uv run ruff format
+    cd {{py_dir}} && uv run ruff format src hatch_build.py
 
 fmt-check:
     cargo fmt --all -- --check
     find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print | xargs -r clang-format-18 --dry-run --Werror
-    cd {{py_dir}} && uv run ruff format --check
+    cd {{py_dir}} && uv run ruff format --check src hatch_build.py
 
 # --- lint --------------------------------------------------------------------
 
@@ -114,9 +114,11 @@ lint-rust:
 lint-cpp: build-cpp
     find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o -name '*.cpp' -print | xargs -r clang-tidy -p {{cpp_build}}
 
+# L15: `hatch_build.py` (the wheel's generated-proto guard) is checked too
+# -- it is real code whose failure breaks `uv build`.
 lint-py: proto-py
-    cd {{py_dir}} && uv run ruff check src
-    cd {{py_dir}} && uv run mypy src
+    cd {{py_dir}} && uv run ruff check src hatch_build.py
+    cd {{py_dir}} && uv run mypy src hatch_build.py
 
 lint-sh:
     shellcheck scripts/*.sh tests/contract/*.sh
@@ -127,7 +129,7 @@ lint-manifest:
     #!/usr/bin/env bash
     set -euo pipefail
     python3 - <<'PY'
-    import sys, tomllib
+    import re, sys, tomllib
     with open("models/manifest.toml", "rb") as f:
         manifest = tomllib.load(f)
     required = {"name", "component", "url", "dest", "sha256", "license"}
@@ -135,8 +137,12 @@ lint-manifest:
         missing = required - m.keys()
         if missing:
             sys.exit(f"models/manifest.toml: {m.get('name', '?')} missing fields: {missing}")
-        if len(m["sha256"]) != 64 and m["sha256"] != "PLACEHOLDER":
-            sys.exit(f"models/manifest.toml: {m['name']} sha256 is not 64 hex chars")
+        # L10: `PLACEHOLDER` used to be accepted here and in
+        # scripts/fetch-models.sh, where it meant "install this file
+        # without verifying it". Nothing in the manifest uses it, and an
+        # unverified model defeats the whole point of the manifest.
+        if not re.fullmatch(r"[0-9a-f]{64}", m["sha256"]):
+            sys.exit(f"models/manifest.toml: {m['name']} sha256 is not 64 lowercase hex chars")
     print(f"OK: {len(manifest['model'])} manifest entries well-formed")
     PY
 

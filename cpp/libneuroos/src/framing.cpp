@@ -10,6 +10,71 @@ namespace neuroos::ipc {
 
 namespace {
 
+// L4: owns a received SCM_RIGHTS fd until the caller takes it. Every error
+// path out of `read_envelope_with_fd` used to have to remember to close it
+// by hand, and the two body-read failures did not, leaking C4's token-ring
+// memfd to a client that could trigger a short read at will.
+class FdGuard {
+  public:
+    FdGuard() = default;
+    explicit FdGuard(int fd) : fd_(fd) {}
+    ~FdGuard() {
+        reset();
+    }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    FdGuard(FdGuard&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
+    FdGuard& operator=(FdGuard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+
+    int get() const {
+        return fd_;
+    }
+    bool valid() const {
+        return fd_ >= 0;
+    }
+
+    // Replaces the held fd, closing whatever was there. L4: a peer can
+    // attach SCM_RIGHTS to more than one recvmsg of the same 4-byte
+    // header; the old code just overwrote the variable and leaked the
+    // earlier fd.
+    void replace(int fd) {
+        reset();
+        fd_ = fd;
+    }
+
+    // Hands ownership to the caller.
+    int release() {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
+    void reset() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+  private:
+    int fd_ = -1;
+};
+
+// L4: how many SCM_RIGHTS fds one frame's control buffer makes room for.
+// The protocol sends at most one (C4's token-ring memfd), but receiving a
+// few means a peer that sends more gets them closed rather than leaked
+// into the kernel's MSG_CTRUNC path.
+constexpr std::size_t kMaxReceivedFds = 4;
+
 // Reads exactly `len` bytes into `buf`, retrying on EINTR and on partial
 // reads. Returns false on a clean EOF with zero bytes read so far (the
 // "no more frames" case); a partial read followed by EOF is `Truncated`.
@@ -175,19 +240,30 @@ Expected<std::optional<EnvelopeWithFd>, IpcError> read_envelope_with_fd(int fd,
     // consumed without anyone asking for the control data). So the header
     // itself must be read via recvmsg, not read_exact, or the fd is lost.
     std::uint8_t len_buf[4];
-    int received_fd = -1;
+    // L4: closed on every error path below unless `release`d into the
+    // returned EnvelopeWithFd.
+    FdGuard received_fd;
     {
         std::size_t got = 0;
         while (got < sizeof(len_buf)) {
             iovec iov{.iov_base = len_buf + got, .iov_len = sizeof(len_buf) - got};
-            alignas(struct cmsghdr) char cmsg_buf[CMSG_SPACE(sizeof(int))];
+            // L4: room for more than one fd, so a peer that attaches
+            // several does not get them silently truncated by the kernel
+            // (MSG_CTRUNC) -- they are received and the extras closed
+            // below, which is what makes the "one fd per frame" contract
+            // enforceable rather than just assumed.
+            alignas(struct cmsghdr) char cmsg_buf[CMSG_SPACE(sizeof(int) * kMaxReceivedFds)];
             msghdr msg{};
             msg.msg_iov = &iov;
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg_buf;
             msg.msg_controllen = sizeof(cmsg_buf);
 
-            ssize_t n = ::recvmsg(fd, &msg, 0);
+            // L4: MSG_CMSG_CLOEXEC, so a received fd does not survive an
+            // exec(2) in this process. Every other fd this codebase opens
+            // is already O_CLOEXEC (SOCK_CLOEXEC, MFD_CLOEXEC); this one
+            // was the exception.
+            ssize_t n = ::recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -200,10 +276,25 @@ Expected<std::optional<EnvelopeWithFd>, IpcError> read_envelope_with_fd(int fd,
                 }
                 return make_unexpected(IpcError::truncated());
             }
-            if (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr &&
-                                                     cmsg->cmsg_level == SOL_SOCKET &&
-                                                     cmsg->cmsg_type == SCM_RIGHTS) {
-                std::memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+            // L4: walk *every* cmsg and every fd in it. The old code read
+            // the first fd of the first header and assigned it over
+            // whatever a previous iteration had stored, leaking both the
+            // displaced fd and any extras.
+            for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+                 cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+                    continue;
+                }
+                std::size_t payload = cmsg->cmsg_len - CMSG_LEN(0);
+                std::size_t count = payload / sizeof(int);
+                for (std::size_t i = 0; i < count; ++i) {
+                    int one = -1;
+                    std::memcpy(&one, CMSG_DATA(cmsg) + (i * sizeof(int)), sizeof(int));
+                    // Keeping the last one matches the previous behaviour
+                    // for the single-fd case; the difference is that the
+                    // ones it supersedes are now closed, not leaked.
+                    received_fd.replace(one);
+                }
             }
             got += static_cast<std::size_t>(n);
         }
@@ -211,9 +302,6 @@ Expected<std::optional<EnvelopeWithFd>, IpcError> read_envelope_with_fd(int fd,
     std::uint32_t len;
     std::memcpy(&len, len_buf, sizeof(len));
     if (len > max_frame) {
-        if (received_fd >= 0) {
-            ::close(received_fd);
-        }
         return make_unexpected(IpcError::frame_too_large(len, max_frame));
     }
 
@@ -230,12 +318,9 @@ Expected<std::optional<EnvelopeWithFd>, IpcError> read_envelope_with_fd(int fd,
 
     neuroos::v1::Envelope env;
     if (!env.ParseFromArray(body.data(), static_cast<int>(body.size()))) {
-        if (received_fd >= 0) {
-            ::close(received_fd);
-        }
         return make_unexpected(IpcError::decode_failed("protobuf ParseFromArray failed"));
     }
-    return std::optional<EnvelopeWithFd>{EnvelopeWithFd{std::move(env), received_fd}};
+    return std::optional<EnvelopeWithFd>{EnvelopeWithFd{std::move(env), received_fd.release()}};
 }
 
 } // namespace neuroos::ipc

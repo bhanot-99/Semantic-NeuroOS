@@ -22,7 +22,7 @@ pub fn spawn_preamble_recorder(
             return;
         };
         loop {
-            let Ok(Some((mut stream, _cred))) = server.accept().await else {
+            let Ok(Some((mut stream, _cred, _permit))) = server.accept().await else {
                 continue;
             };
             while let Ok(Some(env)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await {

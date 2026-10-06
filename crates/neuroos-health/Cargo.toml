@@ -10,6 +10,10 @@ workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+# L7: for `now_ns` (rules.md §4: `jiff` via neuroos_common, never a local
+# `SystemTime` arithmetic helper). neuroos-common depends on nothing in
+# this workspace, so there is no cycle.
+neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
 neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 prost = "0.13"

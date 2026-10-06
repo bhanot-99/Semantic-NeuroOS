@@ -54,8 +54,13 @@ neuroos::v1::HealthResponse HealthServer::snapshot() const {
 
 namespace {
 
-void handle_connection(int fd, const HealthServer& server) {
+// L2: `conn` owns the fd and the server's connection slot, and frees both
+// when this thread ends (see neuroos::ipc::Connection).
+void handle_connection(neuroos::ipc::Connection conn, const HealthServer& server) {
+    const int fd = conn.fd();
     for (;;) {
+        // A read that times out (SO_RCVTIMEO, armed by accept) reports an
+        // error here, which ends the connection -- the point of L2.
         auto req = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
         if (!req || !req.value().has_value()) {
             break;
@@ -72,7 +77,6 @@ void handle_connection(int fd, const HealthServer& server) {
             break;
         }
     }
-    ::close(fd);
 }
 
 } // namespace
@@ -96,8 +100,8 @@ void HealthServer::serve(const std::string& socket_path, std::vector<std::uint32
         if (!accepted.value().has_value()) {
             continue; // this one connection failed; keep serving
         }
-        int fd = accepted.value()->first;
-        std::thread(handle_connection, fd, std::cref(*this)).detach();
+        std::thread(handle_connection, std::move(accepted.value()->first), std::cref(*this))
+            .detach();
     }
 }
 

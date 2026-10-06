@@ -27,6 +27,10 @@ constexpr const char* kGenerateRejected = "generate_rejected";
 constexpr const char* kDistillRejected = "distill_rejected";
 constexpr const char* kLaneQueueFull = "lane_queue_full";
 constexpr const char* kUnsupportedRequest = "unsupported_request";
+// L3: AttachRing/Generate/Distill refused because C4 is already holding
+// RingRegistry's kMaxRings rings, or the requested shape is over its
+// ceilings.
+constexpr const char* kRingRefused = "ring_refused";
 
 void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envelope& resp,
                      LaneScheduler& lanes, RingRegistry& rings, const Model& model,
@@ -60,10 +64,18 @@ void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envel
         return;
     }
     auto writer = rings.get_or_create(req.ring_name(), 0, 0);
+    if (!writer) {
+        // L3: cannot happen for a ring that `exists` (checked above), so
+        // this is the registry refusing a *new* one at its ceiling.
+        out->set_accepted(false);
+        out->set_error("ring registry is full");
+        health.incr_error(kRingRefused);
+        return;
+    }
     // BUG-004: fence this job's slots off from whatever a prior job on this
     // same (likely reused) ring_name already wrote -- see
     // RingWriter::next_generation's doc comment.
-    std::uint64_t generation_id = writer.next_generation();
+    std::uint64_t generation_id = writer->next_generation();
 
     // proto3 float fields default to 0.0, not 1.0, so a caller that never
     // sets repetition_penalty (every caller predating BUG-005's fix) must
@@ -99,8 +111,14 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
         prompt << chunk << "\n";
     }
     auto writer = rings.get_or_create(req.ring_name(), 0, 0);
+    if (!writer) {
+        out->set_accepted(false);
+        out->set_error("ring registry is full");
+        health.incr_error(kRingRefused);
+        return;
+    }
     // BUG-004: same fencing as handle_generate, above.
-    std::uint64_t generation_id = writer.next_generation();
+    std::uint64_t generation_id = writer->next_generation();
 
     Job job{generation_id,
             prompt.str(),
@@ -119,10 +137,15 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
     }
 }
 
-void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lanes,
-                       RingRegistry& rings, std::uint32_t max_context_tokens,
+// L2: `conn` owns the fd and the server's connection slot, and frees both
+// when this thread ends (see neuroos::ipc::Connection).
+void handle_connection(neuroos::ipc::Connection conn, std::shared_ptr<Model> model,
+                       LaneScheduler& lanes, RingRegistry& rings, std::uint32_t max_context_tokens,
                        neuroos::health::HealthServer& health) {
+    const int fd = conn.fd();
     for (;;) {
+        // A read that times out (SO_RCVTIMEO, armed by accept) reports an
+        // error here, which ends the connection -- the point of L2.
         auto req = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
         if (!req || !req.value().has_value()) {
             break;
@@ -150,7 +173,15 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
             break;
         case neuroos::v1::Envelope::kAttachRingRequest: {
             const auto& areq = in.attach_ring_request();
-            rings.get_or_create(areq.ring_name(), areq.capacity_slots(), areq.slot_size());
+            auto writer =
+                rings.get_or_create(areq.ring_name(), areq.capacity_slots(), areq.slot_size());
+            // L3: a refusal is reported as `ok = false` with no fd, rather
+            // than silently handing back a ring that was never created.
+            if (!writer) {
+                resp.mutable_attach_ring_response()->set_ok(false);
+                health.incr_error(kRingRefused);
+                break;
+            }
             resp.mutable_attach_ring_response()->set_ok(true);
             fd_to_send = rings.fd_for(areq.ring_name());
             break;
@@ -168,8 +199,19 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
             break;
         }
         default:
+            // L3: this used to `continue` without writing anything, so a
+            // client that sent a request this socket does not serve (a
+            // HealthRequest, say -- that goes to the separate health
+            // server) got no reply at all and blocked until its own
+            // deadline. rules.md §5.4: fatal, not retryable.
             health.incr_error(kUnsupportedRequest);
-            continue; // not ours (e.g. HealthRequest goes to the separate health server)
+            {
+                auto* err = resp.mutable_error();
+                err->set_code(neuroos::v1::ERROR_CODE_INVALID_ARGUMENT);
+                err->set_message("unsupported request on inference.sock");
+                err->set_retryable(false);
+            }
+            break;
         }
 
         bool wrote;
@@ -184,7 +226,6 @@ void handle_connection(int fd, std::shared_ptr<Model> model, LaneScheduler& lane
             break;
         }
     }
-    ::close(fd);
 }
 
 } // namespace
@@ -211,9 +252,8 @@ void serve(const std::string& socket_path, std::vector<std::uint32_t> allowed_ui
         if (!accepted.value().has_value()) {
             continue; // this one connection failed; keep serving
         }
-        int fd = accepted.value()->first;
-        std::thread(handle_connection, fd, model, std::ref(lanes), std::ref(rings),
-                    max_context_tokens, std::ref(health))
+        std::thread(handle_connection, std::move(accepted.value()->first), model, std::ref(lanes),
+                    std::ref(rings), max_context_tokens, std::ref(health))
             .detach();
     }
 }

@@ -43,7 +43,7 @@ pub fn spawn_token_counter(sock_path: impl AsRef<Path>, allowed_uid: u32) -> Cou
             return;
         };
         loop {
-            let Ok(Some((stream, _cred))) = server.accept().await else {
+            let Ok(Some((stream, _cred, _permit))) = server.accept().await else {
                 continue;
             };
             let handle = Arc::clone(&handle);
@@ -107,7 +107,7 @@ pub fn spawn_stalling_generator(
         };
         let ring = Arc::new(ring);
         loop {
-            let Ok(Some((stream, _cred))) = server.accept().await else {
+            let Ok(Some((stream, _cred, _permit))) = server.accept().await else {
                 continue;
             };
             // One task per connection: a real client holds its `Generate`

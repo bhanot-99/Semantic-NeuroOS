@@ -92,19 +92,36 @@ pub fn process_tree(root_pid: u32) -> Result<ProcessTreeSnapshot, ProcError> {
         let Ok(stat) = proc.stat() else { continue };
         entries.push((stat.pid, stat.ppid, stat.comm));
     }
-    let root_known = entries.iter().any(|(pid, ..)| *pid == root_pid as i32);
+    // L11: the pid index is built once and used for both the root lookup
+    // and every descendant's, instead of a linear scan per node.
+    let by_pid: HashMap<i32, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (pid, ..))| (*pid, i))
+        .collect();
+    let root_known = by_pid.contains_key(&(root_pid as i32));
     Ok(ProcessTreeSnapshot {
         root_pid,
         root_pid_known: root_known,
         processes: if root_known {
-            collect_subtree(root_pid as i32, &entries)
+            collect_subtree(root_pid as i32, &entries, &by_pid)
         } else {
             Vec::new()
         },
     })
 }
 
-fn collect_subtree(root_pid: i32, entries: &[(i32, i32, String)]) -> Vec<ProcessInfo> {
+/// L11: this used to call `entries.iter().find(...)` for every node it
+/// walked, making the whole traversal O(subtree x processes) -- on a
+/// desktop with ~400 processes and an editor subtree of 50, that is 20,000
+/// comparisons per focus change, every focus change, inside C1's 0.5%
+/// idle-CPU budget (PRD §6.2). `by_pid` makes each lookup O(1), so the
+/// traversal is linear in the subtree.
+fn collect_subtree(
+    root_pid: i32,
+    entries: &[(i32, i32, String)],
+    by_pid: &HashMap<i32, usize>,
+) -> Vec<ProcessInfo> {
     let mut children: HashMap<i32, Vec<usize>> = HashMap::new();
     for (i, (_, ppid, _)) in entries.iter().enumerate() {
         children.entry(*ppid).or_default().push(i);
@@ -116,7 +133,7 @@ fn collect_subtree(root_pid: i32, entries: &[(i32, i32, String)]) -> Vec<Process
         if !visited.insert(pid) {
             continue; // defends against a pathological ppid cycle
         }
-        if let Some((p, ppid, comm)) = entries.iter().find(|(p, ..)| *p == pid) {
+        if let Some((p, ppid, comm)) = by_pid.get(&pid).and_then(|&i| entries.get(i)) {
             out.push(ProcessInfo {
                 pid: *p as u32,
                 ppid: *ppid as u32,
@@ -272,6 +289,39 @@ mod tests {
         assert!(comm_matches("cos", "cosmic-comp"), "3 chars is the cutoff");
     }
 
+    /// L11: the pid index `process_tree` builds, rebuilt here so the
+    /// traversal tests can call `collect_subtree` directly.
+    fn index(entries: &[(i32, i32, String)]) -> HashMap<i32, usize> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, (pid, ..))| (*pid, i))
+            .collect()
+    }
+
+    /// L11: with the old linear `find` per node this is ~2,000 x 2,000 =
+    /// 4M string-carrying comparisons and takes seconds; indexed it is
+    /// linear in the subtree. The bound is loose enough not to be flaky on
+    /// a loaded machine but far below the quadratic cost.
+    #[test]
+    fn collect_subtree_is_linear_not_quadratic() {
+        // A 2,000-deep chain: every process is in the subtree.
+        let n = 2_000;
+        let entries: Vec<(i32, i32, String)> =
+            (0..n).map(|i| (i + 1, i, format!("p{i}"))).collect();
+        let idx = index(&entries);
+
+        let started = std::time::Instant::now();
+        let out = collect_subtree(1, &entries, &idx);
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.len(), n as usize, "every process is a descendant");
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "a {n}-node subtree took {elapsed:?}, which looks quadratic"
+        );
+    }
+
     #[test]
     fn collect_subtree_gathers_every_descendant_and_ignores_unrelated_processes() {
         let entries = vec![
@@ -281,7 +331,7 @@ mod tests {
             (102, 101, "cc1".to_string()),
             (200, 1, "unrelated".to_string()),
         ];
-        let mut pids: Vec<u32> = collect_subtree(100, &entries)
+        let mut pids: Vec<u32> = collect_subtree(100, &entries, &index(&entries))
             .into_iter()
             .map(|p| p.pid)
             .collect();
@@ -293,7 +343,7 @@ mod tests {
     fn collect_subtree_survives_a_ppid_cycle() {
         // pathological input (should never occur from real /proc) must not hang
         let entries = vec![(1, 2, "a".to_string()), (2, 1, "b".to_string())];
-        let pids: Vec<u32> = collect_subtree(1, &entries)
+        let pids: Vec<u32> = collect_subtree(1, &entries, &index(&entries))
             .into_iter()
             .map(|p| p.pid)
             .collect();

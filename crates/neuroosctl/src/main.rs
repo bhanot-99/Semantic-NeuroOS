@@ -663,7 +663,7 @@ mod tests {
         let server = UdsServer::bind(UdsServerConfig::new(&sock, vec![current_uid()])).unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok(Some((mut stream, _))) = server.accept().await else {
+                let Ok(Some((mut stream, _, _permit))) = server.accept().await else {
                     continue;
                 };
                 let Ok(Some(req)) = read_envelope(&mut stream, DEFAULT_MAX_FRAME).await else {
