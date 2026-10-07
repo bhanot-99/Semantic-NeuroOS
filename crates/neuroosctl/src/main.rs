@@ -6,10 +6,9 @@
 use std::time::Duration;
 
 use clap::{ArgGroup, Parser, Subcommand};
-use neuroos_ipc::{
-    DEFAULT_MAX_FRAME, OnRestart, connect, read_envelope_deadline, request_once,
-    write_envelope_deadline,
-};
+// C3: every request on this CLI's production paths now goes through
+// neuroos_ipc::request_once; the raw framing primitives are test-only here.
+use neuroos_ipc::{OnRestart, request_once, request_once_with_read_deadline};
 use neuroos_proto::v1::{
     AggregateStatusRequest, AskRequest, BackupJob, ComponentStatus, Envelope, ForgetRequest, GcJob,
     MaintenanceRequest, MonitorPauseRequest, MonitorStatusRequest, RenderGraphViewRequest, Status,
@@ -383,26 +382,19 @@ async fn run_storage(
     body: envelope::Body,
     timeout: Duration,
 ) -> i32 {
-    let response = async {
-        let mut stream = connect(socket_path, REQUEST_TIMEOUT)
-            .await
-            .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
-        let request = Envelope {
-            schema_version: 1,
-            trace_id: String::new(),
-            request_id: 0,
-            sent_at_ns: neuroos_common::now_ns(),
-            body: Some(body),
-        };
-        write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
-            .await
-            .map_err(|e| format!("write request: {e}"))?;
-        read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, timeout)
-            .await
-            .map_err(|e| format!("read response: {e}"))?
-            .ok_or_else(|| "neuroos-storage closed the connection with no response".to_string())
-    }
-    .await;
+    // C3: `request_once_with_read_deadline` keeps the short connect/write
+    // budget this call site has always had while giving GC and backup --
+    // which run for minutes -- their own long read budget.
+    let response = request_once_with_read_deadline(
+        socket_path,
+        body,
+        0,
+        REQUEST_TIMEOUT,
+        timeout,
+        OnRestart::FailFast,
+    )
+    .await
+    .map_err(|e| e.to_string());
     match response.map(|env| env.body) {
         Ok(Some(envelope::Body::ForgetResponse(r))) => {
             println!("forgotten: {} entities (plus their chunks)", r.forgotten);
@@ -598,7 +590,9 @@ mod tests {
     /// answers with an error or is down.
     #[tokio::test]
     async fn storage_commands_round_trip_over_a_real_socket() {
-        use neuroos_ipc::{UdsServer, UdsServerConfig, read_envelope, write_envelope};
+        use neuroos_ipc::{
+            DEFAULT_MAX_FRAME, UdsServer, UdsServerConfig, read_envelope, write_envelope,
+        };
         use neuroos_proto::v1::{ForgetResponse, MaintenanceResponse};
 
         let dir = tempfile::tempdir().unwrap();

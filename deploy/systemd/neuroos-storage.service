@@ -32,7 +32,8 @@ InaccessiblePaths=-/run/systemd/resolve
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-MemoryMax=300M
+# ADR-0014 / M21: raised from 300M (PRD §6.2).
+MemoryMax=420M
 Restart=on-failure
 RestartSec=2s
 

@@ -54,12 +54,39 @@ pub enum OnRestart {
 ///
 /// `deadline` is applied to each of the three stages (connect, write, read)
 /// rather than to the whole exchange, matching what every call site this
-/// replaced already did.
+/// replaced already did. Use [`request_once_with_read_deadline`] when the
+/// server may legitimately take much longer to answer than to accept.
 pub async fn request_once(
     socket_path: &Path,
     body: envelope::Body,
     request_id: u64,
     deadline: Duration,
+    on_restart: OnRestart,
+) -> Result<Envelope, RequestError> {
+    request_once_with_read_deadline(
+        socket_path,
+        body,
+        request_id,
+        deadline,
+        deadline,
+        on_restart,
+    )
+    .await
+}
+
+/// As [`request_once`], but with its own deadline for reading the response.
+///
+/// C3: `neuroosctl storage gc|backup` needs exactly this. Those jobs run for
+/// minutes, so the read budget has to be long — but giving the *connect* that
+/// same budget would turn "the socket is not there" into a multi-minute hang
+/// instead of a prompt error. Connect and write keep `deadline`; only the
+/// read gets `read_deadline`.
+pub async fn request_once_with_read_deadline(
+    socket_path: &Path,
+    body: envelope::Body,
+    request_id: u64,
+    deadline: Duration,
+    read_deadline: Duration,
     on_restart: OnRestart,
 ) -> Result<Envelope, RequestError> {
     let mut stream = match on_restart {
@@ -79,7 +106,7 @@ pub async fn request_once(
         body: Some(body),
     };
     write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, deadline).await?;
-    read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, deadline)
+    read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, read_deadline)
         .await?
         .ok_or(RequestError::NoResponse)
 }
@@ -129,6 +156,76 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RequestError::NoResponse), "{err:?}");
+    }
+
+    /// C3: the whole point of the split -- a slow answer is fine, an absent
+    /// socket is not. A long read budget must not be spent on the connect.
+    #[tokio::test]
+    async fn a_long_read_deadline_does_not_lengthen_the_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let err = request_once_with_read_deadline(
+            &dir.path().join("nonexistent.sock"),
+            envelope::Body::HealthRequest(HealthRequest {}),
+            1,
+            Duration::from_millis(100),
+            Duration::from_secs(600),
+            OnRestart::FailFast,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RequestError::Connect { .. }), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the connect must fail on its own deadline, not the read's; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// And the read really does get its own, longer budget: a server that
+    /// takes longer than `deadline` but less than `read_deadline` succeeds.
+    #[tokio::test]
+    async fn a_slow_answer_is_allowed_by_the_read_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slow.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req =
+                read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            // Longer than `deadline` below, shorter than `read_deadline`.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let resp = Envelope {
+                schema_version: 1,
+                trace_id: String::new(),
+                request_id: req.request_id,
+                sent_at_ns: 0,
+                body: Some(envelope::Body::HealthResponse(HealthResponse::default())),
+            };
+            write_envelope_deadline(
+                &mut stream,
+                &resp,
+                DEFAULT_MAX_FRAME,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        });
+
+        let resp = request_once_with_read_deadline(
+            &path,
+            envelope::Body::HealthRequest(HealthRequest {}),
+            5,
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            OnRestart::FailFast,
+        )
+        .await
+        .expect("a slow but answered request must succeed");
+        assert_eq!(resp.request_id, 5);
     }
 
     #[tokio::test]

@@ -462,6 +462,58 @@ int main() {
         ::close(fd);
     }
 
+    // ADR-0013 / L3: DetachRing releases a ring so its kMaxRings slot can
+    // be reused, and is idempotent. Done last so nothing else in this smoke
+    // test still needs `smoke-test-ring`.
+    {
+        int fd = connect_or_die(sock_path);
+        neuroos::v1::Envelope req;
+        req.set_schema_version(1);
+        req.set_request_id(90);
+        req.mutable_detach_ring_request()->set_ring_name("smoke-test-ring");
+        check(neuroos::ipc::write_envelope(fd, req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write DetachRingRequest");
+        auto resp = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
+        check(resp.has_value() && resp.value().has_value(), "read DetachRingResponse");
+        check(resp.value()->detach_ring_response().detached(),
+             "detaching an attached ring must report detached = true");
+        ::close(fd);
+
+        // Second detach of the same name: idempotent, not an error.
+        fd = connect_or_die(sock_path);
+        req.set_request_id(91);
+        check(neuroos::ipc::write_envelope(fd, req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write the second DetachRingRequest");
+        resp = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
+        check(resp.has_value() && resp.value().has_value(), "read the second DetachRingResponse");
+        check(!resp.value()->detach_ring_response().detached(),
+             "detaching an already-detached ring must report detached = false");
+        check(resp.value()->detach_ring_response().error().empty(),
+             "an idempotent detach is not an error");
+        ::close(fd);
+
+        // Generate on the detached ring must now be refused up front
+        // (handle_generate's exists() check), not accepted into a void.
+        fd = connect_or_die(sock_path);
+        neuroos::v1::Envelope gen_req;
+        gen_req.set_schema_version(1);
+        gen_req.set_request_id(92);
+        auto* gen = gen_req.mutable_generate_request();
+        gen->set_prompt("anything");
+        gen->set_max_tokens(4);
+        gen->set_lane(neuroos::v1::LANE_INTERACTIVE);
+        gen->set_ring_name("smoke-test-ring");
+        check(neuroos::ipc::write_envelope(fd, gen_req, neuroos::ipc::kDefaultMaxFrame).has_value(),
+             "write GenerateRequest for the detached ring");
+        auto gen_resp = neuroos::ipc::read_envelope(fd, neuroos::ipc::kDefaultMaxFrame);
+        check(gen_resp.has_value() && gen_resp.value().has_value(), "read GenerateResponse");
+        check(!gen_resp.value()->generate_response().accepted(),
+             "a generate on a detached ring must be refused, not accepted");
+        ::close(fd);
+        std::printf("OK: DetachRing frees the ring, is idempotent, and a detached ring "
+                   "stops accepting generations\n");
+    }
+
     std::printf("all cpp_inference_smoke checks passed\n");
     return 0;
 }

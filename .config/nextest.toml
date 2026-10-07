@@ -1,0 +1,38 @@
+# cargo-nextest configuration.
+
+[profile.default]
+# The live `--ignored` tests load the real embedding model, build real HNSW
+# indexes and drive real sockets. Running them at full fan-out on a laptop
+# makes the timing-sensitive ones report latency that belongs to the machine
+# being saturated rather than to the code.
+#
+# BUG-002's `query_latency_at_20k_synthetic_items` is the clearest case: it
+# passes comfortably on its own (p99 well under its 5 s sanity bound) and
+# failed inside a 151-test parallel run, which looked like a third real
+# failure alongside M23 and C13 and cost time to attribute. BUGS.md's own
+# C12 note records the same lesson from the opposite direction: a failure
+# here does not always mean what it appears to mean.
+#
+# These groups cap concurrency for exactly those tests. Everything else keeps
+# running at full fan-out.
+[test-groups]
+# One at a time: each loads its own copy of the embedding model (~127 MiB of
+# f32 weights) or measures latency.
+heavy-live = { max-threads = 1 }
+# Only one real BitNet instance on the machine at a time.
+real-inference = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# C3-side: real embedding model, real HNSW builds, latency measurements.
+filter = 'test(query_latency_at_20k_synthetic_items) or test(soak_replay_gate_passes_on_every_committed_dump) or test(hnsw_promotion) or test(the_first_query_after_open_is_within_c5as_deadline)'
+test-group = 'heavy-live'
+
+[[profile.default.overrides]]
+# C4-side: each of these spawns its own real BitNet instance (~1.1 GB model)
+# and has a 30 s client deadline. Four at once starve each other past it and
+# report as failures that have nothing to do with the code -- each passes in
+# about a second on its own. M22 recorded exactly this once already ("sharing
+# the machine with a second real BitNet instance"); Phase 6 adds more
+# real-model tests, so the constraint is written down here instead.
+filter = 'package(neuroos-knowledge-query) and (binary(inference_generate) or binary(ask_end_to_end) or binary(kpi1_eval))'
+test-group = 'real-inference'

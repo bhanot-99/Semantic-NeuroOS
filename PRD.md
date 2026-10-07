@@ -52,7 +52,7 @@ The defining property is the **Zero-Egress Guarantee**. Every component that tou
 | G-2 | Absolute privacy | 0 bytes of egress from Components 1–6 and healthd, proven by test in Phase 9 |
 | G-3 | Feels responsive | Spoken preamble starts ≤ 50 ms after the transcript is ready; first answer audio ≤ 2.0 s p50 |
 | G-4 | Safe by construction | 100% of tainted-context skill calls escalate; 0 skills execute without an `ATTEMPT` + `RESULT` audit pair |
-| G-5 | Runs on a normal laptop | Total steady-state RSS ≤ 2,340 MiB; idle CPU ≤ 3% on reference hardware |
+| G-5 | Runs on a normal laptop | Total steady-state RSS ≤ 2,475 MiB; idle CPU ≤ 3% on reference hardware (§6.2: C3's share was corrected upward in ADR-0014) |
 | G-6 | Stable for long sessions | 24 h soak: RSS growth < 5%, p99 latency drift < 10% |
 
 ### 2.2 Non-goals (explicitly out of scope for v1.0)
@@ -118,7 +118,7 @@ The project owner, who builds, installs and debugs the system. They need `neuroo
 | Audio | PipeWire ≥ 1.0 |
 | Init | systemd ≥ 255 |
 | Network | Components 1–6 and healthd: none. Component 7: egress only on approval. |
-| Memory budget | ≤ 2,340 MiB RSS total |
+| Memory budget | ≤ 2,475 MiB RSS total (§6.2) |
 | Models | Shipped as local files under `/opt/neuroos/models/`. Never downloaded at runtime by any component. |
 
 ---
@@ -307,13 +307,24 @@ Each functional requirement (FR) has an ID used by [phases.md](phases.md) user s
 | :--- | :--- | :--- |
 | C1 monitor | 25 MiB | 40 MiB |
 | C2 voice | 405 MiB | 520 MiB |
-| C3 storage | 205 MiB | 300 MiB |
+| C3 storage | 340 MiB | 420 MiB |
 | C4 inference | 1,590 MiB | 1,900 MiB |
 | C5 knowledge (hot + cold) | 75 MiB | 120 MiB |
 | C6 kernel | 15 MiB (+25 MiB transient dialog) | 64 MiB |
 | C7 fetcher | 10 MiB | 32 MiB |
 | healthd | 15 MiB | 32 MiB |
-| **Total** | **2,340 MiB** | — |
+| **Total** | **2,475 MiB** | — |
+
+> **C3's budget was raised from 205/300 MiB to 340/420 MiB on 2026-10-07
+> (ADR-0014, BUGS.md M21).** The original figure was set before C3 had an
+> embedding model: `bge-small-en-v1.5` is 126.9 MiB of f32 weights on its
+> own, and the arrow/datafusion/lance stack adds ~110 MiB of resident text
+> and buffers, so 205 MiB was not reachable by any implementation of this
+> design. Measured release-build behaviour: 299–334 MiB across the real
+> lifecycle, 392–401 MiB peak during startup. The new figures are those
+> measurements plus headroom, so healthd now reports C3 honestly instead of
+> DEGRADED on every start. ADR-0014 records the two ways to bring the number
+> back down and why neither was taken now.
 
 Idle CPU (no speech, no queries): ≤ 3% of total CPU across all components.
 

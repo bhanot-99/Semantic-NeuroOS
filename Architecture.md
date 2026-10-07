@@ -169,7 +169,7 @@ message Error {
 }
 ```
 
-Field-number ranges per component: 10–19 common, 20–29 C1, 30–39 C2, 40–59 C3, 60–69 C4, 70–89 C5, 90–109 C6, 110–119 C7, 120–129 healthd.
+Field-number ranges per component: 10–19 common, 20–29 C1, 30–39 C2, 40–59 C3, 60–69 C4, 70–89 C5, 90–109 C6, 110–119 C7, 120–129 healthd, **130–139 C4 overflow** (ADR-0013: 60–69 was exhausted by Generate/Cancel/Distill/AttachRing/GetInfo, and renumbering a live range would break the wire contract for no gain).
 
 ### 5.4 Versioning policy
 
@@ -625,7 +625,7 @@ V3.2 is the primary source. Where the two blueprints disagree or leave gaps, the
 | 2 | Distillation | Sync 100 ms budget | Async ~6 s background, fast path always used | **Async** (FR-KNO-05) |
 | 3 | C3 RSS | 165 MiB | 205 MiB (incl. 120 MiB FastEmbed) | **205 MiB** |
 | 4 | C6 / C7 RSS | 30 / 15 MiB | 15 / 10 MiB | **V3.2** |
-| 5 | Total RSS | 2,385 MiB | 2,420 MiB | **2,340 MiB** (Piper removed, see #16) |
+| 5 | Total RSS | 2,385 MiB | 2,420 MiB | **2,475 MiB** (Piper removed, see #16; C3 raised 205→340 MiB in ADR-0014 after M21 measured the real cost of the embedding model plus the arrow/lance stack) |
 | 6 | Token stream payload | — | `write_token(u32 token_id)` | **token_id + detokenized UTF-8 piece** (C2 has no tokenizer) |
 | 7 | Fetcher → C3 notification | IPC signal | IPC signal | **inotify on spool dir** (fetcher UID cannot reach `/run/user/$UID`) |
 | 8 | SHM transport | POSIX SHM | POSIX SHM | **memfd + SCM_RIGHTS** (sandbox-safe) |

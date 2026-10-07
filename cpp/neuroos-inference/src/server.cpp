@@ -63,7 +63,7 @@ void handle_generate(const neuroos::v1::GenerateRequest& req, neuroos::v1::Envel
         health.incr_error(kGenerateRejected);
         return;
     }
-    auto writer = rings.get_or_create(req.ring_name(), 0, 0);
+    auto writer = rings.get(req.ring_name()); // ADR-0013: exists() checked above
     if (!writer) {
         // L3: cannot happen for a ring that `exists` (checked above), so
         // this is the registry refusing a *new* one at its ceiling.
@@ -110,7 +110,7 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
     for (const auto& chunk : req.chunks()) {
         prompt << chunk << "\n";
     }
-    auto writer = rings.get_or_create(req.ring_name(), 0, 0);
+    auto writer = rings.get(req.ring_name()); // ADR-0013: exists() checked above
     if (!writer) {
         out->set_accepted(false);
         out->set_error("ring registry is full");
@@ -188,6 +188,21 @@ void handle_connection(neuroos::ipc::Connection conn,
             }
             resp.mutable_attach_ring_response()->set_ok(true);
             fd_to_send = rings.fd_for(areq.ring_name());
+            break;
+        }
+        case neuroos::v1::Envelope::kDetachRingRequest: {
+            // ADR-0013 / L3: lets a client release a ring it no longer
+            // reads, so kMaxRings bounds how many are attached at once
+            // rather than how many C4 may ever serve. Idempotent: a name
+            // that is not attached reports `detached = false`, not an error.
+            const auto& dreq = in.detach_ring_request();
+            auto* out = resp.mutable_detach_ring_response();
+            if (dreq.ring_name().empty()) {
+                out->set_detached(false);
+                out->set_error("ring_name is required");
+                break;
+            }
+            out->set_detached(rings.detach(dreq.ring_name()));
             break;
         }
         case neuroos::v1::Envelope::kGetInfoRequest: {

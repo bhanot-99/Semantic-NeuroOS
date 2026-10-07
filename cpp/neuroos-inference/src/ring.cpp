@@ -10,8 +10,8 @@ std::optional<neuroos::shm::RingWriter> RingRegistry::get_or_create(const std::s
     if (it != rings_.end()) {
         return it->second->writer();
     }
-    // L3: everything below creates a ring, and a created ring is never
-    // freed, so this is where the ceilings have to hold.
+    // L3: everything below creates a ring, so this is where the ceilings
+    // have to hold. ADR-0013's `detach` is what frees one again.
     if (rings_.size() >= kMaxRings) {
         return std::nullopt;
     }
@@ -25,6 +25,20 @@ std::optional<neuroos::shm::RingWriter> RingRegistry::get_or_create(const std::s
     auto writer = ring->writer();
     rings_.emplace(name, std::move(ring));
     return writer;
+}
+
+std::optional<neuroos::shm::RingWriter> RingRegistry::get(const std::string& name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = rings_.find(name);
+    if (it == rings_.end()) {
+        return std::nullopt;
+    }
+    return it->second->writer();
+}
+
+bool RingRegistry::detach(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rings_.erase(name) > 0;
 }
 
 std::size_t RingRegistry::size() const {
