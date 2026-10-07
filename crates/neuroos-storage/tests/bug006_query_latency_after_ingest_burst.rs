@@ -26,9 +26,19 @@
 //! (so it was never a warm-up or a compaction backlog). The fix lets a
 //! single sample past the deadline promote on its own.
 //!
+//! ADR-0015 then added a background latency probe so C3 measures itself
+//! once ingest settles, instead of the user's first question doing it. With
+//! any pause at all between data landing and the first question --
+//! `NEUROOS_BUG006_SETTLE_SECS=3` simulates it -- that takes the misses to
+//! ~0, because the index is already built when the question arrives. This
+//! test's default path is the harsher one, asking the instant ingest stops,
+//! where the probe has not had its quiet period yet and the first few
+//! queries still pay for the promotion they trigger.
+//!
 //! This started as a measurement and is now the regression guard: it prints
 //! the per-query latency curve, then asserts the misses stay within the
-//! small budget the promotion mechanism inherently costs.
+//! small budget the promotion mechanism inherently costs and that steady
+//! state is inside the deadline.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
 
 use std::path::PathBuf;
@@ -49,12 +59,14 @@ const QUERIES: usize = 45;
 
 /// How many of those may miss the deadline after the fix.
 ///
-/// Promotion is driven by a *measured* p99 (FR-STO-07), so one query has to
-/// be slow for C3 to learn anything at all, and the detached `create_index`
-/// it fires then competes for CPU with the next few. Measured on this
-/// machine: 5 misses (query 1 triggers, 2-5 overlap the ~1 s build, 6+ run
-/// at ~55 ms). The budget allows headroom for a slower machine without
-/// letting the old 24-miss behaviour back in.
+/// Promotion is driven by a *measured* p99 (FR-STO-07), so something has to
+/// be slow once for C3 to learn anything at all. On this default path --
+/// querying the instant ingest stops, before ADR-0015's probe has had its
+/// quiet period -- that is query 1, and the detached `create_index` it
+/// fires competes with the next few: measured at 4-5 misses, then ~55 ms.
+/// With a settle gap the probe absorbs it and this drops to ~0. The budget
+/// allows headroom for a slower machine without letting the original
+/// 24-miss behaviour back in.
 const MAX_QUERIES_OVER_DEADLINE: usize = 8;
 
 /// Per-family data-file counts under a LanceDB store directory. Fragment
@@ -230,24 +242,22 @@ async fn only_the_promotion_trigger_and_its_index_build_miss_the_deadline() {
          has grown again, check whether promotion still fires on the first over-deadline query.",
         over.len(),
     );
-    // The misses must also be *front-loaded*: the cost belongs to the
-    // promotion trigger and its index build, so once those are done latency
-    // has to drop and stay down. This is a relative check on purpose --
-    // absolute per-query budgets are not robust when the whole live suite is
-    // sharing the machine (C14), and a stray outlier mid-run under that load
-    // is not a regression. The before/after gap was 179 ms vs 68 ms, so a
-    // real regression (promotion never firing) shows up here as the two
-    // halves converging, not as one slow query.
+    // Steady state has to be inside the deadline, not merely better than
+    // the start. Checked on the second half's mean rather than per query,
+    // because an absolute per-query budget is not robust when the whole
+    // live suite shares the machine (C14) -- a stray outlier mid-run is not
+    // a regression, a raised floor is. Before any fix this sat at 68 ms
+    // only *after* query 24, with the first half at 179 ms.
     assert!(
-        mean(second_half) * 1.5 < mean(first_half),
-        "BUG-006 regression: latency is no longer front-loaded (first half {:.1} ms, \
-         second half {:.1} ms). That shape means promotion is not firing early any more -- \
-         before the fix both halves sat high until query 24.",
-        mean(first_half),
+        mean(second_half) < C3_QUERY_DEADLINE.as_secs_f64() * 1000.0,
+        "BUG-006 regression: steady-state latency ({:.1} ms) is outside the \
+         {C3_QUERY_DEADLINE:?} deadline, so the family is not getting indexed at all.",
         mean(second_half),
     );
     eprintln!(
-        "\nOK: {} miss(es) of {QUERIES} (budget {MAX_QUERIES_OVER_DEADLINE}), front-loaded as expected",
-        over.len()
+        "\nOK: {} miss(es) of {QUERIES} (budget {MAX_QUERIES_OVER_DEADLINE}), \
+         steady state {:.1} ms",
+        over.len(),
+        mean(second_half),
     );
 }

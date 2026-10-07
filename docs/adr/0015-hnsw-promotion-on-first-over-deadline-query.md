@@ -1,4 +1,4 @@
-# ADR-0015: Promote to HNSW on the first over-deadline query, not after 20 samples
+# ADR-0015: Promote to HNSW on the first over-deadline query, and probe for it once ingest settles
 
 - Status: Accepted (owner directed the fix on 2026-10-07; BUG-006 reopened the same day)
 - Date: 2026-10-07
@@ -49,7 +49,7 @@ it was not this bug. Two measurements separated them:
 And the direct test: dropping the floor to 2 moved the recovery point from
 query 24 to query 6, tracking the gate exactly.
 
-## Decision
+## Decision 1: act on one decisive sample
 
 Keep the sample floor for borderline cases, and let a single decisive sample
 bypass it:
@@ -82,7 +82,7 @@ rather than imported because C3 must not depend on C5a (AB-1).
   explicitly forbids item-count thresholds, and building the index at
   `open()` would be exactly that in disguise.
 
-## Consequences
+### Effect of decision 1
 
 Measured on this machine, same recording, real 100 ms deadline:
 
@@ -93,25 +93,70 @@ Measured on this machine, same recording, real 100 ms deadline:
 | KPI-1 held-out set (15 questions) | 0/15 | 9/15 |
 | `storage.sock` deadline errors, tuned set | 21 | 5 |
 
-**Five misses remain, and they are inherent to a p99-driven policy.** Query 1
-must be slow for C3 to measure anything at all, and queries 2–5 overlap the
-~1 s detached `create_index`. Driving this to zero would need C3 to measure
-its own latency *before* the user's first query — for instance an internal
-probe query after an ingest burst, which would still satisfy FR-STO-07 since
-it is p99-driven and not item-count-driven. That is a larger change that
-invents behaviour the specs do not describe (R0-8), so it is recorded here as
-the option rather than taken.
+Five misses remained after this change alone: query 1 must be slow for C3 to
+measure anything, and queries 2–5 overlap the ~1 s detached `create_index`.
+The owner asked for those to be removed too, which is the second decision
+below.
+
+## Decision 2: a background latency probe, fired once ingest settles
+
+C3 now queries *itself* once a family has gone `PROBE_QUIET_PERIOD` (500 ms)
+without an insert, while that family is still un-indexed
+(`LanceStore::maybe_spawn_latency_probe`, called from `StorageEngine::ingest`).
+The probe is a real `query()` call, so it feeds the same histogram and the
+same promotion decision a user query would — deliberately no separate path
+whose timings could drift from the real one. It is detached (rules.md AB-11),
+and stops for good once the family is promoted.
+
+Effect, measured on the same recording:
+
+| Gap between data landing and the first question | Queries over deadline (of 45) |
+| :--- | :--- |
+| None — asked the instant ingest stops | 5 → **4–5** (unchanged) |
+| 3 s | 5 → **0** |
+
+So the probe removes the remaining cost whenever anything at all happens
+between data arriving and a question being asked, which is the real-world
+case: C3 ingests telemetry continuously, and the gaps between events are
+seconds, so a 500 ms quiet window is reached constantly. It cannot help a
+harness that asks in the same instant ingest stops — which is exactly what
+`kpi1_eval` does, so **KPI-1's own numbers are unchanged by this** (46/59
+before, 45/59 after, run-to-run noise). The isolation test measures both
+paths; `NEUROOS_BUG006_SETTLE_SECS` switches between them.
+
+### What the first attempt got wrong, and what it revealed
+
+The probe was first written to fire every `COMPACT_EVERY_INSERTS` (256)
+inserts, like compaction. That made things **strictly worse — all 45 queries
+missed the deadline instead of 5.**
+
+The reason is worth recording, because it is a property of the design and not
+of the probe: a probe 256 inserts into a 6,100-event burst measures a corpus
+that is still small, promotes on it, and builds an index over that prefix.
+**An HNSW index does not cover rows added after it is built, and `promoted` is
+a one-shot in-memory flag** — so the family was permanently marked "indexed"
+with ~95% of its rows outside the index, and every query fell back to a flat
+scan with nothing left to trigger a rebuild.
+
+Waiting for ingest to settle avoids it: the index is built over the whole
+corpus. But the underlying gap remains and is now recorded in BUGS.md as its
+own item — any promotion is a snapshot, and continuous telemetry ingest will
+keep adding rows the index does not cover. It is also the most plausible
+explanation yet for the question BUG-002 left open (why HNSW did not beat flat
+scan in the 20k synthetic benchmark, when here it beats it threefold:
+~150 ms → ~50 ms).
+
+## Consequences
 
 Guarded by `tests/bug006_query_latency_after_ingest_burst.rs`, which asserts
-a miss budget and that latency stays front-loaded. It is `#[ignore]`d and
+a miss budget and that steady-state latency is inside the deadline. It is
+`#[ignore]`d and
 machine-local (it needs the real embedder and the raw recording) and pinned
 to the `heavy-live` nextest group — as an absolute-latency test it is
 sensitive to machine load, which cost one wrong attribution during this work
 (the same lesson as C14).
 
-Separately noted, not addressed here: the store still shows 680 data files
+Separately noted, not addressed here: the store still shows ~680 data files
 for `attention` after the burst, unchanged after 45 s of settling. That may
 be nothing more than uncleaned old LanceDB versions, but it is worth
-measuring on its own, and it is a candidate explanation for the open question
-ADR-0014's sibling BUG-002 left behind — why HNSW did not beat flat scan in
-the 20k synthetic benchmark, when here it beats it threefold (~150 ms → ~50 ms).
+measuring on its own.

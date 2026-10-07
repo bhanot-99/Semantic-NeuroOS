@@ -97,7 +97,32 @@ deadline failure is a separate engineering defect, not a quality verdict.**
 
 ## 🟠 Open engineering work
 
-### 3. M10: the distillation cache is written but never read
+### 3. An HNSW index never covers rows added after it was built
+
+Found while building ADR-0015's probe, and the reason the probe's first
+version made BUG-006 *worse* (all 45 queries over deadline instead of 5): a
+probe fired mid-burst promoted a family on a few hundred rows, built an index
+over that prefix, and — because `LanceStore::promoted` is a one-shot in-memory
+flag and nothing reindexes on growth — left the family permanently marked
+"indexed" with ~95% of its rows outside the index, every query back to a flat
+scan with nothing able to trigger a rebuild.
+
+ADR-0015 sidesteps it by only probing once ingest settles, so the index is
+built over the whole corpus. **The gap itself is untouched.** C3 ingests
+telemetry continuously, so any promotion is a snapshot and rows keep arriving
+outside it. What is not known is how fast that matters in practice — whether
+LanceDB's own scan of unindexed fragments alongside the index is fast enough
+that it never shows, or whether C3 needs periodic reindexing (`optimize` with
+an index action, on the existing maintenance cadence) to hold its latency.
+
+**This is also the most plausible explanation yet for the question BUG-002 left
+open** — why HNSW did not beat flat scan in the 20k synthetic benchmark, when
+on the real corpus here it beats it threefold (~150 ms → ~50 ms). That
+benchmark inserts its 20,000 rows and promotes partway through, which is
+exactly the prefix-index situation. Worth measuring before anyone re-opens
+BUG-002 on its own terms.
+
+### 4. M10: the distillation cache is written but never read
 
 `DistillationCache::get` is public, entries carry their taint and a
 `stored_at_ns`, and nothing blocks a consumer. What is missing is the *contract*,
@@ -109,7 +134,7 @@ Those answers come out of C2's turn-taking state machine — **Phase 6 story
 P6-S08**. Wiring a lookup before then would invent the contract a phase early
 (R0-8). This is Phase 6 work, not a defect.
 
-### 4. Phase 7: bring C3's RSS back down (ADR-0014)
+### 5. Phase 7: bring C3's RSS back down (ADR-0014)
 
 C3's budget was raised to 340 MiB / 420 MiB because 205/300 predated C3 having
 an embedding model and was unreachable by any implementation of this design
@@ -150,10 +175,15 @@ decided by measured p99 over 5 ms, never by item count.
 | KPI-1 tuned (59) at the real deadline | 31/59 | **46/59** |
 | KPI-1 held-out (15) at the real deadline | 0/15 | **9/15** |
 
-Five misses remain and are inherent: query 1 has to be slow for C3 to measure
-anything, and 2–5 overlap the ~1 s detached index build. ADR-0015 records the
-option for driving that to zero (an internal probe query after an ingest burst)
-and why it was not taken unasked.
+A second change then removed the remaining five: C3 now probes its own latency
+in the background once a family has gone 500 ms without an insert, so the index
+is built before a question arrives rather than by it. Measured on the same
+recording: **0 of 45 queries over the deadline** when anything at all happens
+between data landing and the first question (the real-world case — telemetry
+events are seconds apart, so the quiet window is reached constantly), and
+unchanged at 4–5 when asked in the very same instant ingest stops. `kpi1_eval`
+is the latter, so **KPI-1's own numbers are unchanged by the probe** (46/59
+before, 45/59 after, run-to-run noise).
 
 Guarded by `crates/neuroos-storage/tests/bug006_query_latency_after_ingest_burst.rs`.
 
