@@ -24,7 +24,7 @@ real-inference = { max-threads = 1 }
 
 [[profile.default.overrides]]
 # C3-side: real embedding model, real HNSW builds, latency measurements.
-filter = 'test(query_latency_at_20k_synthetic_items) or test(soak_replay_gate_passes_on_every_committed_dump) or test(hnsw_promotion) or test(the_first_query_after_open_is_within_c5as_deadline)'
+filter = 'test(query_latency_at_20k_synthetic_items) or test(soak_replay_gate_passes_on_every_committed_dump) or test(hnsw_promotion) or test(the_first_query_after_open_is_within_c5as_deadline) or binary(bug006_query_latency_after_ingest_burst)'
 test-group = 'heavy-live'
 
 [[profile.default.overrides]]

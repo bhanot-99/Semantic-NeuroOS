@@ -31,6 +31,30 @@ const HNSW_PROMOTION_P99_THRESHOLD: Duration = Duration::from_millis(5);
 /// p99 estimate to mean anything.
 const MIN_SAMPLES_BEFORE_PROMOTION_CHECK: u64 = 20;
 
+/// BUG-006: one query slower than this promotes on its own, without
+/// waiting for the sample floor above.
+///
+/// The floor exists so a *borderline* p99 (just over the 5 ms threshold)
+/// isn't decided by one outlier. It was never meant to delay an obvious
+/// case, but that is what it did: flat scan over a real ~6,100-event
+/// corpus measures ~150 ms, 30x the threshold, so every query until the
+/// floor was reached missed C5's own 100 ms query deadline (rules.md
+/// §5.7) and came back as a degraded "couldn't retrieve evidence" answer.
+/// Measured on this machine's own recording: 21 of 59 real questions
+/// failed, contiguously from the first one, and the curve was identical
+/// after letting the store settle for 45 s — so it was the floor, not a
+/// warm-up or a compaction backlog.
+///
+/// 100 ms is C3's own copy of that deadline (C3 must not depend on C5a,
+/// AB-1). A sample past it is not noise relative to a 5 ms threshold, and
+/// the asymmetry is stark: promoting one family early costs a background
+/// index build that only ever makes queries faster, while promoting late
+/// costs the user ~20 unanswered questions. FR-STO-07 is still honoured —
+/// promotion is decided by measured p99 exceeding 5 ms, never by item
+/// count; this only changes how long C3 waits before believing its own
+/// measurement.
+const PROMOTE_IMMEDIATELY_ABOVE: Duration = Duration::from_millis(100);
+
 /// BUG-007(c): a family is compacted in the background after this many
 /// `insert` calls. Telemetry ingest adds one row (one fragment) per call;
 /// at a measured ~6,100 events/3 h, waiting for the 6-hourly backup left
@@ -416,7 +440,11 @@ impl LanceStore {
             h.record(elapsed);
             h.to_proto()
         };
-        if hist.count < MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
+        // BUG-006: the sample floor applies only to borderline cases. A
+        // single query past `PROMOTE_IMMEDIATELY_ABOVE` is already decisive,
+        // and waiting out the floor is what made the first ~20 queries
+        // against a fresh store fail. The p99 check below still decides.
+        if elapsed <= PROMOTE_IMMEDIATELY_ABOVE && hist.count < MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
             return false;
         }
         let Some(p99) = p99_ns(&hist) else {
@@ -867,6 +895,38 @@ mod tests {
         for _ in 0..MIN_SAMPLES_BEFORE_PROMOTION_CHECK - 1 {
             assert!(!store.record_query_latency("attention", Duration::from_millis(50)));
         }
+        assert!(!store.is_promoted("attention"));
+    }
+
+    // BUG-006: the sample floor above is what made the first ~20 real
+    // queries against a fresh store miss C5's 100 ms deadline -- flat scan
+    // on a real ~6,100-event corpus measures ~150 ms, so every query before
+    // the floor was reached failed, and the 21st finally promoted. A single
+    // sample that far over a 5 ms threshold is not noise, so it promotes on
+    // its own.
+    #[tokio::test]
+    async fn one_sample_over_the_query_deadline_promotes_without_waiting_for_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        assert!(
+            store.record_query_latency(
+                "attention",
+                PROMOTE_IMMEDIATELY_ABOVE + Duration::from_millis(1)
+            ),
+            "one query past the deadline should promote on the first sample"
+        );
+        assert!(store.is_promoted("attention"));
+    }
+
+    // The flip side, and why the floor still exists: a borderline sample
+    // (over 5 ms but inside the deadline) must still wait for enough
+    // samples to make a p99 meaningful, so one slow outlier can't promote
+    // a family that is actually fine.
+    #[tokio::test]
+    async fn one_borderline_sample_still_waits_for_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        assert!(!store.record_query_latency("attention", Duration::from_millis(50)));
         assert!(!store.is_promoted("attention"));
     }
 

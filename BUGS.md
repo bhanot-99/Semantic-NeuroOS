@@ -97,37 +97,7 @@ deadline failure is a separate engineering defect, not a quality verdict.**
 
 ## 🟠 Open engineering work
 
-### 3. BUG-006 is NOT fixed: the first ~21 C3 queries blow the 100 ms deadline
-
-Reopened 2026-10-07. BUG-006 was closed on the theory that unbounded concurrent
-distillation starved the CPU, and `MAX_CONCURRENT_DISTILLATIONS = 1`
-(`distill.rs:33`) was the fix. The symptom is unchanged in magnitude: BUG-006
-was recorded as "~20/51 questions", and the 2026-10-07 re-run fails **21/59**
-with `storage.sock request failed: read deadline exceeded`.
-
-What is new and makes the old root cause doubtful:
-
-- The failures are **contiguous from question 1** through 21 (plus Q23), then
-  stop for the remaining 36 questions. A distillation backlog would build up
-  over the first few questions, not be worst at the very first one; D-19's note
-  explicitly records that "the very first call alone reliably succeeds".
-- Lifting the deadline to 30 s makes **all** of them pass (0 errors, 48/59 and
-  11/15). So it is purely latency, never a hang, an error or a wrong result.
-
-Front-loaded latency that decays suggests a **warm-up cost that amortises** —
-most plausibly LanceDB fragmentation from the 6103-event ingest burst, with the
-background compaction added for BUG-007 (every 256 inserts) only catching up
-around query ~21. That is a hypothesis, not a diagnosis; it has not been
-measured. The competing explanation is still CPU contention from background
-distillation decodes.
-
-**Why it matters beyond KPI-1:** this is a real user-facing defect, not a test
-artifact. After any burst of ingest, roughly the first 20 questions a user asks
-return a degraded "I couldn't retrieve evidence" answer. Needs its own
-systematic-debugging session: instrument real C3 query latency per query index,
-then fix the cause rather than the deadline.
-
-### 4. M10: the distillation cache is written but never read
+### 3. M10: the distillation cache is written but never read
 
 `DistillationCache::get` is public, entries carry their taint and a
 `stored_at_ns`, and nothing blocks a consumer. What is missing is the *contract*,
@@ -139,7 +109,7 @@ Those answers come out of C2's turn-taking state machine — **Phase 6 story
 P6-S08**. Wiring a lookup before then would invent the contract a phase early
 (R0-8). This is Phase 6 work, not a defect.
 
-### 5. Phase 7: bring C3's RSS back down (ADR-0014)
+### 4. Phase 7: bring C3's RSS back down (ADR-0014)
 
 C3's budget was raised to 340 MiB / 420 MiB because 205/300 predated C3 having
 an embedding model and was unreachable by any implementation of this design
@@ -152,6 +122,40 @@ now because it re-embeds the whole store and changes retrieval behaviour, and
 KPI-1 is currently awaiting grading against the retrieval quality the f32 model
 produces. Revisit once that grading is done. ADR-0014 also records a second,
 smaller option: dropping the transient load-time copy (peak only, ~95 MiB).
+
+---
+
+## ✅ Fixed
+
+### ~~BUG-006: the first ~21 C3 queries blow the 100 ms deadline~~ — **fixed 2026-10-07**
+
+Root cause was **not** the distillation pile-up BUG-006 was originally closed
+against. `MIN_SAMPLES_BEFORE_PROMOTION_CHECK = 20` stopped HNSW promotion from
+firing until a family had served 20 queries, while flat scan over a real
+~6,100-event corpus costs ~150 ms — so the first 20 queries against any fresh
+store necessarily missed C5's 100 ms deadline, and the 21st finally promoted.
+
+Separated from the old theory by two measurements: it reproduces with
+distillation absent entirely (direct `query_hybrid` loop, no socket, no C4),
+and it is query-count-driven rather than time-driven (45 s of settling changed
+nothing). Dropping the floor to 2 moved the recovery point from query 24 to 6.
+
+Fixed by letting one sample past 100 ms promote on its own, with the floor kept
+for borderline cases — **ADR-0015**. FR-STO-07 is unchanged: promotion is still
+decided by measured p99 over 5 ms, never by item count.
+
+| | Before | After |
+| :--- | :--- | :--- |
+| Queries over deadline (45-query isolation test) | 24 | 5 |
+| KPI-1 tuned (59) at the real deadline | 31/59 | **46/59** |
+| KPI-1 held-out (15) at the real deadline | 0/15 | **9/15** |
+
+Five misses remain and are inherent: query 1 has to be slow for C3 to measure
+anything, and 2–5 overlap the ~1 s detached index build. ADR-0015 records the
+option for driving that to zero (an internal probe query after an ingest burst)
+and why it was not taken unasked.
+
+Guarded by `crates/neuroos-storage/tests/bug006_query_latency_after_ingest_burst.rs`.
 
 ---
 
@@ -188,6 +192,7 @@ reopen them.
 | `deny.toml` ignores **RUSTSEC-2024-0436** (`paste` unmaintained; a proc-macro three levels inside vendored lancedb, no vulnerability, nothing to patch locally) | lancedb drops `paste`, or the advisory becomes a vulnerability |
 | **C10**: `cpp/neuroos-inference/CMakeLists.txt` writes `bitnet-lut-kernels.h` into the bitnet.cpp submodule worktree. Cannot be relocated — ggml lists it by a fixed relative path in `add_library` and CMake hard-errors on a missing source. `.gitmodules` sets `ignore = untracked` so it cannot show as a dirty tree | upstream makes the header optional, or the pin moves |
 | **C3**: C5a's `inference_client` is the one request site not on `neuroos_ipc::request_once` — it owns its stream across a whole streaming exchange, so it is not a request/response call | it stops being a streaming client |
+| `attention.lance` held **680 data files** after a 6,100-event ingest burst, unchanged after 45 s of settling (measured during the BUG-006 work, ADR-0015). Possibly just uncleaned old LanceDB versions rather than live fragments — not measured either way. Also a candidate explanation for BUG-002's open question, since HNSW beat flat scan threefold here (~150 → ~50 ms) but not in the 20k synthetic benchmark | someone measures live fragment count vs files on disk, or BUG-002's question is reopened |
 | **OQ-01** (PRD §13): final wake phrase, defaulting to openWakeWord's stock "hey jarvis" (already in `models/manifest.toml`) | Phase 6 — it is a Phase 6 exit criterion |
 
 ---
