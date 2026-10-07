@@ -1,9 +1,10 @@
 //! LanceDB: vectors + chunks, one table per domain family (Architecture.md
 //! §7.2: `attention`, `work`, `knowledge`, `system`, `external`), columns
 //! `chunk_id, entity_id, text, vector[384], taint, t_ns, domain`.
+use neuroos_common::sync::lock;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_array::types::Float32Type;
@@ -36,12 +37,6 @@ const MIN_SAMPLES_BEFORE_PROMOTION_CHECK: u64 = 20;
 /// thousands of fragments and 140-250 ms flat scans. Compacting every 256
 /// inserts keeps queries at ~20-40 ms for ~0.3 s of off-path work.
 const COMPACT_EVERY_INSERTS: u64 = 256;
-
-/// See `neuroos_health::histogram::lock`'s doc comment: recovers rather
-/// than panics on a poisoned mutex (rules.md §5).
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// `bge-small-en-v1.5`'s output width (matches `embed::EMBEDDING_DIM`; kept
 /// separate so this module has no compile-time dependency on `embed`).
@@ -624,11 +619,19 @@ impl LanceStore {
     /// `lance`'s own docs describe exactly this ("small files can hurt read
     /// and write performance... if writes are run frequently, compaction
     /// should run frequently too") and `optimize(Compact)` is its answer:
-    /// merge small fragments into fewer, larger ones. Not on the hot
-    /// ingest path (that would trade ingest latency for query latency,
-    /// rules.md AB-11) -- called from `StorageEngine::backup` instead,
-    /// riding the existing 6-hourly maintenance cadence (Architecture.md
-    /// §7.5).
+    /// merge small fragments into fewer, larger ones.
+    ///
+    /// C8: this used to say compaction happens only here, on the 6-hourly
+    /// backup cadence. That stopped being true with BUG-007(c), which found
+    /// the backup interval far too slow for real ingest rates (~6,100
+    /// events/3 h, one fragment per row) and added per-family background
+    /// compaction every `COMPACT_EVERY_INSERTS` inserts. That is the primary
+    /// mechanism now. This whole-store pass still runs from
+    /// `StorageEngine::backup` as the backstop that catches families whose
+    /// insert counters never reach the threshold (Architecture.md §7.5).
+    /// Neither path runs on the hot ingest path: the per-insert one spawns
+    /// off-task and holds the family's maintenance lock, so ingest latency is
+    /// never traded for query latency (rules.md AB-11).
     pub async fn compact_all_families(&self) -> Result<(), LanceError> {
         for family in FAMILIES {
             let maintenance = self.maintenance_lock(family)?;

@@ -1,19 +1,17 @@
+"""FR-KNO-10: hypothesis edges are pruned after 72 h unless reinforced.
+
+D2: this file used to test a `pruning.is_stale` predicate as well. Nothing
+called it -- the decision of *which* edges to delete belongs to C3, which
+applies it in SQL (`storage.sock`'s `PruneEdges`, covered by
+`sqlite::tests::prune_hypothesis_edges_only_removes_stale_hypotheses`), and
+AB-1 forbids this worker from touching SQLite at all. All this module owns is
+the cutoff instant it passes to C3, so that is all this file tests.
+"""
+
 from hypothesis import given
 from hypothesis import strategies as st
 
 from neuroos_bg import pruning
-from neuroos_bg.ipc import Edge
-
-
-def make_edge(*, reinforced_ns: int, hypothesis: bool) -> Edge:
-    return Edge(
-        src=1,
-        dst=2,
-        kind="co_occurs",
-        weight=1.0,
-        reinforced_ns=reinforced_ns,
-        hypothesis=hypothesis,
-    )
 
 
 def test_cutoff_ns_is_72_hours_before_now() -> None:
@@ -25,36 +23,22 @@ def test_cutoff_ns_never_goes_negative() -> None:
     assert pruning.cutoff_ns(0) == 0
 
 
-def test_confirmed_edge_is_never_stale_regardless_of_age() -> None:
-    edge = make_edge(reinforced_ns=0, hypothesis=False)
-    assert not pruning.is_stale(edge, now_ns=1000 * pruning.NS_PER_HOUR)
-
-
-def test_hypothesis_edge_within_ttl_is_not_stale() -> None:
+def test_cutoff_ns_honours_an_explicit_ttl() -> None:
     now = 100 * pruning.NS_PER_HOUR
-    edge = make_edge(reinforced_ns=now - 71 * pruning.NS_PER_HOUR, hypothesis=True)
-    assert not pruning.is_stale(edge, now_ns=now)
+    assert pruning.cutoff_ns(now, ttl_ns=pruning.NS_PER_HOUR) == now - pruning.NS_PER_HOUR
 
 
-def test_hypothesis_edge_past_ttl_is_stale() -> None:
-    now = 100 * pruning.NS_PER_HOUR
-    edge = make_edge(reinforced_ns=now - 73 * pruning.NS_PER_HOUR, hypothesis=True)
-    assert pruning.is_stale(edge, now_ns=now)
+@given(now_ns=st.integers(min_value=0, max_value=10_000 * pruning.NS_PER_HOUR))
+def test_cutoff_is_never_in_the_future_and_never_negative(now_ns: int) -> None:
+    cutoff = pruning.cutoff_ns(now_ns)
+    assert 0 <= cutoff <= now_ns
 
 
 @given(
-    reinforced_ns=st.integers(min_value=0, max_value=10_000 * pruning.NS_PER_HOUR),
     now_ns=st.integers(min_value=0, max_value=10_000 * pruning.NS_PER_HOUR),
+    ttl_ns=st.integers(min_value=0, max_value=10_000 * pruning.NS_PER_HOUR),
 )
-def test_confirmed_edges_are_always_kept(reinforced_ns: int, now_ns: int) -> None:
-    edge = make_edge(reinforced_ns=reinforced_ns, hypothesis=False)
-    assert not pruning.is_stale(edge, now_ns)
-
-
-@given(
-    reinforced_ns=st.integers(min_value=0, max_value=10_000 * pruning.NS_PER_HOUR),
-    now_ns=st.integers(min_value=0, max_value=10_000 * pruning.NS_PER_HOUR),
-)
-def test_staleness_matches_the_72h_cutoff_exactly(reinforced_ns: int, now_ns: int) -> None:
-    edge = make_edge(reinforced_ns=reinforced_ns, hypothesis=True)
-    assert pruning.is_stale(edge, now_ns) == (reinforced_ns < pruning.cutoff_ns(now_ns))
+def test_a_longer_ttl_never_prunes_more(now_ns: int, ttl_ns: int) -> None:
+    # A longer TTL moves the cutoff earlier, so it can only keep more edges.
+    longer = ttl_ns + pruning.NS_PER_HOUR
+    assert pruning.cutoff_ns(now_ns, ttl_ns) >= pruning.cutoff_ns(now_ns, longer)

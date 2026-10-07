@@ -12,6 +12,9 @@ workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
 prost = "0.13"
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
+# C1/C3: the safe current_uid() helper and `now_ns` for request envelopes
+# (AB-1 shared crate; it depends on nothing in this workspace, so no cycle).
+neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
 thiserror = "2"
 tracing = "0.1"
 rustix = { version = "1", features = ["fs", "net", "process"] }

@@ -126,7 +126,7 @@ Expected<std::optional<std::vector<std::uint8_t>>, IpcError> read_frame(int fd,
     if (!got_header.value()) {
         return std::optional<std::vector<std::uint8_t>>{std::nullopt};
     }
-    std::uint32_t len;
+    std::uint32_t len = 0;
     std::memcpy(&len, len_buf, sizeof(len)); // host is little-endian (x86_64/AArch64)
     if (len > max_frame) {
         return make_unexpected(IpcError::frame_too_large(len, max_frame));
@@ -299,7 +299,7 @@ Expected<std::optional<EnvelopeWithFd>, IpcError> read_envelope_with_fd(int fd,
             got += static_cast<std::size_t>(n);
         }
     }
-    std::uint32_t len;
+    std::uint32_t len = 0;
     std::memcpy(&len, len_buf, sizeof(len));
     if (len > max_frame) {
         return make_unexpected(IpcError::frame_too_large(len, max_frame));

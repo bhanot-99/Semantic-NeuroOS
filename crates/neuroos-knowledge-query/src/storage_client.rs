@@ -5,13 +5,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neuroos_ipc::{
-    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, write_envelope_deadline,
-};
+use neuroos_ipc::{OnRestart, request_once};
 use neuroos_proto::v1::{
-    ChunkMatch, EdgeRow, EntityRow, Envelope, FocusHistoryRow, ListEdgesRequest,
-    ListEntitiesRequest, QueryActivityRequest, QueryActivityResponse, QueryFocusHistoryRequest,
-    QueryHybridRequest, envelope,
+    ChunkMatch, EdgeRow, EntityRow, FocusHistoryRow, ListEdgesRequest, ListEntitiesRequest,
+    QueryActivityRequest, QueryActivityResponse, QueryFocusHistoryRequest, QueryHybridRequest,
+    envelope,
 };
 
 /// rules.md §5.7: every C3 query gets a 100 ms deadline.
@@ -35,6 +33,19 @@ pub enum StorageClientError {
     UnexpectedResponse,
 }
 
+/// C3: `request_once` reports the transport failures this enum already had
+/// variants for, so the mapping is one-to-one and every existing
+/// `StorageClientError::Connect { .. }` match keeps working.
+impl From<neuroos_ipc::RequestError> for StorageClientError {
+    fn from(e: neuroos_ipc::RequestError) -> Self {
+        match e {
+            neuroos_ipc::RequestError::Connect { path, source } => Self::Connect { path, source },
+            neuroos_ipc::RequestError::Framing(e) => Self::Io(e),
+            neuroos_ipc::RequestError::NoResponse => Self::NoResponse,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageClient {
     socket_path: PathBuf,
@@ -46,30 +57,15 @@ impl StorageClient {
     }
 
     async fn round_trip(&self, body: envelope::Body) -> Result<envelope::Body, StorageClientError> {
-        let mut stream = connect_retrying(&self.socket_path, STORAGE_QUERY_DEADLINE)
-            .await
-            .map_err(|source| StorageClientError::Connect {
-                path: self.socket_path.clone(),
-                source,
-            })?;
-        let request = Envelope {
-            schema_version: 1,
-            trace_id: String::new(),
-            request_id: 1,
-            sent_at_ns: neuroos_common::now_ns(),
-            body: Some(body),
-        };
-        write_envelope_deadline(
-            &mut stream,
-            &request,
-            DEFAULT_MAX_FRAME,
+        // C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
+        let response = request_once(
+            &self.socket_path,
+            body,
+            1,
             STORAGE_QUERY_DEADLINE,
+            OnRestart::Retry,
         )
         .await?;
-        let response =
-            read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, STORAGE_QUERY_DEADLINE)
-                .await?
-                .ok_or(StorageClientError::NoResponse)?;
         match response.body {
             Some(envelope::Body::Error(e)) => Err(StorageClientError::Remote(e.message)),
             Some(body) => Ok(body),
@@ -165,14 +161,7 @@ impl StorageClient {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
-    }
+    use neuroos_common::current_uid;
 
     /// M20 / AB-10: C3 restarting (systemd, a GC crash) left its socket
     /// file behind with nothing listening, and every C5a call in that

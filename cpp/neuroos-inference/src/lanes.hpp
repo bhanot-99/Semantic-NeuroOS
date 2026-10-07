@@ -23,14 +23,14 @@
 namespace neuroos::inference {
 
 struct Job {
-    std::uint64_t generation_id; // the target ring's generation_id, captured at submit time
+    std::uint64_t generation_id = 0; // the target ring's generation_id, captured at submit time
     std::string prompt;
-    std::uint32_t max_tokens;
-    float temperature;
-    std::uint64_t seed;
+    std::uint32_t max_tokens = 0;
+    float temperature = 0.0F;
+    std::uint64_t seed = 0;
     std::string grammar_gbnf;
     std::string ring_name;
-    float repetition_penalty; // BUG-005: 1.0 = disabled
+    float repetition_penalty = 1.0F; // BUG-005: 1.0 = disabled
 };
 
 constexpr std::size_t kMaxQueueDepth = 4;
@@ -41,6 +41,9 @@ class LaneScheduler {
     ~LaneScheduler();
     LaneScheduler(const LaneScheduler&) = delete;
     LaneScheduler& operator=(const LaneScheduler&) = delete;
+    // Owns two llama contexts and a worker thread per lane: not movable either.
+    LaneScheduler(LaneScheduler&&) = delete;
+    LaneScheduler& operator=(LaneScheduler&&) = delete;
 
     // Returns false (caller reports !accepted) if the target lane's bounded
     // queue is already full.

@@ -37,7 +37,14 @@ Cloud sync, remote accounts, telemetry to the developer, or any "phone home" beh
 
 ## Status
 
-Planning complete, foundation documents baselined. Phase 0 (Foundation, Contracts & Spikes) not yet started. See [`phases.md`](phases.md) for the full 11-phase roadmap and [`memory.md`](memory.md) for live project state.
+Five of the eleven phases are built: Phase 0 (foundation, contracts, spikes), Phase 1
+(health/IPC), Phase 2 (inference) and Phase 3 (monitor) are done and merged; Phase 4
+(storage) passed with approved exceptions; Phase 5 (knowledge engine) is story-complete
+with its KPI-1 gate awaiting the owner's grading. Phase 6 (voice) is next.
+
+See [`phases.md`](phases.md) for the full 11-phase roadmap, [`memory.md`](memory.md) for
+live project state (the authoritative source for what is done), and [`BUGS.md`](BUGS.md)
+for the open issue registry.
 
 ## Documents
 

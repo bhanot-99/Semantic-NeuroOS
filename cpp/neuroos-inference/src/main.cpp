@@ -19,14 +19,15 @@
 
 namespace {
 
+// A `volatile sig_atomic_t` at namespace scope is the only object a signal
+// handler may legally write, so it cannot be const or local.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 volatile std::sig_atomic_t g_shutdown = 0;
 void on_signal(int) {
     g_shutdown = 1;
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] neuroos-inference: %v");
 
     // L5: bad config is fatal (rules.md §5.4), not a warning followed by a
@@ -44,8 +45,10 @@ int main(int argc, char** argv) {
         return neuroos::inference::run_benchmark(config);
     }
 
-    std::signal(SIGTERM, on_signal);
-    std::signal(SIGINT, on_signal);
+    if (std::signal(SIGTERM, on_signal) == SIG_ERR || std::signal(SIGINT, on_signal) == SIG_ERR) {
+        spdlog::error("cannot install the SIGTERM/SIGINT handlers");
+        return 1;
+    }
 
     std::string model_path = neuroos::inference::resolve_model_path(config);
 
@@ -117,4 +120,23 @@ int main(int argc, char** argv) {
     // documented shutdown model (no graceful in-flight-request drain in
     // Phase 2 scope): the OS reclaims everything on process exit regardless.
     std::quick_exit(0);
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    // rules.md §5.4 / bugprone-exception-escape: an exception leaving main
+    // means std::terminate and no log line at all. Everything above returns
+    // Expected rather than throwing, but spdlog, the STL containers and
+    // llama.cpp can all throw, so this is the backstop that turns any of it
+    // into an exit code systemd can act on.
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        spdlog::critical("unhandled exception: {}", e.what());
+        return 1;
+    } catch (...) {
+        spdlog::critical("unhandled non-standard exception");
+        return 1;
+    }
 }

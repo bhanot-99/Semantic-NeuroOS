@@ -36,6 +36,10 @@ class Fd {
     }
     Fd(const Fd&) = delete;
     Fd& operator=(const Fd&) = delete;
+    // Scope guard for one Landlock ruleset fd: never moved, so the close in
+    // the destructor always happens exactly where the fd was opened.
+    Fd(Fd&&) = delete;
+    Fd& operator=(Fd&&) = delete;
     int get() const {
         return fd_;
     }

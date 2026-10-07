@@ -5,6 +5,8 @@
 //! ring, and mock `voice.sock`/`kernel.sock` servers standing in for C2/C6
 //! (both land in later phases).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+use neuroos_common::current_uid;
+use neuroos_storage::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -24,30 +26,8 @@ use neuroos_storage::engine::StorageEngine;
 use neuroos_testkit::{kernel_mocks, voice_mocks};
 use tokio::sync::Mutex;
 
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
-
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn dev_models_dir() -> PathBuf {
-    repo_root().join(".dev-cache/models")
-}
-
-fn dev_onnxruntime_dylib() -> PathBuf {
-    // M16: a test is its own `main`, so it pins the ONNX Runtime
-    // dylib the way `main` does, before `Embedder::load` can be
-    // reached; harmless to repeat, an error only on a conflict.
-    let path =
-        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-    let _ = neuroos_storage::embed::Embedder::set_dylib_path(&path);
-    path
 }
 
 struct InferenceProcess {

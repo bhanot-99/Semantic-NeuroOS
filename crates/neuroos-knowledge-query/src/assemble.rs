@@ -283,17 +283,10 @@ fn truncate_bytes(text: &str, max_bytes: usize) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+    use neuroos_common::current_uid;
 
     use neuroos_proto::v1::Taint;
     use neuroos_testkit::inference_mocks::{MOCK_BYTES_PER_TOKEN, spawn_token_counter};
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
-    }
 
     /// A mock C4 that counts tokens and records every text it was asked
     /// about, so a test can assert the number of round trips as well as

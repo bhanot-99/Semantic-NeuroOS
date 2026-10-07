@@ -5,6 +5,8 @@
 //! as a `[dev-dependencies]`-only entry (see Cargo.toml), matching the
 //! precedent `neuroosctl` already set for `neuroos-healthd`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+use neuroos_common::current_uid;
+use neuroos_storage::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,28 +19,6 @@ use neuroos_proto::v1::{
 };
 use neuroos_storage::engine::StorageEngine;
 use tokio::sync::Mutex;
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
-
-fn dev_models_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-}
-
-fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-    // M16: a test is its own `main`, so it pins the ONNX Runtime
-    // dylib the way `main` does, before `Embedder::load` can be
-    // reached; harmless to repeat, an error only on a conflict.
-    let path =
-        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-    let _ = neuroos_storage::embed::Embedder::set_dylib_path(&path);
-    path
-}
 
 fn window_event(toplevel_id: u64, at_ns: u64, kind: Kind) -> RawTelemetryEvent {
     RawTelemetryEvent {

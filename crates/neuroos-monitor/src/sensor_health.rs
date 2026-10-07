@@ -9,10 +9,11 @@
 //! drops into backoff and when it starts again, so the component reports
 //! `DEGRADED` for exactly as long as at least one sensor is down, and the
 //! per-sensor error counters show which one and how often.
+use neuroos_common::sync::lock;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use neuroos_health::HealthServer;
@@ -22,11 +23,6 @@ use neuroos_proto::v1::Status;
 // sleeps use, which `tokio::time::pause` can drive in tests (rules.md §7.6
 // prefers a fake clock to sleeping for real).
 use tokio::time::Instant;
-
-/// Recovers rather than panics on a poisoned mutex (rules.md §5).
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 #[derive(Clone)]
 pub struct SensorHealth {

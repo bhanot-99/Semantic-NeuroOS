@@ -28,6 +28,13 @@ constexpr std::uint32_t kDefaultSlotSize = 256;
 constexpr std::uint16_t kFlagEos = 1u << 0;
 constexpr std::uint16_t kFlagCancel = 1u << 1;
 
+// D2: these are wire values shared with Rust's FLAG_EOS / FLAG_CANCEL
+// (crates/neuroos-shm/src/ring.rs), which pins the same two literals in a
+// test of its own. Nothing in Rust reads FLAG_CANCEL today, so without both
+// assertions a renumbering here would be caught by neither side.
+static_assert(kFlagEos == 1, "wire value shared with Rust's FLAG_EOS");
+static_assert(kFlagCancel == 2, "wire value shared with Rust's FLAG_CANCEL");
+
 // slot byte layout (must match ring.rs's SLOT_*_OFF constants exactly):
 //   [0..4)   seqlock: u32 (odd = writing, even = stable)
 //   [4..8)   padding
@@ -93,22 +100,22 @@ class RingView {
     }
 
     static std::uint32_t read_magic(const void* base) {
-        std::uint32_t magic;
+        std::uint32_t magic = 0;
         std::memcpy(&magic, static_cast<const std::uint8_t*>(base) + 0, sizeof(magic));
         return magic;
     }
     static std::uint16_t read_version(const void* base) {
-        std::uint16_t v;
+        std::uint16_t v = 0;
         std::memcpy(&v, static_cast<const std::uint8_t*>(base) + 4, sizeof(v));
         return v;
     }
     static std::uint32_t read_capacity_slots(const void* base) {
-        std::uint32_t v;
+        std::uint32_t v = 0;
         std::memcpy(&v, static_cast<const std::uint8_t*>(base) + 8, sizeof(v));
         return v;
     }
     static std::uint32_t read_slot_size(const void* base) {
-        std::uint32_t v;
+        std::uint32_t v = 0;
         std::memcpy(&v, static_cast<const std::uint8_t*>(base) + 12, sizeof(v));
         return v;
     }

@@ -3835,6 +3835,7 @@ name = "neuroos-common"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "rustix 1.1.5",
  "serde",
  "tempfile",
  "thiserror",
@@ -3859,7 +3860,6 @@ dependencies = [
  "neuroos-common",
  "neuroos-ipc",
  "neuroos-proto",
- "prost 0.13.5",
  "tempfile",
  "tokio",
  "tracing",
@@ -3886,6 +3886,7 @@ dependencies = [
 name = "neuroos-ipc"
 version = "0.1.0"
 dependencies = [
+ "neuroos-common",
  "neuroos-proto",
  "neuroos-shm",
  "proptest",
@@ -3905,7 +3906,6 @@ version = "0.1.0"
 name = "neuroos-knowledge-query"
 version = "0.1.0"
 dependencies = [
- "clap",
  "neuroos-common",
  "neuroos-health",
  "neuroos-ipc",
@@ -3948,10 +3948,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
- "wayland-protocols-wlr",
  "zbus",
  "zeroize",
 ]
@@ -3979,7 +3977,6 @@ name = "neuroos-shm"
 version = "0.1.0"
 dependencies = [
  "rustix 1.1.5",
- "tempfile",
  "thiserror",
 ]
 
@@ -3998,6 +3995,7 @@ dependencies = [
  "neuroos-monitor",
  "neuroos-proto",
  "neuroos-sandbox",
+ "neuroos-storage",
  "neuroos-taint",
  "notify",
  "proptest",
@@ -4022,6 +4020,7 @@ dependencies = [
 name = "neuroos-testkit"
 version = "0.1.0"
 dependencies = [
+ "neuroos-common",
  "neuroos-health",
  "neuroos-ipc",
  "neuroos-proto",
@@ -4045,7 +4044,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
 ]
 
@@ -6474,9 +6472,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",

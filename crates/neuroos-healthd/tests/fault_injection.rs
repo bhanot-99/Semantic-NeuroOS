@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! FI (phases.md §4.3): kill a mock mid-scrape; healthd keeps running and
 //! reports DOWN within one cycle.
+use neuroos_common::current_uid;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,14 +11,6 @@ use neuroos_health::HealthServer;
 use neuroos_healthd::aggregate::Aggregate;
 use neuroos_healthd::targets::Target;
 use neuroos_proto::v1::Status;
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
 
 #[tokio::test]
 async fn killed_mock_is_reported_down_next_cycle_without_crashing_healthd() {

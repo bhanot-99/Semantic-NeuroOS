@@ -1,8 +1,15 @@
 //! neuroosctl entry point (Architecture.md §6.5, PRD FR-CLI-01).
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. This enforces that.
+#![cfg_attr(not(test), deny(unsafe_code))]
+
 use std::time::Duration;
 
 use clap::{ArgGroup, Parser, Subcommand};
-use neuroos_ipc::{DEFAULT_MAX_FRAME, connect, read_envelope_deadline, write_envelope_deadline};
+use neuroos_ipc::{
+    DEFAULT_MAX_FRAME, OnRestart, connect, read_envelope_deadline, request_once,
+    write_envelope_deadline,
+};
 use neuroos_proto::v1::{
     AggregateStatusRequest, AskRequest, BackupJob, ComponentStatus, Envelope, ForgetRequest, GcJob,
     MaintenanceRequest, MonitorPauseRequest, MonitorStatusRequest, RenderGraphViewRequest, Status,
@@ -162,25 +169,12 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
+// C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
 async fn monitor_control_request(body: envelope::Body) -> Result<Envelope, String> {
     let socket_path = neuroos_common::paths::monitor_control_sock();
-    let mut stream = connect(&socket_path, REQUEST_TIMEOUT)
+    request_once(&socket_path, body, 0, REQUEST_TIMEOUT, OnRestart::FailFast)
         .await
-        .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
-    let request = Envelope {
-        schema_version: 1,
-        trace_id: String::new(),
-        request_id: 0,
-        sent_at_ns: neuroos_common::now_ns(),
-        body: Some(body),
-    };
-    write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
-        .await
-        .map_err(|e| format!("write request: {e}"))?;
-    read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
-        .await
-        .map_err(|e| format!("read response: {e}"))?
-        .ok_or_else(|| "neuroos-monitor closed the connection with no response".to_string())
+        .map_err(|e| e.to_string())
 }
 
 async fn run_pause(duration: Option<u64>, resume: bool) -> i32 {
@@ -254,40 +248,19 @@ async fn run_monitor_status() -> i32 {
 
 async fn run_graph_open() -> i32 {
     let socket_path = neuroos_common::paths::knowledge_sock();
-    let mut stream = match connect(&socket_path, GRAPH_TIMEOUT).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "neuroosctl: could not reach neuroos-knowledge-query at {}: {e}",
-                socket_path.display()
-            );
-            return 1;
-        }
-    };
-    let request = Envelope {
-        schema_version: 1,
-        trace_id: String::new(),
-        request_id: 0,
-        sent_at_ns: neuroos_common::now_ns(),
-        body: Some(envelope::Body::RenderGraphViewRequest(
-            RenderGraphViewRequest {},
-        )),
-    };
-    if let Err(e) =
-        write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, GRAPH_TIMEOUT).await
+    // C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
+    let response = match request_once(
+        &socket_path,
+        envelope::Body::RenderGraphViewRequest(RenderGraphViewRequest {}),
+        0,
+        GRAPH_TIMEOUT,
+        OnRestart::FailFast,
+    )
+    .await
     {
-        eprintln!("neuroosctl: failed to send RenderGraphView request: {e}");
-        return 1;
-    }
-    let response = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, GRAPH_TIMEOUT).await
-    {
-        Ok(Some(env)) => env,
-        Ok(None) => {
-            eprintln!("neuroosctl: neuroos-knowledge-query closed the connection with no response");
-            return 1;
-        }
+        Ok(env) => env,
         Err(e) => {
-            eprintln!("neuroosctl: failed to read response: {e}");
+            eprintln!("neuroosctl: {e}");
             return 1;
         }
     };
@@ -313,40 +286,22 @@ async fn run_graph_open() -> i32 {
 
 async fn run_ask(question: &str) -> i32 {
     let socket_path = neuroos_common::paths::knowledge_sock();
-    let mut stream = match connect(&socket_path, ASK_TIMEOUT).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "neuroosctl: could not reach neuroos-knowledge-query at {}: {e}",
-                socket_path.display()
-            );
-            return 1;
-        }
-    };
-    let request = Envelope {
-        schema_version: 1,
-        trace_id: String::new(),
-        request_id: 0,
-        sent_at_ns: neuroos_common::now_ns(),
-        body: Some(envelope::Body::AskRequest(AskRequest {
+    // C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
+    let response = match request_once(
+        &socket_path,
+        envelope::Body::AskRequest(AskRequest {
             question: question.to_string(),
             t_ns: 0, // text path has no real utterance start; knowledge.sock treats 0 as "now"
-        })),
-    };
-    if let Err(e) =
-        write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, ASK_TIMEOUT).await
+        }),
+        0,
+        ASK_TIMEOUT,
+        OnRestart::FailFast,
+    )
+    .await
     {
-        eprintln!("neuroosctl: failed to send question: {e}");
-        return 1;
-    }
-    let response = match read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, ASK_TIMEOUT).await {
-        Ok(Some(env)) => env,
-        Ok(None) => {
-            eprintln!("neuroosctl: neuroos-knowledge-query closed the connection with no response");
-            return 1;
-        }
+        Ok(env) => env,
         Err(e) => {
-            eprintln!("neuroosctl: failed to read answer: {e}");
+            eprintln!("neuroosctl: {e}");
             return 1;
         }
     };
@@ -417,6 +372,12 @@ fn forget_body(
 
 /// One `storage.sock` round trip for `forget` / `storage gc|backup`, with
 /// a human-readable result. Exit code 0 on success, 1 on failure.
+///
+/// C3: deliberately *not* on `neuroos_ipc::request_once`. GC and backup can
+/// run for minutes, so this is the one call site that needs a short connect
+/// and write deadline with a much longer read deadline; `request_once`
+/// applies one deadline to all three stages, and widening the connect budget
+/// to the backup timeout would turn a missing socket into a long hang.
 async fn run_storage(
     socket_path: &std::path::Path,
     body: envelope::Body,
@@ -498,27 +459,16 @@ async fn run_status(json: bool) -> i32 {
 
 async fn fetch_status() -> Result<StatusReport, String> {
     let socket_path = neuroos_common::paths::healthd_sock();
-    let mut stream = connect(&socket_path, REQUEST_TIMEOUT)
-        .await
-        .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
-
-    let request = Envelope {
-        schema_version: 1,
-        trace_id: String::new(),
-        request_id: 0,
-        sent_at_ns: neuroos_common::now_ns(),
-        body: Some(envelope::Body::AggregateStatusRequest(
-            AggregateStatusRequest {},
-        )),
-    };
-    write_envelope_deadline(&mut stream, &request, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
-        .await
-        .map_err(|e| format!("write request: {e}"))?;
-
-    let response = read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, REQUEST_TIMEOUT)
-        .await
-        .map_err(|e| format!("read response: {e}"))?
-        .ok_or_else(|| "healthd closed the connection with no response".to_string())?;
+    // C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
+    let response = request_once(
+        &socket_path,
+        envelope::Body::AggregateStatusRequest(AggregateStatusRequest {}),
+        0,
+        REQUEST_TIMEOUT,
+        OnRestart::FailFast,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     match response.body {
         Some(envelope::Body::AggregateStatusResponse(resp)) => Ok(StatusReport {
@@ -601,6 +551,7 @@ mod tests {
     use neuroos_proto::v1::LatencyHistogram;
 
     use super::*;
+    use neuroos_common::current_uid;
 
     fn target(name: &str) -> Target {
         Target {
@@ -616,14 +567,6 @@ mod tests {
     /// `cargo test` (one process, many threads) they raced each other;
     /// every test that sets them holds this for its whole run.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
-    }
 
     #[test]
     fn parse_duration_accepts_every_unit_and_rejects_garbage() {

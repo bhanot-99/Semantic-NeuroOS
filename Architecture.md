@@ -347,12 +347,15 @@ healthd connects to every `*.health.sock` every 30 s, reads `HealthResponse{stat
 | :--- | :--- | :--- |
 | `focus_history` | `id, app_id, title, pid, root_pid, t_start_ns, t_end_ns, dwell_ms` | 14 days raw |
 | `event_counters` | `domain, key, count, first_ns, last_ns, total_dwell_ms` | 14 days |
-| `aggregates_daily` | `day, domain, key, count, dwell_ms` | 90 days |
 | `entities` | `id, domain, kind, label, taint, created_ns, last_seen_ns, permanent` | domain-dependent |
 | `edges` | `src, dst, kind, weight, reinforced_ns, hypothesis` | hypotheses: 72 h TTL unless reinforced |
-| `chunks_meta` | `chunk_id, entity_id, source, taint, token_count, created_ns` | follows entity |
 | `index_meta` | `collection, embedding_model_id, dim, index_kind, p99_ms, updated_ns` | permanent |
 | `schema_migrations` | `version, applied_ns` | permanent |
+
+D3: `aggregates_daily` and `chunks_meta` were in this table until migration
+`0004_drop_dead_tables`. Neither was ever written: chunk provenance is
+denormalised into `chunks_fts` and the LanceDB row, and `event_counters`
+answers what the daily rollup was meant to.
 
 **LanceDB tables**: one per domain family (`attention`, `work`, `knowledge`, `system`, `external`) with columns `chunk_id, entity_id, text, vector[384], taint, t_ns, domain`.
 
@@ -608,7 +611,7 @@ Start order (`After=`/`Wants=`): healthd → storage, inference → monitor, kno
 
 ### 12.5 Quality tooling
 
-`cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`, `cargo-audit`, `cargo-machete`, `clippy`, `rustfmt`, `clang-format`, `clang-tidy`, ASan/UBSan/TSan CMake presets, `gcovr`, `ruff`, `mypy --strict`, `pytest-cov`, `shellcheck`, `systemd-analyze security`, `markdownlint`.
+`cargo-nextest`, `cargo-llvm-cov`, `cargo-deny` (its `advisories` check replaces `cargo-audit`, which reads the same RustSec database — see rules.md §4.1), `cargo-machete`, `clippy`, `rustfmt`, `clang-format`, `clang-tidy`, ASan/UBSan/TSan CMake presets, `gcovr`, `ruff`, `mypy --strict`, `pytest-cov`, `shellcheck`, `systemd-analyze security`, `markdownlint`.
 
 ---
 

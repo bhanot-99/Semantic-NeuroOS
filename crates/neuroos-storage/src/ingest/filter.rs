@@ -200,8 +200,14 @@ impl IngestFilter {
 
     /// The last-known title for a still-open toplevel (`None` if it was
     /// never opened, was self-observation-excluded, or has since closed).
-    /// A domain adapter reads this after a dwell segment completes, since
-    /// that event (`StateChanged`) carries no title of its own.
+    ///
+    /// D2: this was public production API, but no adapter ever called it --
+    /// `last_segment_title` is what they use, since a completed dwell
+    /// segment needs the title shown *during* the segment, not the current
+    /// one. It survives as the tests' window onto `toplevel_titles`, which
+    /// is how the "a close clears the title" and "a retitle while unfocused
+    /// still updates it" invariants are observed.
+    #[cfg(test)]
     pub fn title_for(&self, toplevel_id: u64) -> Option<&str> {
         self.toplevel_titles.get(&toplevel_id).map(String::as_str)
     }

@@ -8,8 +8,6 @@ running `neuroos-storage`.
 
 from __future__ import annotations
 
-from neuroos_bg.ipc import Edge
-
 # FR-KNO-10.
 HYPOTHESIS_TTL_HOURS = 72
 NS_PER_HOUR = 3_600_000_000_000
@@ -21,10 +19,3 @@ def cutoff_ns(now_ns: int, ttl_ns: int = HYPOTHESIS_TTL_NS) -> int:
     `PruneEdges(older_than_ns=cutoff_ns(now))` deletes exactly those that
     are also still `hypothesis` (a confirmed edge is never pruned)."""
     return max(0, now_ns - ttl_ns)
-
-
-def is_stale(edge: Edge, now_ns: int, ttl_ns: int = HYPOTHESIS_TTL_NS) -> bool:
-    """Same rule as `cutoff_ns`, applied to one edge -- used by tests and by
-    the job loop's own dry-run logging, kept in lockstep with what C3 will
-    actually delete."""
-    return edge.hypothesis and edge.reinforced_ns < cutoff_ns(now_ns, ttl_ns)

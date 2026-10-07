@@ -4,7 +4,16 @@ all-features = false
 no-default-features = false
 
 [advisories]
-ignore = []
+# C6: `cargo deny check` runs all four checks, and `advisories` had never been
+# run in CI (only `bans licenses` were), so this was failing unnoticed.
+ignore = [
+    # `paste` is an unmaintained proc-macro with no reported vulnerability.
+    # It reaches us only through lance-bitpacking -> lance -> lancedb, three
+    # levels inside a vendored dependency we do not control, and a
+    # proc-macro contributes no code to the shipped binary. Revisit when
+    # lancedb drops it; there is nothing to patch locally in the meantime.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # rules.md §4 licence allowlist. GPL/LGPL/AGPL and non-commercial licences

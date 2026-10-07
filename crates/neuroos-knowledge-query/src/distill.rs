@@ -2,6 +2,7 @@
 //! asynchronous distillation job on C4's background lane that warms a
 //! cache for follow-up questions -- never blocking the current answer
 //! (rules.md AB-11: "hot paths must not block on slow work").
+use neuroos_common::sync::lock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,10 +52,6 @@ const MAX_PENDING_DISTILLATIONS: usize = 2;
 /// question added an entry (plus up to `DISTILL_MAX_TOKENS` of text) that
 /// nothing ever removed.
 const MAX_CACHE_ENTRIES: usize = 32;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// One cached distillation.
 #[derive(Debug, Clone, PartialEq)]

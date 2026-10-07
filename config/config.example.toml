@@ -1,4 +1,10 @@
-# example operator configuration, copy to config.toml
+# Example operator configuration -- copy to config.toml.
+#
+# C7: this file documents every section the strict parser in
+# crates/neuroos-common/src/config.rs accepts. That parser uses
+# `deny_unknown_fields`, so a key not listed here is a hard startup error, and
+# every section is optional (each falls back to the defaults shown).
+
 
 [monitor]
 # FR-MON-02: ext_idle_notify_v1 timeout before "idle" fires.
@@ -23,3 +29,37 @@ bus_capacity = 4096
 # [[monitor.folders]]
 # label = "notes"
 # path = "/home/user/Notes"
+
+# --- [healthd] (Phase 1, C8 `neuroos-healthd`) --------------------------------
+[healthd]
+# How often healthd polls every component's health socket.
+poll_interval_s = 30
+# Per-target deadline; a target that does not answer in time is DOWN.
+per_target_timeout_s = 1
+
+# Extra health-check targets beyond the built-in registry
+# (crates/neuroos-common/src/healthd_targets.rs). `budget_bytes` is the RSS
+# budget healthd reports DEGRADED against; `cgroup_path` is optional.
+# [[healthd.extra_targets]]
+# name = "my-component"
+# socket = "/run/user/1000/neuroos/my-component-health.sock"
+# budget_bytes = 104857600
+# cgroup_path = "/sys/fs/cgroup/user.slice/my-component.service"
+
+# --- [inference] (Phase 2, C4 `neuroos-inference`) ----------------------------
+# Read by the C++ daemon (cpp/neuroos-inference/src/config.cpp), not by Rust.
+[inference]
+# Defaults to <models_dir>/<the manifest's BitNet entry> when unset.
+# model_path = "/opt/neuroos/models/bitnet-b1.58-2B-4T/ggml-model-i2_s.gguf"
+# models/manifest.toml's sha256 for that file, verified again at load time.
+# model_sha256 = "..."
+threads = 8
+max_context_tokens = 512
+
+# --- [storage] (Phase 4/5, C3 `neuroos-storage`) ------------------------------
+[storage]
+# Architecture.md §8.2's Landlock read-only path for C3's embedding model and
+# ONNX Runtime. Override for dev (/opt/neuroos/models needs root to populate).
+models_dir = "/opt/neuroos/models"
+# Where C7 drops fetched documents; C3 ingests and removes them.
+spool_dir = "/var/spool/neuroos-fetcher"

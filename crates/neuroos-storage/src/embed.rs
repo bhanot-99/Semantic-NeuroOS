@@ -40,6 +40,13 @@ pub enum EmbedError {
         in_effect: PathBuf,
         requested: PathBuf,
     },
+    /// C5: the `spawn_blocking` worker that owns the embedder panicked.
+    /// Reported as an error rather than re-raised with
+    /// `std::panic::resume_unwind`, which rules.md §5 forbids outside test
+    /// code: a panic inside fastembed/ort must degrade this one ingest or
+    /// query, not take down C3's whole request loop.
+    #[error("the embedding worker panicked: {0}")]
+    WorkerPanicked(String),
 }
 
 /// The dylib this process has committed to (M16). `OnceLock`, not a plain
@@ -100,6 +107,7 @@ impl Embedder {
         // (Under `cargo test` several test binaries' threads share a
         // process; see tests/embedder_dylib_path.rs for why the
         // observable contract is tested in a process of its own.)
+        #[allow(unsafe_code)] // the one documented exception in this crate
         unsafe {
             std::env::set_var("ORT_DYLIB_PATH", onnxruntime_dylib);
         }
@@ -177,20 +185,7 @@ impl Embedder {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
-
-    fn dev_models_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-    }
-
-    fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-        // M16: a test is its own `main`, so it pins the ONNX Runtime
-        // dylib the way `main` does, before `Embedder::load` can be
-        // reached; harmless to repeat, an error only on a conflict.
-        let path =
-            dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-        let _ = Embedder::set_dylib_path(&path);
-        path
-    }
+    use crate::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 
     /// Live proof (P4-S03): loads the real downloaded model against the
     /// real fetched ONNX Runtime and embeds real sentences — needs

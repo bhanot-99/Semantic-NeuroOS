@@ -8,6 +8,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# C4: exposes src/test_support.rs (shared real-model fixtures) to other
+# crates' test binaries. Never enabled by the daemon build.
+test-support = []
+
 [dependencies]
 neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
 neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
@@ -30,7 +35,15 @@ notify = "6"
 tempfile = "3"
 
 [dev-dependencies]
+# C4: a self dev-dependency is how a crate turns on its own feature for its
+# own test binaries. Without it, tests/*.rs cannot see `test_support` (the
+# lib they link is built without `cfg(test)`), and it only appeared to work
+# because neuroos-knowledge-query enables the feature in a workspace build.
+neuroos-storage = { path = ".", features = ["test-support"] }
 rustix = { version = "1", features = ["process"] }
 proptest = "1"
 tempfile = "3"
+# C9 / AB-1 scope: test-only. tests/soak_replay.rs replays real C1
+# telemetry dumps through `neuroos_monitor::dump::DumpReader`, so the
+# gate runs against C1's actual on-disk format rather than a copy of it.
 neuroos-monitor = { path = "../neuroos-monitor", version = "0.1.0" }

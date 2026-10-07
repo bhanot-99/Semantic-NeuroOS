@@ -5,10 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neuroos_ipc::{
-    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, write_envelope_deadline,
-};
-use neuroos_proto::v1::{Envelope, PreambleRequest, envelope};
+use neuroos_ipc::{OnRestart, request_once};
+use neuroos_proto::v1::{PreambleRequest, envelope};
 
 /// rules.md §5.7: no voice.sock-specific deadline is named, so this uses
 /// the default "control call" budget (250 ms).
@@ -32,6 +30,19 @@ pub enum VoiceClientError {
     UnexpectedResponse,
 }
 
+/// C3: `request_once` reports the transport failures this enum already had
+/// variants for, so the mapping is one-to-one and every existing
+/// `VoiceClientError::Connect { .. }` match keeps working.
+impl From<neuroos_ipc::RequestError> for VoiceClientError {
+    fn from(e: neuroos_ipc::RequestError) -> Self {
+        match e {
+            neuroos_ipc::RequestError::Connect { path, source } => Self::Connect { path, source },
+            neuroos_ipc::RequestError::Framing(e) => Self::Io(e),
+            neuroos_ipc::RequestError::NoResponse => Self::NoResponse,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct VoiceClient {
     socket_path: PathBuf,
@@ -47,32 +58,17 @@ impl VoiceClient {
     /// soft): a failure here must not stop the answer itself from
     /// proceeding; callers decide whether to treat this as fatal.
     pub async fn request_preamble(&self, clip_id: &str) -> Result<(), VoiceClientError> {
-        let mut stream = connect_retrying(&self.socket_path, VOICE_REQUEST_DEADLINE)
-            .await
-            .map_err(|source| VoiceClientError::Connect {
-                path: self.socket_path.clone(),
-                source,
-            })?;
-        let request = Envelope {
-            schema_version: 1,
-            trace_id: String::new(),
-            request_id: 1,
-            sent_at_ns: neuroos_common::now_ns(),
-            body: Some(envelope::Body::Preamble(PreambleRequest {
+        // C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
+        let response = request_once(
+            &self.socket_path,
+            envelope::Body::Preamble(PreambleRequest {
                 clip_id: clip_id.to_string(),
-            })),
-        };
-        write_envelope_deadline(
-            &mut stream,
-            &request,
-            DEFAULT_MAX_FRAME,
+            }),
+            1,
             VOICE_REQUEST_DEADLINE,
+            OnRestart::Retry,
         )
         .await?;
-        let response =
-            read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, VOICE_REQUEST_DEADLINE)
-                .await?
-                .ok_or(VoiceClientError::NoResponse)?;
         match response.body {
             Some(envelope::Body::PreambleResponse(_)) => Ok(()),
             Some(envelope::Body::Error(e)) => Err(VoiceClientError::Remote(e.message)),

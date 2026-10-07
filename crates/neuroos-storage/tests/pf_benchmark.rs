@@ -12,30 +12,12 @@
 //! own search performance at scale, matching what "20,000 items" in the
 //! budget is actually about.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
-use std::path::{Path, PathBuf};
+use neuroos_storage::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 use std::time::Instant;
 
 use neuroos_health::Histogram;
 use neuroos_storage::embed::Embedder;
 use neuroos_storage::lance::{ChunkRecord, LanceStore};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn dev_models_dir() -> PathBuf {
-    repo_root().join(".dev-cache/models")
-}
-
-fn dev_onnxruntime_dylib() -> PathBuf {
-    // M16: a test is its own `main`, so it pins the ONNX Runtime
-    // dylib the way `main` does, before `Embedder::load` can be
-    // reached; harmless to repeat, an error only on a conflict.
-    let path =
-        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-    let _ = neuroos_storage::embed::Embedder::set_dylib_path(&path);
-    path
-}
 
 /// Deterministic pseudo-random unit-ish vector -- cheap, no RNG crate
 /// dependency needed for a synthetic benchmark corpus.

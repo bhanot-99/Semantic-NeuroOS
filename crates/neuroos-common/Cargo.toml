@@ -9,6 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# C1: safe getuid() wrapper, replacing a hand-rolled FFI block in 12 crates.
+rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 jiff = "0.2"

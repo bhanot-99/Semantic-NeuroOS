@@ -7,7 +7,7 @@ use std::time::Duration;
 use neuroos_taint::TaintFlags;
 
 use crate::assemble;
-use crate::deictic::{self, WindowContext};
+use crate::deictic;
 use crate::distill::{self, DistillationCache};
 use crate::evidence;
 use crate::inference_client::{InferenceClient, InferenceClientError};
@@ -53,23 +53,6 @@ pub enum AskError {
     Capability(#[from] KernelClientError),
 }
 
-/// FR-KNO-02: requests the preamble first and only *then* resolves deictic
-/// context. Ordering matters -- a preamble that starts after retrieval (or
-/// after the model has already begun replying) isn't a preamble; it's
-/// dead air. Kept as its own small function (not inlined into [`ask`]) so
-/// P5-S02's ordering proof (`tests/preamble_ordering.rs`) stays a fast,
-/// mock-only test that doesn't need real inference/kernel clients.
-pub async fn ask_context(
-    voice: &VoiceClient,
-    storage: &StorageClient,
-    t_speech_start_ns: u64,
-) -> Result<Option<WindowContext>, AskError> {
-    request_preamble(voice).await;
-    deictic::snap(storage, t_speech_start_ns)
-        .await
-        .map_err(AskError::FocusHistory)
-}
-
 /// H9 / rules.md §5.6 (fail soft): the preamble only masks latency, so a
 /// C2 that is down or slow must not stop the answer itself. The failure is
 /// logged (no user content in it) and the hot path carries on.
@@ -103,6 +86,16 @@ pub struct AskResult {
 /// capability check, and a real C4 generation. `distill_cache` warms
 /// (FR-KNO-05) whenever the raw evidence is large -- see
 /// [`crate::distill`] -- and is never awaited by this function itself.
+/// FR-KNO-02 / Architecture.md §6.1's hot-path sequence: the preamble is
+/// requested first and only *then* is any retrieval work started. Ordering
+/// matters -- a preamble that starts after retrieval (or after the model has
+/// begun replying) isn't a preamble, it's dead air.
+///
+/// D2: there used to be an `ask_context` beside this function with the same
+/// preamble-then-snap body, existing only so `tests/preamble_ordering.rs`
+/// could prove the ordering without inference/kernel clients. Because `ask`
+/// kept its own inline copy, that proof never covered this code path. The
+/// duplicate is gone and the test drives `ask` directly.
 pub async fn ask(
     voice: &VoiceClient,
     storage: &StorageClient,

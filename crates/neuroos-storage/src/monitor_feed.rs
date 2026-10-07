@@ -77,10 +77,7 @@ mod tests {
     };
 
     use super::*;
-
-    fn dev_models_dir() -> PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-    }
+    use crate::test_support::dev_models_dir;
 
     /// One promoted focus session (6 s > the 5 s gate) for `app_id`.
     fn session(toplevel_id: u64, app_id: &str, start_ns: u64) -> Vec<Envelope> {

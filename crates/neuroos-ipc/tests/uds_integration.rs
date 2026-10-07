@@ -31,7 +31,7 @@ fn fixture_envelope() -> Envelope {
 async fn echo_over_real_uds_socket() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("echo.sock");
-    let my_uid = unsafe { libc_getuid() };
+    let my_uid = neuroos_common::current_uid();
 
     let server = UdsServer::bind(UdsServerConfig::new(&sock_path, vec![my_uid])).unwrap();
     let server_task = tokio::spawn(async move {
@@ -69,7 +69,7 @@ async fn echo_over_real_uds_socket() {
 async fn client_reconnects_after_server_restart() {
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("restart.sock");
-    let my_uid = unsafe { libc_getuid() };
+    let my_uid = neuroos_common::current_uid();
 
     // Client starts trying before the server exists at all.
     let sock_path_for_client = sock_path.clone();
@@ -87,13 +87,4 @@ async fn client_reconnects_after_server_restart() {
         .unwrap();
     assert!(client_result.is_ok());
     assert!(accept_task.await.unwrap().unwrap().is_some());
-}
-
-/// # Safety
-/// `getuid()` takes no arguments and cannot fail.
-unsafe fn libc_getuid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
 }

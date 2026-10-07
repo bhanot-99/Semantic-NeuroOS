@@ -11,4 +11,4 @@ add_library(neuroos-voice STATIC
     src/playback.cpp
     src/bargein.cpp
 )
-target_link_libraries(neuroos-voice PRIVATE libneuroos)
+target_link_libraries(neuroos-voice PRIVATE libneuroos neuroos-warnings)

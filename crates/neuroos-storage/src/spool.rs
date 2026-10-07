@@ -297,6 +297,7 @@ pub async fn watch_forever(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+    use crate::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 
     fn write_doc(dir: &Path, doc_id: &str, text: &str) -> PathBuf {
         let path = dir.join(format!("{doc_id}.json"));
@@ -467,20 +468,6 @@ mod tests {
         let err = parse_spool_file(&path).unwrap_err();
         assert!(matches!(err, SpoolError::Parse { .. }));
         assert!(path.exists(), "a malformed spool file must not be deleted");
-    }
-
-    fn dev_models_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-    }
-
-    fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-        // M16: a test is its own `main`, so it pins the ONNX Runtime
-        // dylib the way `main` does, before `Embedder::load` can be
-        // reached; harmless to repeat, an error only on a conflict.
-        let path =
-            dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-        let _ = crate::embed::Embedder::set_dylib_path(&path);
-        path
     }
 
     /// M14: `ingest_existing` used `?`, so the first unusable file (a

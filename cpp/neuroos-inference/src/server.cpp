@@ -139,9 +139,13 @@ void handle_distill(const neuroos::v1::DistillRequest& req, neuroos::v1::Envelop
 
 // L2: `conn` owns the fd and the server's connection slot, and frees both
 // when this thread ends (see neuroos::ipc::Connection).
-void handle_connection(neuroos::ipc::Connection conn, std::shared_ptr<Model> model,
-                       LaneScheduler& lanes, RingRegistry& rings, std::uint32_t max_context_tokens,
-                       neuroos::health::HealthServer& health) {
+// `model` is taken by value deliberately: this runs on a detached thread that
+// outlives `serve`'s frame, so it needs its own owning shared_ptr rather than a
+// reference into one.
+void handle_connection(neuroos::ipc::Connection conn,
+                       // NOLINTNEXTLINE(performance-unnecessary-value-param)
+                       std::shared_ptr<Model> model, LaneScheduler& lanes, RingRegistry& rings,
+                       std::uint32_t max_context_tokens, neuroos::health::HealthServer& health) {
     const int fd = conn.fd();
     for (;;) {
         // A read that times out (SO_RCVTIMEO, armed by accept) reports an
@@ -214,7 +218,7 @@ void handle_connection(neuroos::ipc::Connection conn, std::shared_ptr<Model> mod
             break;
         }
 
-        bool wrote;
+        bool wrote = false;
         if (fd_to_send >= 0) {
             wrote = static_cast<bool>(neuroos::ipc::write_envelope_with_fd(
                 fd, resp, neuroos::ipc::kDefaultMaxFrame, fd_to_send));
@@ -230,7 +234,10 @@ void handle_connection(neuroos::ipc::Connection conn, std::shared_ptr<Model> mod
 
 } // namespace
 
+// Each detached connection thread gets its own copy of `model`, so `serve`
+// has to own one to copy from.
 void serve(const std::string& socket_path, std::vector<std::uint32_t> allowed_uids,
+           // NOLINTNEXTLINE(performance-unnecessary-value-param)
            std::shared_ptr<Model> model, LaneScheduler& lanes, RingRegistry& rings,
            std::uint32_t max_context_tokens, neuroos::health::HealthServer& health) {
     auto server = neuroos::ipc::UdsServer::bind(socket_path, std::move(allowed_uids));

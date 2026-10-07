@@ -34,7 +34,19 @@ const SLOT_FLAGS_OFF: usize = 28;
 const SLOT_UTF8_LEN_OFF: usize = 30;
 const SLOT_PAYLOAD_OFF: usize = 32;
 
+/// Terminal slot: the generation ended normally.
 pub const FLAG_EOS: u16 = 1 << 0;
+/// Terminal slot: the generation was cancelled (H8 sets `FLAG_EOS |
+/// FLAG_CANCEL` together, so a reader that waits only on `FLAG_EOS` still
+/// terminates).
+///
+/// D2 listed this as dead code because no Rust code reads it. It is not
+/// removable: it is one half of the shm slot's wire contract with C4, whose
+/// `neuroos::shm::kFlagCancel` (cpp/libneuroos/include/libneuroos/shm_ring.hpp)
+/// writes this exact bit. Dropping the Rust side would leave the layout
+/// documented in only one language. Both sides now pin the literal wire
+/// values -- `static_assert` there, `wire_flag_values_are_pinned` here -- so
+/// a renumbering on either side fails its own build.
 pub const FLAG_CANCEL: u16 = 1 << 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -469,6 +481,17 @@ mod tests {
 
     fn payloads(mut reader: RingReader<'_>) -> Vec<Vec<u8>> {
         std::iter::from_fn(|| reader.try_read().map(|p| p.payload)).collect()
+    }
+
+    /// D2: the slot flags are a wire contract with C4's C++ side, which
+    /// pins the same two literals with `static_assert`
+    /// (cpp/libneuroos/include/libneuroos/shm_ring.hpp). FLAG_CANCEL has no
+    /// Rust reader, so this assertion is the only thing that would catch a
+    /// renumbering here.
+    #[test]
+    fn wire_flag_values_are_pinned() {
+        assert_eq!(FLAG_EOS, 1, "must match C++ kFlagEos");
+        assert_eq!(FLAG_CANCEL, 2, "must match C++ kFlagCancel");
     }
 
     /// M1: a zero-capacity ring would divide by zero in `write_as` /

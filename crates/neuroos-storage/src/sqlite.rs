@@ -1,6 +1,6 @@
 //! `meta.sqlite3` (Architecture.md §7.2): WAL mode, `synchronous=NORMAL`,
 //! single writer (this process). Owns `focus_history`, `event_counters`,
-//! `aggregates_daily`, `entities`, `edges`, `chunks_meta`, `index_meta`.
+//! `entities`, `edges`, `index_meta`.
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
@@ -20,6 +20,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_entities_unique",
         include_str!("migrations/0003_entities_unique.sql"),
+    ),
+    // D3: `chunks_meta` and `aggregates_daily` were never written by
+    // anything; see the migration's own comment.
+    (
+        "0004_drop_dead_tables",
+        include_str!("migrations/0004_drop_dead_tables.sql"),
     ),
 ];
 
@@ -481,11 +487,9 @@ pub fn forget_since(conn: &Connection, since_ns: u64) -> Result<Vec<i64>, Storag
 /// first: their foreign keys would otherwise reject the entity delete.
 pub(crate) fn delete_entities(conn: &Connection, entity_ids: &[i64]) -> Result<(), StorageError> {
     let mut edges = conn.prepare("DELETE FROM edges WHERE src = ?1 OR dst = ?1")?;
-    let mut meta = conn.prepare("DELETE FROM chunks_meta WHERE entity_id = ?1")?;
     let mut entities = conn.prepare("DELETE FROM entities WHERE id = ?1")?;
     for id in entity_ids {
         edges.execute([id])?;
-        meta.execute([id])?;
         entities.execute([id])?;
     }
     delete_chunks_fts(conn, entity_ids)
@@ -938,7 +942,12 @@ mod tests {
         )
         .unwrap();
 
-        apply_migrations(&conn, MIGRATIONS).expect("0003 must survive existing duplicates");
+        // D3: run the chain only as far as 0003. `chunks_meta` is dropped by
+        // 0004, and the repoint 0003 performs on it is still the behaviour
+        // under test for any database written before either migration.
+        let through_0003 = &MIGRATIONS[..3];
+        assert_eq!(through_0003[2].0, "0003_entities_unique");
+        apply_migrations(&conn, through_0003).expect("0003 must survive existing duplicates");
 
         // One row left for the pair, and it is the lowest id.
         let ids: Vec<i64> = collect_ids(
@@ -974,6 +983,52 @@ mod tests {
             .query_row("SELECT entity_id FROM chunks_fts", (), |r| r.get(0))
             .unwrap();
         assert_eq!(fts_owner, 1);
+    }
+
+    /// D3: the full chain drops both never-written tables, and does so on a
+    /// database that already had rows in them (the pre-0004 case).
+    #[test]
+    fn migration_0004_drops_the_never_written_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&conn, &MIGRATIONS[..3]).unwrap();
+
+        // Both tables exist before 0004, and chunks_meta can hold rows.
+        conn.execute(
+            "INSERT INTO entities (id, domain, kind, label, taint, created_ns, last_seen_ns, permanent)
+             VALUES (1, 'window_focus', 'window', 'firefox', 0, 10, 20, 0)",
+            (),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks_meta (chunk_id, entity_id, source, taint, token_count, created_ns)
+             VALUES ('c1', 1, 'window_focus', 0, 4, 300)",
+            (),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO aggregates_daily (day, domain, key, count, dwell_ms)
+             VALUES ('2026-10-06', 'window_focus', 'firefox', 1, 10)",
+            (),
+        )
+        .unwrap();
+
+        apply_migrations(&conn, MIGRATIONS).expect("0004 must apply over existing rows");
+
+        for table in ["chunks_meta", "aggregates_daily"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "{table} must be gone after 0004");
+        }
+        // The entity itself is untouched.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", (), |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     /// L13: the index `upsert_entity` always assumed now exists, so a

@@ -692,7 +692,7 @@ gantt
 | Level | Tests |
 | :--- | :--- |
 | AT | Fresh Pop!_OS 24.04 VM: install from `.deb`, run acceptance script, uninstall with purge → no files left (`find` evidence). |
-| SC | Final `cargo audit`/`deny`, dependency review, threat model sign-off. |
+| SC | Final `cargo deny check` (all four checks), dependency review, threat model sign-off. |
 | IT | Upgrade path: v1.0.0-rc → v1.0.0 keeps data and config. |
 
 ### 13.4 Exit criteria
