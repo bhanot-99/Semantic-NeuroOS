@@ -97,35 +97,30 @@ deadline failure is a separate engineering defect, not a quality verdict.**
 
 ## 🟠 Open engineering work
 
-### 3. BUG-006 is NOT fixed: the first ~21 C3 queries blow the 100 ms deadline
+### 3. An HNSW index never covers rows added after it was built
 
-Reopened 2026-10-07. BUG-006 was closed on the theory that unbounded concurrent
-distillation starved the CPU, and `MAX_CONCURRENT_DISTILLATIONS = 1`
-(`distill.rs:33`) was the fix. The symptom is unchanged in magnitude: BUG-006
-was recorded as "~20/51 questions", and the 2026-10-07 re-run fails **21/59**
-with `storage.sock request failed: read deadline exceeded`.
+Found while building ADR-0015's probe, and the reason the probe's first
+version made BUG-006 *worse* (all 45 queries over deadline instead of 5): a
+probe fired mid-burst promoted a family on a few hundred rows, built an index
+over that prefix, and — because `LanceStore::promoted` is a one-shot in-memory
+flag and nothing reindexes on growth — left the family permanently marked
+"indexed" with ~95% of its rows outside the index, every query back to a flat
+scan with nothing able to trigger a rebuild.
 
-What is new and makes the old root cause doubtful:
+ADR-0015 sidesteps it by only probing once ingest settles, so the index is
+built over the whole corpus. **The gap itself is untouched.** C3 ingests
+telemetry continuously, so any promotion is a snapshot and rows keep arriving
+outside it. What is not known is how fast that matters in practice — whether
+LanceDB's own scan of unindexed fragments alongside the index is fast enough
+that it never shows, or whether C3 needs periodic reindexing (`optimize` with
+an index action, on the existing maintenance cadence) to hold its latency.
 
-- The failures are **contiguous from question 1** through 21 (plus Q23), then
-  stop for the remaining 36 questions. A distillation backlog would build up
-  over the first few questions, not be worst at the very first one; D-19's note
-  explicitly records that "the very first call alone reliably succeeds".
-- Lifting the deadline to 30 s makes **all** of them pass (0 errors, 48/59 and
-  11/15). So it is purely latency, never a hang, an error or a wrong result.
-
-Front-loaded latency that decays suggests a **warm-up cost that amortises** —
-most plausibly LanceDB fragmentation from the 6103-event ingest burst, with the
-background compaction added for BUG-007 (every 256 inserts) only catching up
-around query ~21. That is a hypothesis, not a diagnosis; it has not been
-measured. The competing explanation is still CPU contention from background
-distillation decodes.
-
-**Why it matters beyond KPI-1:** this is a real user-facing defect, not a test
-artifact. After any burst of ingest, roughly the first 20 questions a user asks
-return a degraded "I couldn't retrieve evidence" answer. Needs its own
-systematic-debugging session: instrument real C3 query latency per query index,
-then fix the cause rather than the deadline.
+**This is also the most plausible explanation yet for the question BUG-002 left
+open** — why HNSW did not beat flat scan in the 20k synthetic benchmark, when
+on the real corpus here it beats it threefold (~150 ms → ~50 ms). That
+benchmark inserts its 20,000 rows and promotes partway through, which is
+exactly the prefix-index situation. Worth measuring before anyone re-opens
+BUG-002 on its own terms.
 
 ### 4. M10: the distillation cache is written but never read
 
@@ -152,6 +147,45 @@ now because it re-embeds the whole store and changes retrieval behaviour, and
 KPI-1 is currently awaiting grading against the retrieval quality the f32 model
 produces. Revisit once that grading is done. ADR-0014 also records a second,
 smaller option: dropping the transient load-time copy (peak only, ~95 MiB).
+
+---
+
+## ✅ Fixed
+
+### ~~BUG-006: the first ~21 C3 queries blow the 100 ms deadline~~ — **fixed 2026-10-07**
+
+Root cause was **not** the distillation pile-up BUG-006 was originally closed
+against. `MIN_SAMPLES_BEFORE_PROMOTION_CHECK = 20` stopped HNSW promotion from
+firing until a family had served 20 queries, while flat scan over a real
+~6,100-event corpus costs ~150 ms — so the first 20 queries against any fresh
+store necessarily missed C5's 100 ms deadline, and the 21st finally promoted.
+
+Separated from the old theory by two measurements: it reproduces with
+distillation absent entirely (direct `query_hybrid` loop, no socket, no C4),
+and it is query-count-driven rather than time-driven (45 s of settling changed
+nothing). Dropping the floor to 2 moved the recovery point from query 24 to 6.
+
+Fixed by letting one sample past 100 ms promote on its own, with the floor kept
+for borderline cases — **ADR-0015**. FR-STO-07 is unchanged: promotion is still
+decided by measured p99 over 5 ms, never by item count.
+
+| | Before | After |
+| :--- | :--- | :--- |
+| Queries over deadline (45-query isolation test) | 24 | 5 |
+| KPI-1 tuned (59) at the real deadline | 31/59 | **46/59** |
+| KPI-1 held-out (15) at the real deadline | 0/15 | **9/15** |
+
+A second change then removed the remaining five: C3 now probes its own latency
+in the background once a family has gone 500 ms without an insert, so the index
+is built before a question arrives rather than by it. Measured on the same
+recording: **0 of 45 queries over the deadline** when anything at all happens
+between data landing and the first question (the real-world case — telemetry
+events are seconds apart, so the quiet window is reached constantly), and
+unchanged at 4–5 when asked in the very same instant ingest stops. `kpi1_eval`
+is the latter, so **KPI-1's own numbers are unchanged by the probe** (46/59
+before, 45/59 after, run-to-run noise).
+
+Guarded by `crates/neuroos-storage/tests/bug006_query_latency_after_ingest_burst.rs`.
 
 ---
 
@@ -188,6 +222,7 @@ reopen them.
 | `deny.toml` ignores **RUSTSEC-2024-0436** (`paste` unmaintained; a proc-macro three levels inside vendored lancedb, no vulnerability, nothing to patch locally) | lancedb drops `paste`, or the advisory becomes a vulnerability |
 | **C10**: `cpp/neuroos-inference/CMakeLists.txt` writes `bitnet-lut-kernels.h` into the bitnet.cpp submodule worktree. Cannot be relocated — ggml lists it by a fixed relative path in `add_library` and CMake hard-errors on a missing source. `.gitmodules` sets `ignore = untracked` so it cannot show as a dirty tree | upstream makes the header optional, or the pin moves |
 | **C3**: C5a's `inference_client` is the one request site not on `neuroos_ipc::request_once` — it owns its stream across a whole streaming exchange, so it is not a request/response call | it stops being a streaming client |
+| `attention.lance` held **680 data files** after a 6,100-event ingest burst, unchanged after 45 s of settling (measured during the BUG-006 work, ADR-0015). Possibly just uncleaned old LanceDB versions rather than live fragments — not measured either way. Also a candidate explanation for BUG-002's open question, since HNSW beat flat scan threefold here (~150 → ~50 ms) but not in the 20k synthetic benchmark | someone measures live fragment count vs files on disk, or BUG-002's question is reopened |
 | **OQ-01** (PRD §13): final wake phrase, defaulting to openWakeWord's stock "hey jarvis" (already in `models/manifest.toml`) | Phase 6 — it is a Phase 6 exit criterion |
 
 ---

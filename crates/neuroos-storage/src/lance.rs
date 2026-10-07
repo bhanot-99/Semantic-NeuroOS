@@ -31,12 +31,61 @@ const HNSW_PROMOTION_P99_THRESHOLD: Duration = Duration::from_millis(5);
 /// p99 estimate to mean anything.
 const MIN_SAMPLES_BEFORE_PROMOTION_CHECK: u64 = 20;
 
+/// BUG-006: one query slower than this promotes on its own, without
+/// waiting for the sample floor above.
+///
+/// The floor exists so a *borderline* p99 (just over the 5 ms threshold)
+/// isn't decided by one outlier. It was never meant to delay an obvious
+/// case, but that is what it did: flat scan over a real ~6,100-event
+/// corpus measures ~150 ms, 30x the threshold, so every query until the
+/// floor was reached missed C5's own 100 ms query deadline (rules.md
+/// §5.7) and came back as a degraded "couldn't retrieve evidence" answer.
+/// Measured on this machine's own recording: 21 of 59 real questions
+/// failed, contiguously from the first one, and the curve was identical
+/// after letting the store settle for 45 s — so it was the floor, not a
+/// warm-up or a compaction backlog.
+///
+/// 100 ms is C3's own copy of that deadline (C3 must not depend on C5a,
+/// AB-1). A sample past it is not noise relative to a 5 ms threshold, and
+/// the asymmetry is stark: promoting one family early costs a background
+/// index build that only ever makes queries faster, while promoting late
+/// costs the user ~20 unanswered questions. FR-STO-07 is still honoured —
+/// promotion is decided by measured p99 exceeding 5 ms, never by item
+/// count; this only changes how long C3 waits before believing its own
+/// measurement.
+const PROMOTE_IMMEDIATELY_ABOVE: Duration = Duration::from_millis(100);
+
 /// BUG-007(c): a family is compacted in the background after this many
 /// `insert` calls. Telemetry ingest adds one row (one fragment) per call;
 /// at a measured ~6,100 events/3 h, waiting for the 6-hourly backup left
 /// thousands of fragments and 140-250 ms flat scans. Compacting every 256
 /// inserts keeps queries at ~20-40 ms for ~0.3 s of off-path work.
 const COMPACT_EVERY_INSERTS: u64 = 256;
+
+/// ADR-0015: how long a family must go without an insert before C3 probes
+/// its own search latency.
+///
+/// Promotion is driven by *measured* p99 (FR-STO-07), so something has to
+/// do the measuring. Left to user queries alone, the first question after a
+/// fresh store's data lands is necessarily the slow one that discovers the
+/// problem, and the next few overlap the index build it triggers --
+/// measured as 5 of 45 real questions missing C5's deadline even after
+/// promotion was allowed to fire on one slow sample.
+///
+/// **Why a quiet period and not an insert count.** The first attempt probed
+/// every `COMPACT_EVERY_INSERTS` inserts, and made things strictly worse:
+/// all 45 queries missed the deadline instead of 5. A probe 256 inserts
+/// into a 6,100-event burst measures a corpus that is still small, promotes
+/// on it, and builds an index over that prefix -- and an HNSW index does
+/// not cover rows added after it is built, while `promoted` is a one-shot
+/// flag, so the family was permanently marked "indexed" with ~95% of its
+/// rows outside the index and every query back to a flat scan. Waiting for
+/// ingest to settle means the index is built over the whole corpus.
+///
+/// This is not an item-count promotion threshold (FR-STO-07 forbids those):
+/// it only decides when to *measure*, and a probe that comes back fast
+/// promotes nothing.
+const PROBE_QUIET_PERIOD: Duration = Duration::from_millis(500);
 
 /// `bge-small-en-v1.5`'s output width (matches `embed::EMBEDDING_DIM`; kept
 /// separate so this module has no compile-time dependency on `embed`).
@@ -229,6 +278,13 @@ pub struct LanceStore {
     promoted: Arc<Mutex<HashSet<String>>>,
     /// BUG-007(c): `insert` calls per family since its last compaction.
     inserts_since_compact: Mutex<HashMap<String, u64>>,
+    /// ADR-0015: when each family last took an insert, so a latency probe
+    /// can wait for ingest to settle instead of measuring a corpus that is
+    /// still growing (which promoted on a prefix and made BUG-006 worse).
+    last_insert: Mutex<HashMap<String, Instant>>,
+    /// Families with a latency probe pending, so an ingest burst schedules
+    /// one waiting probe rather than one per insert.
+    probing: Arc<Mutex<HashSet<String>>>,
     /// Families with a background compaction in flight, so a burst of
     /// inserts doesn't stack up concurrent compactions of the same table.
     compacting: Arc<Mutex<HashSet<String>>>,
@@ -258,6 +314,8 @@ impl LanceStore {
             query_latencies: Mutex::new(HashMap::new()),
             promoted: Arc::new(Mutex::new(HashSet::new())),
             inserts_since_compact: Mutex::new(HashMap::new()),
+            last_insert: Mutex::new(HashMap::new()),
+            probing: Arc::new(Mutex::new(HashSet::new())),
             compacting: Arc::new(Mutex::new(HashSet::new())),
             maintenance: FAMILIES
                 .iter()
@@ -355,6 +413,55 @@ impl LanceStore {
         Ok(())
     }
 
+    /// ADR-0015: after enough inserts into an un-indexed family, queries
+    /// that family once in the background so its own search latency is
+    /// measured before a user's question has to measure it for them.
+    ///
+    /// The probe is a real [`Self::query`] call, so it feeds the same
+    /// histogram and the same promotion decision a user query would — there
+    /// is deliberately no separate "probe" path whose timings could drift
+    /// from the real one. Detached, like compaction and the index build
+    /// (rules.md AB-11): ingest latency is never traded for query latency.
+    ///
+    /// Does nothing once the family is promoted, and holds a per-family
+    /// guard so an ingest burst cannot stack up concurrent self-queries.
+    pub fn maybe_spawn_latency_probe(self: &Arc<Self>, family: &str) {
+        if lock(&self.promoted).contains(family) {
+            return;
+        }
+        lock(&self.last_insert).insert(family.to_string(), Instant::now());
+        // One pending probe per family: the task below waits out the burst
+        // rather than one task being spawned per insert.
+        if !lock(&self.probing).insert(family.to_string()) {
+            return;
+        }
+        let me = Arc::clone(self);
+        let family = family.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PROBE_QUIET_PERIOD).await;
+                let settled = lock(&me.last_insert)
+                    .get(&family)
+                    .is_some_and(|last| last.elapsed() >= PROBE_QUIET_PERIOD);
+                if settled {
+                    break;
+                }
+            }
+            // The vector's contents are irrelevant: a flat scan compares
+            // against every row whatever it is given, so any fixed vector
+            // measures the cost the next real query would pay. `top_k` is 1
+            // to keep the probe's own result-decoding cost minimal. Going
+            // through `query` on purpose -- the probe must feed the same
+            // histogram and the same promotion decision a user query would,
+            // with no separate path whose timings could drift from it.
+            let probe = vec![1.0_f32; EMBEDDING_DIM as usize];
+            if let Err(err) = me.query(&family, &probe, 1).await {
+                tracing::debug!(family, error = %err, "ADR-0015: latency probe did not complete");
+            }
+            lock(&me.probing).remove(&family);
+        });
+    }
+
     /// FR-STO-05: exact (flat) nearest-neighbor search within one family,
     /// unless FR-STO-07's HNSW promotion has already fired for it (P4-S05)
     /// — LanceDB transparently uses whatever index exists on the `vector`
@@ -416,7 +523,11 @@ impl LanceStore {
             h.record(elapsed);
             h.to_proto()
         };
-        if hist.count < MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
+        // BUG-006: the sample floor applies only to borderline cases. A
+        // single query past `PROMOTE_IMMEDIATELY_ABOVE` is already decisive,
+        // and waiting out the floor is what made the first ~20 queries
+        // against a fresh store fail. The p99 check below still decides.
+        if elapsed <= PROMOTE_IMMEDIATELY_ABOVE && hist.count < MIN_SAMPLES_BEFORE_PROMOTION_CHECK {
             return false;
         }
         let Some(p99) = p99_ns(&hist) else {
@@ -870,6 +981,38 @@ mod tests {
         assert!(!store.is_promoted("attention"));
     }
 
+    // BUG-006: the sample floor above is what made the first ~20 real
+    // queries against a fresh store miss C5's 100 ms deadline -- flat scan
+    // on a real ~6,100-event corpus measures ~150 ms, so every query before
+    // the floor was reached failed, and the 21st finally promoted. A single
+    // sample that far over a 5 ms threshold is not noise, so it promotes on
+    // its own.
+    #[tokio::test]
+    async fn one_sample_over_the_query_deadline_promotes_without_waiting_for_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        assert!(
+            store.record_query_latency(
+                "attention",
+                PROMOTE_IMMEDIATELY_ABOVE + Duration::from_millis(1)
+            ),
+            "one query past the deadline should promote on the first sample"
+        );
+        assert!(store.is_promoted("attention"));
+    }
+
+    // The flip side, and why the floor still exists: a borderline sample
+    // (over 5 ms but inside the deadline) must still wait for enough
+    // samples to make a p99 meaningful, so one slow outlier can't promote
+    // a family that is actually fine.
+    #[tokio::test]
+    async fn one_borderline_sample_still_waits_for_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        assert!(!store.record_query_latency("attention", Duration::from_millis(50)));
+        assert!(!store.is_promoted("attention"));
+    }
+
     #[tokio::test]
     async fn p99_above_threshold_reports_promotion_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -975,6 +1118,76 @@ mod tests {
             fragments < COMPACT_EVERY_INSERTS as usize,
             "expected background compaction, still {fragments} fragments"
         );
+    }
+
+    /// ADR-0015: the probe exists so C3 measures its own search latency
+    /// *before* a user's first question, instead of learning it from that
+    /// question failing. Driven off insert volume (the thing that changes
+    /// search cost), it must eventually record a real sample of its own.
+    #[tokio::test]
+    async fn an_ingest_burst_makes_the_store_probe_its_own_latency_once_it_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LanceStore::open(dir.path()).await.unwrap());
+        store
+            .insert(
+                "attention",
+                &[chunk("c0", vec![1.0; EMBEDDING_DIM as usize])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_samples(&store, "attention"),
+            0,
+            "nothing has queried this family yet"
+        );
+
+        store.maybe_spawn_latency_probe("attention");
+
+        let mut samples = 0;
+        for _ in 0..100 {
+            samples = recorded_samples(&store, "attention");
+            if samples > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            samples > 0,
+            "an ingest burst should have produced a background latency probe, got {samples} samples"
+        );
+    }
+
+    /// A probe must not fire on a family that is already indexed -- there is
+    /// nothing left to learn, and it would be pure background cost.
+    #[tokio::test]
+    async fn a_promoted_family_is_never_probed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LanceStore::open(dir.path()).await.unwrap());
+        store
+            .insert(
+                "attention",
+                &[chunk("c0", vec![1.0; EMBEDDING_DIM as usize])],
+            )
+            .await
+            .unwrap();
+        lock(&store.promoted).insert("attention".to_owned());
+
+        for _ in 0..8 {
+            store.maybe_spawn_latency_probe("attention");
+        }
+        tokio::time::sleep(PROBE_QUIET_PERIOD * 3).await;
+        assert_eq!(
+            recorded_samples(&store, "attention"),
+            0,
+            "a promoted family should never be probed"
+        );
+    }
+
+    /// Latency samples recorded for `family` so far.
+    fn recorded_samples(store: &LanceStore, family: &str) -> u64 {
+        lock(&store.query_latencies)
+            .get(family)
+            .map_or(0, |h| h.to_proto().count)
     }
 
     /// Whether any file under `dir` contains `needle` byte-for-byte.

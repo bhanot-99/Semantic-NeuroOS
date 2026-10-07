@@ -158,6 +158,12 @@ impl StorageEngine {
         self.lance
             .insert(chunk.family, std::slice::from_ref(&record))
             .await?;
+        // ADR-0015: ingest is what makes a family slow to scan, so it is
+        // also what should trigger C3 measuring its own search latency --
+        // off-task, and only until the family is indexed. Without this the
+        // first real question after a burst is the one that discovers the
+        // store got slow, and pays for it (BUG-006).
+        self.lance.maybe_spawn_latency_probe(chunk.family);
         // M15: the vector is in LanceDB now; the keyword row and
         // `index_meta` (FR-STO-11: which model produced this family's
         // vectors, so a *future* `Embedder::model_id()` change has
