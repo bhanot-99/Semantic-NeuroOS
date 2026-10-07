@@ -1,11 +1,52 @@
-# C++ static analysis rules
+# C++ static analysis rules. rules.md §7 says warnings are errors, so
+# WarningsAsErrors is on and the check list below is the whole contract: a
+# check is either enforced or disabled here with a reason, never left to
+# produce warnings nobody acts on.
+#
+# C6: HeaderFilterRegex used to be `.*/(cpp)/.*`, which matched
+# cpp/build/proto-gen. protoc's generated headers alone produce ~11,800
+# findings, which is why this lint was unusable and WarningsAsErrors was
+# empty. It is now limited to our own headers.
 Checks: >
   bugprone-*,
   cert-*,
   cppcoreguidelines-*,
   performance-*,
   -cppcoreguidelines-avoid-magic-numbers,
-  -cppcoreguidelines-pro-bounds-pointer-arithmetic
-WarningsAsErrors: ''
-HeaderFilterRegex: '.*/(cpp)/.*'
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -bugprone-unchecked-optional-access,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-type-vararg,
+  -performance-enum-size
+
+# Why each of the above is off:
+#
+#   bugprone-unchecked-optional-access
+#       Cannot see through `Expected<std::optional<T>>`: every hit is a
+#       `std::optional` already guarded by `if (!x.value().has_value())`
+#       one line earlier (framing.cpp, health_server.cpp, server.cpp).
+#   bugprone-easily-swappable-parameters
+#       Style, not a defect. Flags `(fd, len)`-shaped syscall wrappers.
+#   cppcoreguidelines-avoid-c-arrays
+#       Required by the kernel ABIs this code talks to: `struct cmsghdr`
+#       payloads, `sockaddr_un::sun_path`, Landlock rule structs.
+#   cppcoreguidelines-pro-bounds-array-to-pointer-decay
+#   cppcoreguidelines-pro-bounds-constant-array-index
+#       Unavoidable when passing those same buffers to read/write/sendmsg.
+#   cppcoreguidelines-pro-type-reinterpret-cast
+#       The shm ring and the length-prefixed framing are byte-level by
+#       definition (libneuroos/src/shm.cpp, framing.cpp).
+#   cppcoreguidelines-pro-type-union-access
+#       `union { cmsghdr; char buf[]; }` is the documented SCM_RIGHTS idiom.
+#   cppcoreguidelines-pro-type-vararg
+#       open/fcntl/ioctl/prctl are variadic in libc.
+#   performance-enum-size
+#       Flags protoc-generated `enum : int`, which we do not control.
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/cpp/(libneuroos/(include|src)|neuroos-inference/src|neuroos-voice/src)/.*'
 FormatStyle: file

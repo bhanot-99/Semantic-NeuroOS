@@ -649,7 +649,7 @@ gantt
 | E2E | UJ-1…UJ-4 automated; end-of-speech → first answer audio measured (NFR-PERF-02). |
 | SC | Egress proof (0 bytes from isolated units); full injection + SSRF corpora on the integrated system; `systemd-analyze security` scores. |
 | FI | Chaos: kill each unit in turn during a query; restart storms; disk-full; model file removed. |
-| PF | Full latency table re-measured; total RSS ≤ 2,340 MiB; idle CPU ≤ 3%. |
+| PF | Full latency table re-measured; total RSS ≤ 2,475 MiB (PRD §6.2, raised in ADR-0014); idle CPU ≤ 3%. |
 | **Soak** | **24 h: RSS growth < 5%, p99 drift < 10%, 0 crashes, backups and GC ran, audit chain valid.** |
 | AT | Owner runs the acceptance script (all P0 features) and signs off. |
 
@@ -692,7 +692,7 @@ gantt
 | Level | Tests |
 | :--- | :--- |
 | AT | Fresh Pop!_OS 24.04 VM: install from `.deb`, run acceptance script, uninstall with purge → no files left (`find` evidence). |
-| SC | Final `cargo audit`/`deny`, dependency review, threat model sign-off. |
+| SC | Final `cargo deny check` (all four checks), dependency review, threat model sign-off. |
 | IT | Upgrade path: v1.0.0-rc → v1.0.0 keeps data and config. |
 
 ### 13.4 Exit criteria

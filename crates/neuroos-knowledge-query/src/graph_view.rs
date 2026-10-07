@@ -117,36 +117,30 @@ fn escape_for_script(json: &str) -> String {
 }
 
 /// design.md §6: header (search + family filter + theme toggle), legend +
-/// stats sidebar, force-directed canvas, detail card, footer. Colors follow
-/// design.md §5's dark/light token pairs; family palette picked to be
-/// distinguishable and consistent with the legend order in §6.1's mockup
-/// (Attention, Work, Knowledge, System, External).
-const PAGE_TEMPLATE: &str = r##"<!doctype html>
+/// stats sidebar, force-directed canvas, detail card, footer.
+///
+/// Every colour comes from `ui/tokens/tokens.json` via `build.rs`, which emits
+/// the `--token-name` custom properties spliced in below (design.md §3: no
+/// hard-coded hex outside the token file). The family hues keep §6.1's legend
+/// order: Attention, Work, Knowledge, System, External.
+const PAGE_TEMPLATE: &str = concat!(
+    r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NeuroOS &middot; Knowledge graph</title>
 <style>
-:root {
-  --bg-surface: #ffffff; --bg-canvas: #f6f7f9; --text-primary: #1f2328; --text-muted: #6b7280;
-  --border: #d0d7de; --accent: #2f6fed;
-  --family-attention: #2f6fed; --family-work: #16a34a; --family-knowledge: #a855f7;
-  --family-system: #f59e0b; --family-external: #e11d48; --hypothesis: #9ca3af;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --bg-surface: #15171b; --bg-canvas: #0d0f12; --text-primary: #e6e8eb; --text-muted: #9aa1ac; --border: #2b2f36; }
-}
-:root[data-theme="light"] { --bg-surface: #ffffff; --bg-canvas: #f6f7f9; --text-primary: #1f2328; --text-muted: #6b7280; --border: #d0d7de; }
-:root[data-theme="dark"] { --bg-surface: #15171b; --bg-canvas: #0d0f12; --text-primary: #e6e8eb; --text-muted: #9aa1ac; --border: #2b2f36; }
-* { box-sizing: border-box; }
+"##,
+    include_str!(concat!(env!("OUT_DIR"), "/design_tokens.css")),
+    r##"* { box-sizing: border-box; }
 body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text-primary); background: var(--bg-canvas); }
-header { height: 56px; display: flex; align-items: center; gap: 16px; padding: 0 16px; background: var(--bg-surface); border-bottom: 1px solid var(--border); }
+header { height: 56px; display: flex; align-items: center; gap: 16px; padding: 0 16px; background: var(--bg-surface); border-bottom: 1px solid var(--border-subtle); }
 header h1 { font-size: 15px; font-weight: 600; margin: 0; white-space: nowrap; }
-header input, header select, header button { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-canvas); color: var(--text-primary); }
+header input, header select, header button { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-canvas); color: var(--text-primary); }
 header input { flex: 0 1 260px; }
 main { display: grid; grid-template-columns: 220px 1fr 300px; height: calc(100vh - 56px - 32px); }
-aside.legend { padding: 16px; border-right: 1px solid var(--border); background: var(--bg-surface); overflow-y: auto; }
+aside.legend { padding: 16px; border-right: 1px solid var(--border-subtle); background: var(--bg-surface); overflow-y: auto; }
 aside.legend h2 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin: 0 0 8px; }
 .legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 6px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
@@ -154,13 +148,13 @@ aside.legend h2 { font-size: 11px; text-transform: uppercase; color: var(--text-
 #canvas-wrap { position: relative; overflow: hidden; }
 svg { width: 100%; height: 100%; display: block; }
 .node-label { font-size: 10px; fill: var(--text-primary); pointer-events: none; paint-order: stroke; stroke: var(--bg-canvas); stroke-width: 3px; }
-#detail { padding: 16px; border-left: 1px solid var(--border); background: var(--bg-surface); overflow-y: auto; }
+#detail { padding: 16px; border-left: 1px solid var(--border-subtle); background: var(--bg-surface); overflow-y: auto; }
 #detail h2 { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin: 0 0 8px; }
-#detail .card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 13px; }
+#detail .card { border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; font-size: 13px; }
 #detail .card .label { font-weight: 600; margin-bottom: 4px; word-break: break-word; }
 #detail .card .meta { color: var(--text-muted); font-size: 12px; margin-top: 4px; }
 .tainted-badge { display: inline-block; margin-top: 8px; font-size: 11px; font-weight: 600; color: var(--family-external); border: 1px solid var(--family-external); border-radius: 999px; padding: 2px 8px; }
-footer { height: 32px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--text-muted); background: var(--bg-surface); border-top: 1px solid var(--border); }
+footer { height: 32px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--text-muted); background: var(--bg-surface); border-top: 1px solid var(--border-subtle); }
 #sr-only-table { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -232,9 +226,6 @@ footer { height: 32px; display: flex; align-items: center; justify-content: cent
   var height = wrap.clientHeight || 600;
 
   var zoomLayer = svg.append("g");
-  svg.call(d3.zoom().scaleExtent([0.2, 8]).on("zoom", function (event) {
-    zoomLayer.attr("transform", event.transform);
-  }));
 
   var degree = {};
   DATA.nodes.forEach(function (n) { degree[n.id] = 0; });
@@ -250,7 +241,7 @@ footer { height: 32px; display: flex; align-items: center; justify-content: cent
 
   var linkSel = zoomLayer.append("g").attr("stroke-opacity", 0.5)
     .selectAll("line").data(DATA.edges).join("line")
-    .attr("stroke", function (d) { return d.hypothesis ? "var(--hypothesis)" : "var(--text-muted)"; })
+    .attr("stroke", function (d) { return d.hypothesis ? "var(--border-strong)" : "var(--text-muted)"; })
     .attr("stroke-dasharray", function (d) { return d.hypothesis ? "4,3" : null; })
     .attr("stroke-width", function (d) { return Math.max(1, Math.min(4, d.weight)); });
 
@@ -371,7 +362,8 @@ footer { height: 32px; display: flex; align-items: center; justify-content: cent
 </script>
 </body>
 </html>
-"##;
+"##
+);
 
 #[cfg(test)]
 mod tests {

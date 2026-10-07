@@ -20,7 +20,7 @@ async fn main() {
         "usage: health_mock_farm <runtime_dir> <name>..."
     );
 
-    let my_uid = current_uid();
+    let my_uid = neuroos_common::current_uid();
     for name in &names {
         let health = neuroos_health::HealthServer::new(format!("{name} mock"));
         let sock = runtime_dir.join(format!("{name}.health.sock"));
@@ -32,16 +32,4 @@ async fn main() {
     std::io::stdout().flush().unwrap();
 
     std::future::pending::<()>().await;
-}
-
-unsafe fn libc_getuid_impl() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe { libc_getuid_impl() }
 }

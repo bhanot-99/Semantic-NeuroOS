@@ -3,23 +3,16 @@
 //! mock `storage.sock` (`neuroos_testkit`, C2/C6 mocked per phases.md
 //! §8.3), so this needs no real models and isn't `#[ignore]`d.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+use neuroos_common::current_uid;
 use std::time::Duration;
 
 use neuroos_knowledge_query::distill::DistillationCache;
 use neuroos_knowledge_query::inference_client::InferenceClient;
 use neuroos_knowledge_query::kernel_client::KernelClient;
-use neuroos_knowledge_query::orchestrate::{AskError, NO_EVIDENCE_ANSWER, ask, ask_context};
+use neuroos_knowledge_query::orchestrate::{AskError, NO_EVIDENCE_ANSWER, ask};
 use neuroos_knowledge_query::storage_client::StorageClient;
 use neuroos_knowledge_query::voice_client::VoiceClient;
 use neuroos_testkit::{storage_mocks, voice_mocks};
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
 
 #[tokio::test]
 async fn preamble_is_requested_before_focus_history_is_queried() {
@@ -32,9 +25,23 @@ async fn preamble_is_requested_before_focus_history_is_queried() {
     let retrieval_at = storage_mocks::spawn_focus_history_recorder(&storage_sock, my_uid);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // D2: drives `ask`, the real hot path, rather than the `ask_context`
+    // duplicate this test used to call -- which meant the ordering proof
+    // never covered the code that actually runs. The mock C3 only answers
+    // the focus-history RPC, so evidence retrieval fails and `ask` returns
+    // an error; the recorded timestamps are what this test is about.
     let voice = VoiceClient::new(voice_sock);
     let storage = StorageClient::new(storage_sock);
-    ask_context(&voice, &storage, 1_000_000_000).await.unwrap();
+    let _ = ask(
+        &voice,
+        &storage,
+        &InferenceClient::new(sock_dir.path().join("nonexistent-inference.sock")),
+        &KernelClient::new(sock_dir.path().join("nonexistent-kernel.sock")),
+        &DistillationCache::new(),
+        "what was that recipe?",
+        1_000_000_000,
+    )
+    .await;
 
     let preamble_ts = preamble_at
         .lock()
@@ -61,10 +68,22 @@ async fn an_unreachable_voice_service_does_not_stop_context_resolution() {
 
     let voice = VoiceClient::new(sock_dir.path().join("nonexistent-voice.sock"));
     let storage = StorageClient::new(storage_sock);
-    let window = ask_context(&voice, &storage, 0).await.unwrap();
+    let _ = ask(
+        &voice,
+        &storage,
+        &InferenceClient::new(sock_dir.path().join("nonexistent-inference.sock")),
+        &KernelClient::new(sock_dir.path().join("nonexistent-kernel.sock")),
+        &DistillationCache::new(),
+        "what was that recipe?",
+        0,
+    )
+    .await;
 
-    assert_eq!(window, None);
-    assert!(retrieval_at.lock().unwrap().is_some());
+    // The point: C2 being down did not stop C5 from resolving context.
+    assert!(
+        retrieval_at.lock().unwrap().is_some(),
+        "focus history must still have been queried with the voice service down"
+    );
 }
 
 /// H9: the full hot path with C2 down still answers (here: the
@@ -108,6 +127,21 @@ async fn an_unreachable_storage_service_is_still_reported() {
     let sock_dir = tempfile::tempdir().unwrap();
     let voice = VoiceClient::new(sock_dir.path().join("nonexistent-voice.sock"));
     let storage = StorageClient::new(sock_dir.path().join("nonexistent-storage.sock"));
-    let err = ask_context(&voice, &storage, 0).await.unwrap_err();
-    assert!(matches!(err, AskError::FocusHistory(_)));
+    let err = ask(
+        &voice,
+        &storage,
+        &InferenceClient::new(sock_dir.path().join("nonexistent-inference.sock")),
+        &KernelClient::new(sock_dir.path().join("nonexistent-kernel.sock")),
+        &DistillationCache::new(),
+        "what was that recipe?",
+        0,
+    )
+    .await
+    .unwrap_err();
+    // `ask` runs the focus-history snap and evidence retrieval concurrently,
+    // so with C3 unreachable either leg can be the one that reports first.
+    assert!(
+        matches!(err, AskError::FocusHistory(_) | AskError::Evidence(_)),
+        "an unreachable C3 must surface as a storage-side error, got {err:?}"
+    );
 }

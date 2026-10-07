@@ -3,6 +3,10 @@
 //! tests can exercise real logic without a second process (mirrors
 //! `neuroos-healthd`/`neuroos-monitor`/`neuroos-storage`'s own lib/main
 //! split).
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. This enforces that.
+#![cfg_attr(not(test), deny(unsafe_code))]
+
 pub mod assemble;
 pub mod deictic;
 pub mod distill;

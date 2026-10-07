@@ -21,9 +21,9 @@ void check(bool cond, const char* what) {
     }
 }
 
-// L3: nothing frees a ring, so the registry must refuse to grow without
-// bound. Before the fix any client could attach rings under fresh names
-// until C4 ran out of fds and memory.
+// L3: the registry must refuse to grow without bound. Before the fix any
+// client could attach rings under fresh names until C4 ran out of fds and
+// memory.
 void test_ring_registry_is_bounded() {
     neuroos::inference::RingRegistry rings;
     for (std::size_t i = 0; i < neuroos::inference::kMaxRings; ++i) {
@@ -41,6 +41,48 @@ void test_ring_registry_is_bounded() {
     auto existing = rings.get_or_create("ring-0", 0, 0);
     check(existing.has_value(), "an existing ring must still be returned when full");
     std::printf("OK: the ring registry refuses to grow past kMaxRings\n");
+}
+
+// ADR-0013 / L3: `detach` turns kMaxRings into a limit on how many rings
+// are attached at once, rather than how many C4 may serve in its lifetime.
+void test_a_detached_ring_frees_its_slot() {
+    neuroos::inference::RingRegistry rings;
+    for (std::size_t i = 0; i < neuroos::inference::kMaxRings; ++i) {
+        check(rings.get_or_create("ring-" + std::to_string(i), 0, 0).has_value(),
+              "a ring below the ceiling must be created");
+    }
+    check(!rings.get_or_create("one-too-many", 0, 0).has_value(), "the registry must be full");
+
+    check(rings.detach("ring-0"), "detaching an attached ring must report true");
+    check(rings.size() == neuroos::inference::kMaxRings - 1, "detach must shrink the registry");
+    check(!rings.exists("ring-0"), "a detached ring must be gone");
+
+    // The freed slot is reusable, which is the whole point of the RPC.
+    check(rings.get_or_create("one-too-many", 0, 0).has_value(),
+          "a new ring must fit once one was detached");
+
+    // Idempotent: detaching twice, or detaching something never attached,
+    // is a false return and not an error.
+    check(!rings.detach("ring-0"), "detaching an already-detached ring must report false");
+    check(!rings.detach("never-attached"), "detaching an unknown ring must report false");
+    std::printf("OK: a detached ring frees its slot and detach is idempotent\n");
+}
+
+// ADR-0013: the write paths use the non-creating `get`, so a client that
+// detaches its ring mid-generation cannot make C4 silently stream tokens
+// into a fresh memfd nobody is mapped to.
+void test_get_never_creates_a_ring() {
+    neuroos::inference::RingRegistry rings;
+    check(!rings.get("absent").has_value(), "get must not find a ring that was never attached");
+    check(rings.size() == 0, "get must never create a ring");
+
+    check(rings.get_or_create("present", 0, 0).has_value(), "attach must work");
+    check(rings.get("present").has_value(), "get must find an attached ring");
+
+    check(rings.detach("present"), "detach must work");
+    check(!rings.get("present").has_value(), "get must miss after a detach");
+    check(rings.size() == 0, "a missed get must not re-create the ring");
+    std::printf("OK: get never creates a ring\n");
 }
 
 // L3: capacity_slots and slot_size come straight off the wire and multiply
@@ -127,6 +169,8 @@ void test_seed_folding() {
 
 int main() {
     test_ring_registry_is_bounded();
+    test_a_detached_ring_frees_its_slot();
+    test_get_never_creates_a_ring();
     test_ring_shape_is_bounded();
     test_config_is_strict();
     test_seed_folding();

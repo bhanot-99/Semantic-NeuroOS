@@ -2,6 +2,15 @@
 //! format. Split from `main.rs` so integration tests can drive real sensor
 //! and bus logic without needing a second process (mirrors
 //! `neuroos-healthd`'s split).
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. This enforces that.
+#![deny(unsafe_code)]
+
+// C1: one safe implementation in neuroos-common, re-exported so the
+// existing `crate::current_uid` / `neuroos_monitor::current_uid` call
+// sites keep working.
+pub use neuroos_common::current_uid;
+
 pub mod anonymise;
 pub mod bus;
 pub mod control;
@@ -29,14 +38,6 @@ pub fn sandbox_policy(
         policy = policy.read_write(path.to_path_buf());
     }
     policy
-}
-
-pub fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
 }
 
 #[cfg(test)]

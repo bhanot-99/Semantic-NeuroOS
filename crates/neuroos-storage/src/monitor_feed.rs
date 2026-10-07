@@ -76,11 +76,10 @@ mod tests {
         Envelope, RawTelemetryEvent, ToplevelState, WindowEvent, WindowOpened, WindowStateChanged,
     };
 
-    use super::*;
+    use tokio::sync::Notify;
 
-    fn dev_models_dir() -> PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-    }
+    use super::*;
+    use crate::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 
     /// One promoted focus session (6 s > the 5 s gate) for `app_id`.
     fn session(toplevel_id: u64, app_id: &str, start_ns: u64) -> Vec<Envelope> {
@@ -121,9 +120,20 @@ mod tests {
         ]
     }
 
-    /// A fake C1: serves each batch of envelopes on its own connection,
-    /// then closes it (a C1 restart, from the subscriber's side).
-    fn spawn_fake_monitor(sock: PathBuf, batches: Vec<Vec<Envelope>>) {
+    /// A fake C1: serves each batch of envelopes on its own connection and
+    /// then **holds that connection open** until the returned `Notify` is
+    /// signalled, at which point it closes it and accepts the next batch --
+    /// a C1 restart, from the subscriber's side.
+    ///
+    /// M23: this used to drop each connection the instant it finished
+    /// writing, which made the test's "C3 reports OK while subscribed"
+    /// assertion a race it lost deterministically -- by the time the first
+    /// focus row was queryable, the feed had already gone down and C3 had
+    /// correctly reported DEGRADED. Handing the close to the test makes
+    /// every assertion ordered with respect to the connection's lifetime.
+    fn spawn_fake_monitor(sock: PathBuf, batches: Vec<Vec<Envelope>>) -> Arc<Notify> {
+        let close = Arc::new(Notify::new());
+        let close_in_task = Arc::clone(&close);
         let uid = rustix::process::getuid().as_raw();
         tokio::task::spawn_local(async move {
             let server = UdsServer::bind(UdsServerConfig::new(sock, vec![uid])).unwrap();
@@ -134,9 +144,13 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                // Dropping `stream` is what the subscriber sees as the
+                // restart, so wait for the test's go-ahead first.
+                close_in_task.notified().await;
             }
             std::future::pending::<()>().await;
         });
+        close
     }
 
     async fn wait_for_focus(engine: &Mutex<StorageEngine>, t_ns: u64) -> Option<String> {
@@ -160,8 +174,12 @@ mod tests {
                 &dir.path().join("meta.sqlite3"),
                 &dir.path().join("lance"),
                 &dev_models_dir(),
-                &dev_models_dir()
-                    .join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so"),
+                // M23/C4: must be `dev_onnxruntime_dylib()`, which pins
+                // ORT_DYLIB_PATH (M16). Building the path by hand made this
+                // test pass only when some *other* test in the binary had
+                // already pinned it, so running it alone failed with
+                // `DylibPathNotSet`.
+                &dev_onnxruntime_dylib(),
             )
             .await
             .unwrap(),
@@ -170,7 +188,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                spawn_fake_monitor(
+                let close_first_connection = spawn_fake_monitor(
                     sock.clone(),
                     vec![
                         session(1, "org.gnome.TextEditor", 1_000_000_000),
@@ -188,12 +206,18 @@ mod tests {
                     wait_for_focus(&engine, 3_000_000_000).await.as_deref(),
                     Some("org.gnome.TextEditor")
                 );
-                // M3: C3 reports OK while it is subscribed, and counts the
-                // feed going down when C1 restarts mid-stream.
+                // M3: C3 reports OK while it is subscribed. The fake C1 is
+                // still holding this connection open, so this is a fact
+                // about the live feed, not a race (M23).
                 assert_eq!(
                     health.snapshot().status,
-                    neuroos_proto::v1::Status::Ok as i32
+                    neuroos_proto::v1::Status::Ok as i32,
+                    "C3 must report OK while the feed is up"
                 );
+
+                // Now restart C1 mid-stream.
+                close_first_connection.notify_one();
+
                 assert_eq!(
                     wait_for_focus(&engine, 22_000_000_000).await.as_deref(),
                     Some("org.mozilla.firefox"),
@@ -206,6 +230,16 @@ mod tests {
                         .get(crate::server::MONITOR_FEED_DOWN),
                     Some(&1),
                     "the first connection closing must have been counted"
+                );
+                // M3's other half, which nothing covered before: DEGRADED is
+                // *cleared* on recovery. Events arriving on the second
+                // connection prove `subscribe_once` ran its `set_status(Ok)`,
+                // so a component that merely saw C1 restart must not be left
+                // looking degraded to healthd forever.
+                assert_eq!(
+                    health.snapshot().status,
+                    neuroos_proto::v1::Status::Ok as i32,
+                    "C3 must be OK again once it has resubscribed"
                 );
             })
             .await;

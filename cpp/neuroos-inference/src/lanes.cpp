@@ -104,10 +104,10 @@ void LaneScheduler::refresh_interactive_active() {
 
 void LaneScheduler::write_terminal(const std::string& ring_name, std::uint64_t generation_id,
                                    std::uint16_t flags) {
-    // L3: the ring was created when the job was accepted, so this is a
-    // lookup, not a creation -- but `get_or_create` can now refuse, so a
-    // ring that somehow is not there is reported rather than assumed.
-    auto sink = rings_.get_or_create(ring_name, /*capacity_slots=*/0, /*slot_size=*/0);
+    // L3/ADR-0013: the ring was attached before the job was accepted, so
+    // this is a lookup and never a creation. A miss means the client
+    // detached its ring, so there is nowhere to put the terminal slot.
+    auto sink = rings_.get(ring_name);
     if (!sink) {
         spdlog::warn("no ring for generation {}; end-of-stream slot not written", generation_id);
         return;
@@ -178,12 +178,11 @@ void LaneScheduler::worker_loop(std::deque<QueueEntry>& queue, std::mutex& queue
             }
         }
 
-        // L3: as in `write_terminal`, the job's ring already exists; a
-        // refusal here would mean there is nowhere to put this job's
-        // tokens, so it is dropped with a log instead of generating into
-        // nothing.
-        auto sink_opt =
-            rings_.get_or_create(entry.job.ring_name, /*capacity_slots=*/0, /*slot_size=*/0);
+        // L3/ADR-0013: as in `write_terminal`, a lookup and never a
+        // creation. A miss means the client detached its ring, so there is
+        // nowhere to put this job's tokens and it is dropped with a log
+        // rather than generated into a ring nobody reads.
+        auto sink_opt = rings_.get(entry.job.ring_name);
         if (!sink_opt) {
             spdlog::warn("generation {} dropped: no ring to write into", entry.job.generation_id);
             if (is_interactive) {

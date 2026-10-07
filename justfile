@@ -111,8 +111,17 @@ lint: lint-rust lint-cpp lint-py lint-sh lint-systemd lint-manifest
 lint-rust:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# C6: `clang-tidy` (unversioned) is not installed here, and clang-tidy-18 on its
+# own cannot find libstdc++'s headers for a build database produced by g++ —
+# both of which made this recipe a no-op. --gcc-install-dir points it at the
+# same toolchain CMake compiled with; the version is read from gcc so a distro
+# upgrade does not silently break the lint.
 lint-cpp: build-cpp
-    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o -name '*.cpp' -print | xargs -r clang-tidy -p {{cpp_build}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    gcc_dir="$(dirname "$(gcc -print-libgcc-file-name)")"
+    find cpp \( -path '{{cpp_build_glob}}' -o -path cpp/third_party \) -prune -o -name '*.cpp' -print \
+      | xargs -r clang-tidy-18 -p {{cpp_build}} --extra-arg="--gcc-install-dir=$gcc_dir"
 
 # L15: `hatch_build.py` (the wheel's generated-proto guard) is checked too
 # -- it is real code whose failure breaks `uv build`.
@@ -163,6 +172,25 @@ lint-systemd:
         fi
     done
     exit "$fail"
+
+# --- housekeeping ------------------------------------------------------------
+
+# C12: `target/debug/deps` accumulates one binary per test target per build and
+# never evicts the old ones, which is what filled the disk three times in Phase
+# 5. This drops incremental state and any dep artifact untouched for `days`
+# (so the current build's artifacts survive and the next build is still warm).
+# `cargo clean` is the bigger hammer; this is the one safe to run routinely.
+prune days="7":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    before=$(du -sm target 2>/dev/null | cut -f1 || echo 0)
+    rm -rf target/debug/incremental target/release/incremental
+    if [ -d target/debug/deps ]; then
+        find target/debug/deps -maxdepth 1 -type f -atime +{{days}} -delete
+    fi
+    after=$(du -sm target 2>/dev/null | cut -f1 || echo 0)
+    echo "target/: ${before} MiB -> ${after} MiB (freed $((before - after)) MiB)"
+    df -h . | tail -1
 
 # --- aggregate ---------------------------------------------------------------
 

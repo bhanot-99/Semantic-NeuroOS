@@ -2,6 +2,16 @@
 //! query APIs, lifecycle jobs. Split from `main.rs` so tests can exercise
 //! real logic without a second process (mirrors `neuroos-healthd`/
 //! `neuroos-monitor`'s own lib/main split).
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. The one exception in this crate is
+// `Embedder::set_dylib_path` (std::env::set_var is unsafe in edition
+// 2024), which carries its own scoped #[allow] and a SAFETY note.
+#![cfg_attr(not(test), deny(unsafe_code))]
+
+// C4: shared real-model test fixtures. Not compiled into the daemon.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub mod adapters;
 pub mod embed;
 pub mod engine;

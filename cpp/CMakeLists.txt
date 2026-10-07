@@ -42,6 +42,14 @@ add_custom_command(
     VERBATIM
 )
 
+# C6 / rules.md §7: warnings are errors. Carried as an INTERFACE target so it
+# applies to our own code only -- protoc's generated sources and
+# third_party/bitnet.cpp (ggml/llama) are not ours to keep warning-free, and
+# -Werror on them would make the build hostage to an upstream bump.
+add_library(neuroos-warnings INTERFACE)
+target_compile_options(neuroos-warnings INTERFACE
+    -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Wnon-virtual-dtor -Werror)
+
 add_library(neuroos-proto-cpp STATIC ${NEUROOS_PROTO_SRCS})
 target_include_directories(neuroos-proto-cpp PUBLIC ${NEUROOS_PROTO_GEN_DIR})
 target_link_libraries(neuroos-proto-cpp PUBLIC protobuf::libprotobuf)
@@ -52,29 +60,29 @@ add_subdirectory(neuroos-voice)
 
 # tests/contract/: cross-language proto round-trip helper (P0-S02)
 add_executable(contract-codec-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_codec.cpp)
-target_link_libraries(contract-codec-cpp PRIVATE neuroos-proto-cpp)
+target_link_libraries(contract-codec-cpp PRIVATE neuroos-proto-cpp neuroos-warnings)
 
 # tests/contract/: cross-language memfd ring interop tools (P0-S07)
 add_executable(shm-writer-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_writer.cpp)
-target_link_libraries(shm-writer-cpp PRIVATE libneuroos)
+target_link_libraries(shm-writer-cpp PRIVATE libneuroos neuroos-warnings)
 
 add_executable(shm-reader-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_reader.cpp)
-target_link_libraries(shm-reader-cpp PRIVATE libneuroos)
+target_link_libraries(shm-reader-cpp PRIVATE libneuroos neuroos-warnings)
 
 add_executable(shm-stress-cpp ${CMAKE_SOURCE_DIR}/../tests/contract/shm_stress.cpp)
-target_link_libraries(shm-stress-cpp PRIVATE libneuroos Threads::Threads)
+target_link_libraries(shm-stress-cpp PRIVATE libneuroos Threads::Threads neuroos-warnings)
 
 # Phase 2 prerequisite infra: libneuroos's new C++ IPC framing/UDS/SCM_RIGHTS code.
 add_executable(cpp-ipc-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_ipc_smoke.cpp)
-target_link_libraries(cpp-ipc-smoke PRIVATE libneuroos Threads::Threads)
+target_link_libraries(cpp-ipc-smoke PRIVATE libneuroos Threads::Threads neuroos-warnings)
 
 # H15: libneuroos's Landlock sandbox denies what its policy doesn't grant.
 add_executable(cpp-sandbox-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_sandbox_smoke.cpp)
-target_link_libraries(cpp-sandbox-smoke PRIVATE libneuroos Threads::Threads)
+target_link_libraries(cpp-sandbox-smoke PRIVATE libneuroos Threads::Threads neuroos-warnings)
 
 # M1: the ring rejects an untrusted header and never reads past a slot.
 add_executable(cpp-shm-validate ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_shm_validate.cpp)
-target_link_libraries(cpp-shm-validate PRIVATE libneuroos Threads::Threads)
+target_link_libraries(cpp-shm-validate PRIVATE libneuroos Threads::Threads neuroos-warnings)
 
 # L3/L5: neuroos-inference's model-free logic -- RingRegistry's ceilings,
 # the strict [inference] config parser, and the 64-bit seed fold.
@@ -87,8 +95,8 @@ add_executable(cpp-inference-unit
 )
 target_include_directories(cpp-inference-unit PRIVATE ${CMAKE_SOURCE_DIR}/neuroos-inference/src)
 target_link_libraries(cpp-inference-unit
-    PRIVATE libneuroos llama spdlog::spdlog toml11::toml11 Threads::Threads)
+    PRIVATE libneuroos llama spdlog::spdlog toml11::toml11 Threads::Threads neuroos-warnings)
 
 # Phase 2 IT: drives a real running neuroos-inference (real model) over inference.sock.
 add_executable(cpp-inference-smoke ${CMAKE_SOURCE_DIR}/../tests/contract/cpp_inference_smoke.cpp)
-target_link_libraries(cpp-inference-smoke PRIVATE libneuroos Threads::Threads)
+target_link_libraries(cpp-inference-smoke PRIVATE libneuroos Threads::Threads neuroos-warnings)

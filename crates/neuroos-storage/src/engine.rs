@@ -544,6 +544,21 @@ fn fuse_rrf(
 /// `spawn_blocking`'s dedicated thread pool and `.await` the result, which
 /// is a real yield point -- the runtime keeps servicing everything else
 /// while the real inference call runs elsewhere.
+/// Best-effort rendering of a panic payload (C5). `Box<dyn Any>` only
+/// carries a readable message for the `&str`/`String` payloads that
+/// `panic!`/`assert!` produce; anything else reports its absence rather
+/// than pretending to know.
+fn panic_message(join_err: tokio::task::JoinError) -> String {
+    let payload = join_err.into_panic();
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic payload was not a string".to_string()
+    }
+}
+
 async fn embed_blocking(
     embedder: &Arc<StdMutex<Embedder>>,
     texts: Vec<String>,
@@ -555,11 +570,14 @@ async fn embed_blocking(
         embedder.embed(&refs)
     })
     .await
-    // rules.md §5: no naked `.unwrap()/.expect()`. A `JoinError` here means
-    // the blocking closure itself panicked (it never calls `.await`, so it
-    // can't be cancelled) -- propagate that original panic rather than
-    // manufacturing a new message, the standard `spawn_blocking` idiom.
-    .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
+    // C5 / rules.md §5: no `panic!`, `unreachable!` or `resume_unwind` in
+    // non-test code. A `JoinError` here means the blocking closure itself
+    // panicked (it never awaits, so it cannot have been cancelled). This
+    // used to `resume_unwind` the original payload, which unwound the
+    // caller's task and took down whatever request was in flight; the panic
+    // message is preserved in the error instead, so one bad embed degrades
+    // one request.
+    .unwrap_or_else(|join_err| Err(EmbedError::WorkerPanicked(panic_message(join_err))))
 }
 
 /// How many chunks one re-index batch re-embeds before releasing the
@@ -646,23 +664,10 @@ async fn reindex_family(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
+    use crate::test_support::{dev_models_dir, dev_onnxruntime_dylib};
     use neuroos_proto::v1::raw_telemetry_event::Payload;
     use neuroos_proto::v1::window_event::Kind;
     use neuroos_proto::v1::{ToplevelState, WindowEvent, WindowOpened, WindowStateChanged};
-
-    fn dev_models_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-    }
-
-    fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-        // M16: a test is its own `main`, so it pins the ONNX Runtime
-        // dylib the way `main` does, before `Embedder::load` can be
-        // reached; harmless to repeat, an error only on a conflict.
-        let path =
-            dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-        let _ = crate::embed::Embedder::set_dylib_path(&path);
-        path
-    }
 
     fn window_event(toplevel_id: u64, at_ns: u64, kind: Kind) -> RawTelemetryEvent {
         RawTelemetryEvent {
@@ -675,25 +680,12 @@ mod tests {
         }
     }
 
-    /// Live proof (P4-S02/S03/S04 integration): a real focus session, real
-    /// embedding, real LanceDB insert, then a real hybrid query finds it —
-    /// needs the real model + onnxruntime fetched, so `#[ignore]`d like this
-    /// crate's other real-download-dependent tests (`cargo test -p
-    /// neuroos-storage --lib -- --ignored engine`).
-    #[tokio::test]
-    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
-    async fn full_pipeline_ingest_then_hybrid_query_finds_the_window() {
-        let sqlite_dir = tempfile::tempdir().unwrap();
-        let lance_dir = tempfile::tempdir().unwrap();
-        let mut engine = StorageEngine::open(
-            &sqlite_dir.path().join("meta.sqlite3"),
-            lance_dir.path(),
-            &dev_models_dir(),
-            &dev_onnxruntime_dylib(),
-        )
-        .await
-        .expect("real model + onnxruntime should load");
-
+    /// C4: the open → activate → deactivate trio that four tests used
+    /// verbatim to get exactly one promoted, searchable focus session into
+    /// the store. A 6 s dwell clears the ingest filter's minimum, and the
+    /// title is what the `query_hybrid("revenue numbers", ..)` assertions
+    /// match on.
+    async fn ingest_one_focus_session(engine: &mut StorageEngine) {
         engine
             .ingest(&window_event(
                 1,
@@ -725,6 +717,28 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    /// Live proof (P4-S02/S03/S04 integration): a real focus session, real
+    /// embedding, real LanceDB insert, then a real hybrid query finds it —
+    /// needs the real model + onnxruntime fetched, so `#[ignore]`d like this
+    /// crate's other real-download-dependent tests (`cargo test -p
+    /// neuroos-storage --lib -- --ignored engine`).
+    #[tokio::test]
+    #[ignore = "needs models fetched into .dev-cache/models (just fetch-models); see doc comment"]
+    async fn full_pipeline_ingest_then_hybrid_query_finds_the_window() {
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(
+            &sqlite_dir.path().join("meta.sqlite3"),
+            lance_dir.path(),
+            &dev_models_dir(),
+            &dev_onnxruntime_dylib(),
+        )
+        .await
+        .expect("real model + onnxruntime should load");
+
+        ingest_one_focus_session(&mut engine).await;
 
         let results = engine.query_hybrid("revenue numbers", 3).await.unwrap();
         assert!(
@@ -1034,37 +1048,7 @@ mod tests {
         .await
         .expect("real model + onnxruntime should load");
 
-        engine
-            .ingest(&window_event(
-                1,
-                0,
-                Kind::Opened(WindowOpened {
-                    app_id: "org.mozilla.firefox".into(),
-                    title: "quarterly revenue dashboard".into(),
-                    pid: 0,
-                    pid_known: false,
-                }),
-            ))
-            .await
-            .unwrap();
-        engine
-            .ingest(&window_event(
-                1,
-                0,
-                Kind::StateChanged(WindowStateChanged {
-                    states: vec![ToplevelState::Activated as i32],
-                }),
-            ))
-            .await
-            .unwrap();
-        engine
-            .ingest(&window_event(
-                1,
-                6_000_000_000,
-                Kind::StateChanged(WindowStateChanged { states: vec![] }),
-            ))
-            .await
-            .unwrap();
+        ingest_one_focus_session(&mut engine).await;
         assert!(!engine.query_hybrid("revenue", 1).await.unwrap().is_empty());
 
         let forgotten = engine.forget_by_app("org.mozilla.firefox").await.unwrap();
@@ -1175,37 +1159,7 @@ mod tests {
         .await
         .expect("real model + onnxruntime should load");
 
-        engine
-            .ingest(&window_event(
-                1,
-                0,
-                Kind::Opened(WindowOpened {
-                    app_id: "org.mozilla.firefox".into(),
-                    title: "quarterly revenue dashboard".into(),
-                    pid: 0,
-                    pid_known: false,
-                }),
-            ))
-            .await
-            .unwrap();
-        engine
-            .ingest(&window_event(
-                1,
-                0,
-                Kind::StateChanged(WindowStateChanged {
-                    states: vec![ToplevelState::Activated as i32],
-                }),
-            ))
-            .await
-            .unwrap();
-        engine
-            .ingest(&window_event(
-                1,
-                6_000_000_000,
-                Kind::StateChanged(WindowStateChanged { states: vec![] }),
-            ))
-            .await
-            .unwrap();
+        ingest_one_focus_session(&mut engine).await;
 
         let forgotten = engine.forget_by_app("org.mozilla.firefox").await.unwrap();
         assert_eq!(forgotten, 1);
@@ -1275,37 +1229,7 @@ mod tests {
         .await
         .expect("real model + onnxruntime should load");
 
-        engine
-            .ingest(&window_event(
-                1,
-                0,
-                Kind::Opened(WindowOpened {
-                    app_id: "org.mozilla.firefox".into(),
-                    title: "quarterly revenue dashboard".into(),
-                    pid: 0,
-                    pid_known: false,
-                }),
-            ))
-            .await
-            .unwrap();
-        engine
-            .ingest(&window_event(
-                1,
-                0,
-                Kind::StateChanged(WindowStateChanged {
-                    states: vec![ToplevelState::Activated as i32],
-                }),
-            ))
-            .await
-            .unwrap();
-        engine
-            .ingest(&window_event(
-                1,
-                6_000_000_000,
-                Kind::StateChanged(WindowStateChanged { states: vec![] }),
-            ))
-            .await
-            .unwrap();
+        ingest_one_focus_session(&mut engine).await;
 
         let meta = crate::sqlite::get_index_meta(&engine.conn, "attention")
             .unwrap()

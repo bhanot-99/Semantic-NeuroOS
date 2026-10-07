@@ -37,7 +37,7 @@ These rules are **mandatory**. "MUST / MUST NOT / SHOULD / MAY" follow RFC 2119.
 
 | Rule | Detail |
 | :--- | :--- |
-| AB-1 | Components MUST NOT link each other's crates or libraries. Shared code lives only in `neuroos-common`, `neuroos-proto`, `neuroos-ipc`, `neuroos-shm`, `neuroos-taint`, `neuroos-health`, `neuroos-sandbox` (Rust) and `cpp/libneuroos` (C++). |
+| AB-1 | Components MUST NOT link each other's crates or libraries. Shared code lives only in `neuroos-common`, `neuroos-proto`, `neuroos-ipc`, `neuroos-shm`, `neuroos-taint`, `neuroos-health`, `neuroos-sandbox` (Rust) and `cpp/libneuroos` (C++). **Scope (C9):** this is about what a shipped binary links. A `[dev-dependencies]` entry on another component, used only by a test binary to drive that component for real instead of through a mock, is permitted and MUST carry a comment in the manifest naming the tests that need it. A component's `src/` may never `use` another component's crate. |
 | AB-2 | C3 is the **only** writer of persistent user data. C5b writes graph updates through `storage.sock`, not to SQLite directly. |
 | AB-3 | C3 is the **only** component that loads the embedding model. C4 is the **only** component that loads the LLM. |
 | AB-4 | C6 is the **only** component that holds `hmac.key`, writes `actions.jsonl`, or talks to C7. |
@@ -59,7 +59,11 @@ These rules are **mandatory**. "MUST / MUST NOT / SHOULD / MAY" follow RFC 2119.
 - Every dependency is pinned (`Cargo.lock`, `uv.lock`, submodule commit, tarball SHA-256).
 - Licence allowlist (`deny.toml`): MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, Unicode-3.0, MPL-2.0. GPL/LGPL/AGPL and non-commercial licences need an ADR (known: espeak-ng GPL-3.0, openWakeWord models CC BY-NC-SA — see PRD R-06/R-07).
 - `cargo-deny` bans `reqwest`, `hyper`, `hickory-*`, `ureq`, `isahc`, `surf`, `curl` and `openssl` everywhere except `crates/neuroos-fetcher`.
-- `cargo audit` and `cargo deny check` MUST pass in CI with zero unignored advisories.
+- `cargo deny check` (all four checks: `advisories`, `bans`, `licenses`, `sources`) MUST pass in
+  CI with zero unignored advisories. It reads the same RustSec database as `cargo audit`, so the
+  separate `cargo audit` run it used to require added nothing and was never installed; `just deny`
+  is the single gate. Every entry in `deny.toml`'s `advisories.ignore` carries a written reason
+  and a revisit condition.
 
 ### 4.2 Use / Avoid table
 

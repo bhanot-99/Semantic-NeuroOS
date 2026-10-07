@@ -44,6 +44,10 @@ class Model {
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
+    // Held only through the shared_ptr that `load` returns; the llama_model
+    // pointer it owns must not be moved out from under a live Context.
+    Model(Model&&) = delete;
+    Model& operator=(Model&&) = delete;
 
     ModelInfo info() const;
     llama_model* raw() const {

@@ -1,6 +1,7 @@
 //! Standard filesystem locations (Architecture.md §7.1). Every path here is
 //! a function, not a constant: they depend on `$HOME`/`$XDG_*`/the real UID,
 //! which differ between the reference machine and CI/tests.
+use crate::process::current_uid;
 use std::path::PathBuf;
 
 fn home_dir() -> PathBuf {
@@ -142,19 +143,6 @@ pub fn kernel_sock() -> PathBuf {
     runtime_dir().join("kernel.sock")
 }
 
-/// `/opt/neuroos/models/` — read-only, never written by any component.
-pub fn models_dir() -> PathBuf {
-    PathBuf::from("/opt/neuroos/models")
-}
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
@@ -195,14 +183,5 @@ mod tests {
     fn component_health_sock_names_match_the_convention() {
         let p = component_health_sock("neuroos-monitor");
         assert_eq!(p.file_name().unwrap(), "neuroos-monitor.health.sock");
-    }
-
-    #[test]
-    fn current_uid_matches_real_process_uid() {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        assert_eq!(current_uid(), unsafe { getuid() });
     }
 }

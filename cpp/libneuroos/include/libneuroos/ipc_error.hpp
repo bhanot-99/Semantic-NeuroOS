@@ -15,8 +15,15 @@ enum class IpcErrorKind {
     kPeerRejected,
 };
 
+// The analyzer reports the implicit copy constructor as copying a garbage
+// `kind` at every `make_unexpected(x.error())` site. It cannot see that
+// `Expected::error()` is only reached when `!x`, which is exactly when the
+// error slot is engaged, so the "uninitialized" object it describes never
+// exists. The default initializer below makes a default-constructed IpcError
+// well defined regardless.
+// NOLINTNEXTLINE(clang-analyzer-core.uninitialized.Assign)
 struct IpcError {
-    IpcErrorKind kind;
+    IpcErrorKind kind = IpcErrorKind::kIo;
     std::string message;
 
     static IpcError io(const std::string& what) {

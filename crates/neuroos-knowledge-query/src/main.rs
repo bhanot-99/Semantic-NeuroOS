@@ -1,18 +1,11 @@
 // knowledge query engine entry point [C5a]
+use neuroos_common::current_uid;
 use neuroos_knowledge_query::distill::DistillationCache;
 use neuroos_knowledge_query::inference_client::InferenceClient;
 use neuroos_knowledge_query::kernel_client::KernelClient;
 use neuroos_knowledge_query::server::{self, Clients};
 use neuroos_knowledge_query::storage_client::StorageClient;
 use neuroos_knowledge_query::voice_client::VoiceClient;
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
 
 fn main() {
     if neuroos_common::init_logging().is_err() {

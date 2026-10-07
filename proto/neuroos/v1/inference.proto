@@ -68,6 +68,20 @@ message AttachRingResponse {
   string error = 2; // set iff !ok
 }
 
+// ADR-0013 / BUGS.md L3: releases a ring the client no longer reads, so a
+// long-lived C4 serving more than `kMaxRings` distinct ring names over its
+// lifetime does not have to refuse new ones forever. Detaching a ring that
+// still has a queued or running generation is allowed and ends that
+// generation without a terminal slot -- the client that detached its own
+// ring is the one that stopped reading it.
+message DetachRingRequest {
+  string ring_name = 1;
+}
+message DetachRingResponse {
+  bool detached = 1;  // false = no such ring (idempotent, not an error)
+  string error = 2;   // set iff the request was malformed
+}
+
 // GetInfo is also how tests count tokens without a full Generate call
 // (Architecture.md §5.1's "Tokenize/Count (for tests)"): set `tokenize_text`
 // to get `token_count` back alongside the model info.

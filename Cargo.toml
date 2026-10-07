@@ -39,6 +39,15 @@ expect_used = "warn"
 panic = "warn"
 todo = "warn"
 
+# C12: `target/` filled the disk three times during Phase 5, twice breaking a
+# build mid-run. Full DWARF for every dep is the bulk of it, and incremental
+# artifacts are the fastest-growing part, so the dev profile keeps only what a
+# backtrace actually needs (file/line) and drops incremental. `just prune`
+# clears the stale per-dep binaries that accumulate regardless.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
 lto = "thin"
 

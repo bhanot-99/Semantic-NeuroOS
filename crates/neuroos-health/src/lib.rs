@@ -5,22 +5,21 @@
 //! let health = neuroos_health::HealthServer::new("neuroos-monitor v0.1.0");
 //! tokio::spawn(health.clone().serve(socket_path, vec![healthd_uid]));
 //! ```
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. This enforces that.
+#![deny(unsafe_code)]
+
 mod histogram;
 mod percentile;
 mod rss;
 
+use neuroos_common::sync::lock;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// See `histogram::lock`'s doc comment: recovers rather than panics on a
-/// poisoned mutex (rules.md §5).
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 pub use histogram::Histogram;
 pub use percentile::{p50_ns, p99_ns, percentile_ns};
@@ -215,7 +214,7 @@ mod tests {
     async fn serves_health_request_over_real_uds_socket() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("comp.health.sock");
-        let my_uid = unsafe { libc_getuid() };
+        let my_uid = neuroos_common::current_uid();
 
         let health = HealthServer::new("neuroos-test v0.1.0");
         health.record_latency("op", Duration::from_micros(500));
@@ -254,14 +253,5 @@ mod tests {
             }
             other => panic!("expected HealthResponse, got {other:?}"),
         }
-    }
-
-    /// # Safety
-    /// `getuid()` takes no arguments and cannot fail.
-    unsafe fn libc_getuid() -> u32 {
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
     }
 }

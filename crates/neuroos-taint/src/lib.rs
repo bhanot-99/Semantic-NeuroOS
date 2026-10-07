@@ -2,6 +2,10 @@
 //! every component that reads or writes tainted data (C3 storage, C5
 //! prompt assembly, C6 tier evaluation) — one definition, not per-crate
 //! copies, so the bit layout can never drift between them.
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. This enforces that.
+#![deny(unsafe_code)]
+
 use bitflags::bitflags;
 
 bitflags! {

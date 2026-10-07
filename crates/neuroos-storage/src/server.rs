@@ -467,14 +467,8 @@ mod tests {
     use neuroos_proto::v1::QueryFocusHistoryRequest;
 
     use super::*;
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
-    }
+    use crate::test_support::{dev_models_dir, dev_onnxruntime_dylib};
+    use neuroos_common::current_uid;
 
     /// L1: `top_k`/`limit` arrive as untrusted `uint32`s. `0` still
     /// means "unset" (and so 1), and an absurd value is clamped to the
@@ -518,20 +512,6 @@ mod tests {
             }
             other => panic!("unexpected body: {other:?}"),
         }
-    }
-
-    fn dev_models_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-cache/models")
-    }
-
-    fn dev_onnxruntime_dylib() -> std::path::PathBuf {
-        // M16: a test is its own `main`, so it pins the ONNX Runtime
-        // dylib the way `main` does, before `Embedder::load` can be
-        // reached; harmless to repeat, an error only on a conflict.
-        let path =
-            dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-        let _ = crate::embed::Embedder::set_dylib_path(&path);
-        path
     }
 
     /// Live proof (P5 prereq): a real `StorageEngine` served over a real

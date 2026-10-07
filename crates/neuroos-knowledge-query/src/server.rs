@@ -256,14 +256,7 @@ mod tests {
     use neuroos_testkit::{kernel_mocks, voice_mocks};
 
     use super::*;
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
-    }
+    use neuroos_common::current_uid;
 
     /// No real C3/C4 running -- `storage`/`inference` point at sockets that
     /// don't exist, so `ask()` must fail and this server must still answer

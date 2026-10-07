@@ -90,11 +90,13 @@ template <typename E> class Expected<void, E> {
         return has_value();
     }
 
+    // Precondition: `!has_value()`. Mirrors std::expected::error(), which is
+    // likewise undefined on a value-carrying expected.
     const E& error() const& {
-        return *error_;
+        return *error_; // NOLINT(bugprone-unchecked-optional-access)
     }
     E&& error() && {
-        return std::move(*error_);
+        return std::move(*error_); // NOLINT(bugprone-unchecked-optional-access)
     }
 
   private:

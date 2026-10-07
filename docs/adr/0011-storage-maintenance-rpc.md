@@ -1,6 +1,6 @@
 # ADR-0011: `storage.sock` maintenance RPC for GC and backup
 
-- Status: Proposed (needs owner approval — rules.md §10.2.4: contract change)
+- Status: Accepted (owner approved on 2026-10-07; the RPC and CLI shipped with H12 and GC/backup retention depends on it)
 - Date: 2026-10-04
 - Relates to: BUGS.md H12, Architecture.md §7.5, ADR-0002
 

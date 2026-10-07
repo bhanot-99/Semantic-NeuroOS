@@ -25,7 +25,9 @@ pub struct Target {
 const HARD_CAP_MIB: &[(&str, u64)] = &[
     ("neuroos-monitor", 40),
     ("neuroos-voice", 520),
-    ("neuroos-storage", 300),
+    // ADR-0014 / M21: raised from 300. Measured 392-401 MiB peak in a
+    // release build; 205/300 predated C3 having an embedding model.
+    ("neuroos-storage", 420),
     ("neuroos-inference", 1900),
     ("neuroos-knowledge-query", 120),
     ("neuroos-knowledge-background", 120),

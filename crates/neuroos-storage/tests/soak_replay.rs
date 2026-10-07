@@ -21,11 +21,19 @@
 //!   collapse (`ingest::filter`'s stage 1) picked the wrong ancestor. Must
 //!   be 0 by construction of that stage; this proves it holds for real
 //!   data, not just the crafted unit tests in `filter.rs`.
-//! - `zero_access_mpris_nodes`: count of `entities` rows with
-//!   `domain = "media_playback"`. `adapters::adapt_mpris` only ever touches
-//!   `event_counters` (never `upsert_entity` -- see its doc comment: MPRIS
-//!   demotion, stage 4, is unconditional), so this is an invariant of the
-//!   adapter, not a threshold -- must always be 0.
+//! - `zero_access_mpris_nodes`: a `media_playback` entity that the dump
+//!   contains no *played* event for. **C13 redefined this metric.** It used
+//!   to be "count of every `entities` row with `domain = "media_playback"`",
+//!   on the premise that `adapt_mpris` never calls `upsert_entity` at all.
+//!   BUG-007(4) deliberately changed that premise: a titled track seen
+//!   `Playing` is now recorded as an entity plus one searchable chunk,
+//!   because before it "media history never reached search at all". The
+//!   gate's *intent* -- never remember media the user did not actually
+//!   engage with -- is unchanged, so the metric now measures exactly that:
+//!   every `media_playback` entity must be backed by an MPRIS event in the
+//!   dump whose `playback_status` is `Playing` with a non-empty title.
+//!   Passive or untitled media must still leave no entity behind, which is
+//!   what the original "zero-access" wording was protecting.
 //! - `total_promoted_entities`: scoped to the domains P4-S01's own story
 //!   text names as the noise this filter exists to catch ("compiler
 //!   subprocesses, own windows, passive media") -- `process_activity` +
@@ -37,6 +45,9 @@
 //!   is also printed below for transparency, in case this scoping reading
 //!   is wrong.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
+use std::collections::BTreeSet;
+
+use neuroos_storage::test_support::{dev_models_dir, dev_onnxruntime_dylib};
 use std::path::{Path, PathBuf};
 
 use neuroos_monitor::dump::DumpReader;
@@ -46,20 +57,6 @@ use neuroos_storage::engine::StorageEngine;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn dev_models_dir() -> PathBuf {
-    repo_root().join(".dev-cache/models")
-}
-
-fn dev_onnxruntime_dylib() -> PathBuf {
-    // M16: a test is its own `main`, so it pins the ONNX Runtime
-    // dylib the way `main` does, before `Embedder::load` can be
-    // reached; harmless to repeat, an error only on a conflict.
-    let path =
-        dev_models_dir().join("onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so");
-    let _ = neuroos_storage::embed::Embedder::set_dylib_path(&path);
-    path
 }
 
 fn fixture_dumps() -> Vec<PathBuf> {
@@ -80,6 +77,9 @@ struct GateResult {
     total_promoted_entities_all_domains: u64,
     compiler_subprocesses: u64,
     zero_access_mpris_nodes: u64,
+    /// Printed for transparency: how many played tracks the dump did leave
+    /// behind (BUG-007's intended behaviour, not a gate).
+    media_entities: u64,
 }
 
 async fn replay_and_gate(dump_path: &Path) -> GateResult {
@@ -103,7 +103,16 @@ async fn replay_and_gate(dump_path: &Path) -> GateResult {
 
     let mut events_replayed = 0u64;
     let mut compiler_subprocesses = 0u64;
+    // C13: the titles the user actually played, which are the only ones
+    // allowed to leave a `media_playback` entity behind.
+    let mut played_titles: BTreeSet<String> = BTreeSet::new();
     while let Some(event) = reader.read_event().await.unwrap() {
+        if let Some(Payload::Mpris(m)) = &event.payload
+            && m.playback_status == "Playing"
+            && !m.title.is_empty()
+        {
+            played_titles.insert(m.title.clone());
+        }
         if let Some(Payload::ProcTree(snapshot)) = &event.payload
             && snapshot.root_pid_known
         {
@@ -125,10 +134,20 @@ async fn replay_and_gate(dump_path: &Path) -> GateResult {
         .iter()
         .filter(|e| e.domain == DOMAIN_PROCESS_ACTIVITY || e.domain == DOMAIN_BUILD_JOB)
         .count() as u64;
-    let zero_access_mpris_nodes = entities
+    let media_entities: Vec<&_> = entities
         .iter()
         .filter(|e| e.domain == DOMAIN_MEDIA_PLAYBACK)
-        .count() as u64;
+        .collect();
+    let unbacked: Vec<&str> = media_entities
+        .iter()
+        .map(|e| e.label.as_str())
+        .filter(|label| !played_titles.contains(*label))
+        .collect();
+    if !unbacked.is_empty() {
+        println!("  zero-access media entities (no Playing event in the dump): {unbacked:?}");
+    }
+    let zero_access_mpris_nodes = unbacked.len() as u64;
+    let media_entities = media_entities.len() as u64;
 
     GateResult {
         events_replayed,
@@ -136,6 +155,7 @@ async fn replay_and_gate(dump_path: &Path) -> GateResult {
         total_promoted_entities_all_domains: entities.len() as u64,
         compiler_subprocesses,
         zero_access_mpris_nodes,
+        media_entities,
     }
 }
 
@@ -158,13 +178,14 @@ async fn soak_replay_gate_passes_on_every_committed_dump() {
         println!(
             "{}: events={} total_promoted_entities(process_activity+build_job)={} \
              total_promoted_entities(all domains)={} compiler_subprocesses={} \
-             zero_access_mpris_nodes={}",
+             zero_access_mpris_nodes={} media_entities(played, expected)={}",
             dump.display(),
             result.events_replayed,
             result.total_promoted_entities_scoped,
             result.total_promoted_entities_all_domains,
             result.compiler_subprocesses,
             result.zero_access_mpris_nodes,
+            result.media_entities,
         );
 
         assert_eq!(
@@ -176,7 +197,9 @@ async fn soak_replay_gate_passes_on_every_committed_dump() {
         assert_eq!(
             result.zero_access_mpris_nodes,
             0,
-            "gate: zero_access_mpris_nodes must be 0 for {}",
+            "gate: zero_access_mpris_nodes must be 0 for {} -- every \
+             media_playback entity must be backed by a Playing event with a \
+             title (C13)",
             dump.display()
         );
         assert!(

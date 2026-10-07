@@ -139,6 +139,7 @@ mod tests {
     use neuroos_health::HealthServer;
 
     use super::*;
+    use neuroos_common::current_uid;
 
     fn target(name: &str, socket: PathBuf) -> Target {
         Target {
@@ -333,13 +334,5 @@ mod tests {
     fn remaining_saturates_at_zero_for_a_spent_deadline() {
         let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
         assert_eq!(remaining(deadline), Duration::ZERO);
-    }
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
     }
 }

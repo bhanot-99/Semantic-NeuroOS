@@ -1,15 +1,8 @@
 // storage engine entry point [C3]
+use neuroos_common::current_uid;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
 
 /// `models_dir/onnxruntime/onnxruntime-linux-x64-1.30.0/lib/libonnxruntime.so`
 /// (models/manifest.toml's `onnxruntime-linux-x64` entry: `extract_to =

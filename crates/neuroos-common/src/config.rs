@@ -287,6 +287,29 @@ mod tests {
         assert_eq!(cfg.healthd.poll_interval_s, 30);
     }
 
+    /// C7: `config/config.example.toml` used to document only `[monitor]`,
+    /// while the parser accepted four sections. This keeps the example honest:
+    /// `deny_unknown_fields` means any key the example gains that the structs
+    /// do not have fails here, and the assertions below catch an example that
+    /// drifts away from the documented defaults.
+    #[test]
+    fn the_example_config_parses_and_matches_the_documented_defaults() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/config.example.toml")
+            .canonicalize()
+            .expect("config/config.example.toml must exist");
+        let cfg = load_config_from(&example).expect("the example config must parse");
+
+        assert_eq!(cfg.healthd.poll_interval_s, 30);
+        assert_eq!(cfg.healthd.per_target_timeout_s, 1);
+        assert_eq!(cfg.inference.threads, 8);
+        assert_eq!(cfg.inference.max_context_tokens, 512);
+        assert_eq!(cfg.monitor.idle_timeout_s, 60);
+        assert_eq!(cfg.monitor.bus_capacity, 4096);
+        assert_eq!(cfg.storage.models_dir, default_models_dir());
+        assert_eq!(cfg.storage.spool_dir, default_spool_dir());
+    }
+
     #[test]
     fn parses_a_minimal_healthd_section() {
         let dir = tempfile::tempdir().unwrap();

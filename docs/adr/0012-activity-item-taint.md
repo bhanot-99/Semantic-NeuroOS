@@ -1,6 +1,6 @@
 # ADR-0012: `ActivityItem` carries taint
 
-- Status: Proposed (needs owner approval — rules.md §10.2.4: contract change)
+- Status: Accepted (owner approved on 2026-10-07; R0-3 requires the taint union, and the field is additive)
 - Date: 2026-10-04
 - Relates to: BUGS.md M9, Architecture.md §7.4, R0-3, FR-KNO-07
 

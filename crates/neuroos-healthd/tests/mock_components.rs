@@ -4,6 +4,7 @@
 //! IT (phases.md §4.3): healthd against 8 mock components from testkit —
 //! healthy, slow (> timeout), crashing, returning malformed frames (2 of
 //! each) — proving DOWN/OK classification end to end, not just per-function.
+use neuroos_common::current_uid;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,14 +20,6 @@ fn target(dir: &std::path::Path, name: &str) -> Target {
         budget_bytes: 100 * 1024 * 1024,
         cgroup_path: None,
     }
-}
-
-fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
 }
 
 #[tokio::test]

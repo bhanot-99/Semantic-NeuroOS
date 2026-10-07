@@ -131,7 +131,7 @@ int run_benchmark(const Config& config) {
             spdlog::info("bench: n_ctx={} threads={} prompt_tokens={} ttft={:.2f}ms "
                          "prefill={:.3f}ms/tok decode={:.3f}ms/tok rss={}MiB",
                          r.n_ctx, r.n_threads, r.prompt_tokens, r.ttft_ms, r.prefill_ms_per_token,
-                         r.decode_ms_per_token, r.rss_bytes_after / (1024 * 1024));
+                         r.decode_ms_per_token, r.rss_bytes_after / (1024ULL * 1024));
         }
         results.push_back(r);
     }

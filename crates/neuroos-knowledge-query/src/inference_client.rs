@@ -384,14 +384,7 @@ async fn read_all_tokens(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // rules.md §5 scoped to non-test code
     use super::*;
-
-    fn current_uid() -> u32 {
-        // SAFETY: getuid() takes no arguments and cannot fail.
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        unsafe { getuid() }
-    }
+    use neuroos_common::current_uid;
 
     /// M11: C4 writes one ring slot per token *piece*, and a piece is a
     /// slice of the detokenized bytes -- a multi-byte character can land

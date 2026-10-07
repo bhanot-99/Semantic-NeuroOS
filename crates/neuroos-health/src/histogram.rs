@@ -1,14 +1,7 @@
 //! Fixed-bucket latency histogram, log-scale in nanoseconds.
-use std::sync::{Mutex, MutexGuard};
+use neuroos_common::sync::lock;
+use std::sync::Mutex;
 use std::time::Duration;
-
-/// Locks `m`, recovering rather than panicking if a prior holder panicked
-/// while holding it (rules.md §5: no `unwrap()`/`panic!` in non-test code).
-/// A histogram counter has no invariant a partial update could leave
-/// meaningfully broken, so recovering the poisoned guard is safe here.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// Upper bounds in ns: 1us .. ~10s, one decade apart plus a 5x step each decade.
 const BUCKET_UPPER_BOUNDS_NS: &[u64] = &[

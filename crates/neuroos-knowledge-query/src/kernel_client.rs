@@ -5,10 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use neuroos_ipc::{
-    DEFAULT_MAX_FRAME, connect_retrying, read_envelope_deadline, write_envelope_deadline,
-};
-use neuroos_proto::v1::{ActionRequest, Envelope, Taint, envelope};
+use neuroos_ipc::{OnRestart, request_once};
+use neuroos_proto::v1::{ActionRequest, Taint, envelope};
 use neuroos_taint::TaintFlags;
 
 /// rules.md §5.7: C6 checks get a 50 ms deadline (confirmation dialogs
@@ -34,6 +32,19 @@ pub enum KernelClientError {
     UnexpectedResponse,
 }
 
+/// C3: `request_once` reports the transport failures this enum already had
+/// variants for, so the mapping is one-to-one and every existing
+/// `KernelClientError::Connect { .. }` match keeps working.
+impl From<neuroos_ipc::RequestError> for KernelClientError {
+    fn from(e: neuroos_ipc::RequestError) -> Self {
+        match e {
+            neuroos_ipc::RequestError::Connect { path, source } => Self::Connect { path, source },
+            neuroos_ipc::RequestError::Framing(e) => Self::Io(e),
+            neuroos_ipc::RequestError::NoResponse => Self::NoResponse,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct KernelClient {
     socket_path: PathBuf,
@@ -51,35 +62,20 @@ impl KernelClient {
         capability: &str,
         taint: TaintFlags,
     ) -> Result<bool, KernelClientError> {
-        let mut stream = connect_retrying(&self.socket_path, KERNEL_CHECK_DEADLINE)
-            .await
-            .map_err(|source| KernelClientError::Connect {
-                path: self.socket_path.clone(),
-                source,
-            })?;
-        let request = Envelope {
-            schema_version: 1,
-            trace_id: String::new(),
-            request_id: 1,
-            sent_at_ns: neuroos_common::now_ns(),
-            body: Some(envelope::Body::ActionRequest(ActionRequest {
+        // C3: connect/envelope/write/read lives in neuroos_ipc::request_once.
+        let response = request_once(
+            &self.socket_path,
+            envelope::Body::ActionRequest(ActionRequest {
                 capability: capability.to_string(),
                 taint: Some(Taint {
                     flags: taint.bits(),
                 }),
-            })),
-        };
-        write_envelope_deadline(
-            &mut stream,
-            &request,
-            DEFAULT_MAX_FRAME,
+            }),
+            1,
             KERNEL_CHECK_DEADLINE,
+            OnRestart::Retry,
         )
         .await?;
-        let response =
-            read_envelope_deadline(&mut stream, DEFAULT_MAX_FRAME, KERNEL_CHECK_DEADLINE)
-                .await?
-                .ok_or(KernelClientError::NoResponse)?;
         match response.body {
             Some(envelope::Body::ActionResponse(r)) => Ok(r.approved),
             Some(envelope::Body::Error(e)) => Err(KernelClientError::Remote(e.message)),

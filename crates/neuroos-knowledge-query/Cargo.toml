@@ -19,13 +19,22 @@ neuroos-sandbox = { path = "../neuroos-sandbox", version = "0.1.0" }
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-neuroos-storage = { path = "../neuroos-storage", version = "0.1.0" }
+# C4: `features = ["test-support"]` for the shared dev_models_dir /
+# dev_onnxruntime_dylib fixtures.
+neuroos-storage = { path = "../neuroos-storage", version = "0.1.0", features = ["test-support"] }
 neuroos-testkit = { path = "../neuroos-testkit", version = "0.1.0" }
+# C9 / AB-1 scope: test-only. ask_end_to_end, deictic_snap and kpi1_eval
+# drive a real StorageEngine and real C1 dumps -- the point of those
+# tests is that C5a works against the real C3, not against a mock.
 neuroos-monitor = { path = "../neuroos-monitor", version = "0.1.0" }
 tempfile = "3"
 proptest = "1"
+
+# C7: build.rs generates the graph view's CSS custom properties from
+# ui/tokens/tokens.json (design.md §3 forbids hard-coded hex outside it).
+[build-dependencies]
+serde_json = "1"

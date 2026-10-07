@@ -9,6 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# C1: the safe current_uid() helper (AB-1 shared crate).
+neuroos-common = { path = "../neuroos-common", version = "0.1.0" }
 neuroos-proto = { path = "../neuroos-proto", version = "0.1.0" }
 neuroos-ipc = { path = "../neuroos-ipc", version = "0.1.0" }
 neuroos-health = { path = "../neuroos-health", version = "0.1.0" }

@@ -2,6 +2,10 @@
 //! `healthd.sock` server. Split from `main.rs` so integration tests can
 //! drive a real scrape cycle against real mock health servers (phases.md
 //! §4.3 IT level) without needing a second process.
+// C1 / rules.md §6: `unsafe` is allowed only in neuroos-shm,
+// neuroos-sandbox and FFI shims. This enforces that.
+#![deny(unsafe_code)]
+
 pub mod aggregate;
 pub mod cgroup;
 pub mod scrape;
@@ -127,6 +131,10 @@ pub async fn run_forever(
 
 /// H15 / Architecture.md §8.2's healthd row: cgroup files (read), its own
 /// sockets in the runtime dir, and the soak CSV. Health targets' sockets
+// C1: one safe implementation in neuroos-common, re-exported so the
+// existing `neuroos_healthd::current_uid` call sites keep working.
+pub use neuroos_common::current_uid;
+
 /// are only connected to, which Landlock does not restrict.
 pub fn sandbox_policy(targets: &[targets::Target]) -> neuroos_sandbox::Policy {
     let mut policy = neuroos_sandbox::Policy::baseline()
@@ -136,14 +144,6 @@ pub fn sandbox_policy(targets: &[targets::Target]) -> neuroos_sandbox::Policy {
         policy = policy.read_only(cgroup.clone());
     }
     policy
-}
-
-pub fn current_uid() -> u32 {
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
 }
 
 #[cfg(test)]
