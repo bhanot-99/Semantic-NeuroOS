@@ -6,9 +6,9 @@
 | Component(s) | `neuroos-knowledge-query`, `neuroos-knowledge-background`, `neuroosctl` (`ask`, `graph open`) |
 | Sprints | 5 (of 3 planned) |
 | Dates | 2026-09-27 → 2026-09-28 |
-| Status | 🟨 Gate pending owner grading (updated 2026-10-04). First KPI-1 run: 0/51. After the BUG-001…007 fixes, first-pass grading gives **48/59 = 81%** on the tuned question set and **10/15 = 67%** on a held-out set; KPI-1 is human-graded, so the owner's grading decides. See §7 |
+| Status | ✅ **Passed gate — closed 2026-10-07** on the owner's grading of KPI-1 (48/59 = 81%, against phases.md §8.4's "≥ 80%"), with BUG-006 carried forward as a separate open C3 latency defect. First KPI-1 run: 0/51. **Correction to the 2026-10-04 entry:** its 48/59 (81%) and 10/15 (67%) were measured with the 100 ms C3 query deadline lifted, which that entry did not state, and its transcripts were never persisted. A real re-run on 2026-10-07 against the same dump reproduces both figures with the deadline lifted (48/59, 11/15) and scores **31/59 and 0/15 at the real 100 ms deadline** — 21/59 questions fail with `read deadline exceeded` (BUG-006, reopened). Answer quality itself is 31/38 = 82% where evidence arrived, retrieval ceiling 56/59. KPI-1 is human-graded, so the owner's grading decides. See §7 |
 | Author | AI assistant |
-| Sign-off | pending |
+| Sign-off | Jatin Bhanot (owner), 2026-10-07 — graded KPI-1's answer quality and accepted it; directed that BUG-006 be fixed on its own branch before Phase 6 starts |
 
 ---
 

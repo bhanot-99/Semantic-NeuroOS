@@ -37,10 +37,12 @@ Cloud sync, remote accounts, telemetry to the developer, or any "phone home" beh
 
 ## Status
 
-Five of the eleven phases are built: Phase 0 (foundation, contracts, spikes), Phase 1
+Six of the eleven phases are built: Phase 0 (foundation, contracts, spikes), Phase 1
 (health/IPC), Phase 2 (inference) and Phase 3 (monitor) are done and merged; Phase 4
-(storage) passed with approved exceptions; Phase 5 (knowledge engine) is story-complete
-with its KPI-1 gate awaiting the owner's grading. Phase 6 (voice) is next.
+(storage) passed with approved exceptions; Phase 5 (knowledge engine) passed its gate on
+2026-10-07 with KPI-1 graded at 81%. One defect found during that gate (BUG-006: the first
+~21 C3 queries after an ingest burst miss their 100 ms deadline) is being fixed before
+Phase 6 (voice) starts.
 
 See [`phases.md`](phases.md) for the full 11-phase roadmap, [`memory.md`](memory.md) for
 live project state (the authoritative source for what is done), and [`BUGS.md`](BUGS.md)

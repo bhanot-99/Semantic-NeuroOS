@@ -58,29 +58,74 @@ those paths, followed by a force-push. That rewrites a merged commit on a public
 done on anyone's behalf. **Decision needed: do it, or accept and record the
 residual risk.**
 
-### 2. KPI-1 grading (closes Phase 5)
+### 2. ~~KPI-1 grading (closes Phase 5)~~ — **graded and passed 2026-10-07**
 
-Not a bug — the Phase 5 gate. Re-measured 2026-10-04 at 48/59 (81%) on the tuned
-question set and 10/15 (67%) held out, by assistant grading; KPI-1 requires the
-owner's. Questions and transcripts are in `.dev-cache/telemetry-raw/`. See
-`memory.md` for the full state.
+Not a bug — the Phase 5 gate. **The owner graded the answer quality on 2026-10-07
+and accepted it**, so KPI-1 is met: 48/59 = 81% against phases.md §8.4's "≥ 80%"
+target. Phase 5's gate is closed. The deadline failure below (item 3) is a
+separate C3 latency defect, not a KPI-1 quality result, and is still open.
+
+The measurement detail is kept here because it was previously recorded wrongly:
+
+Re-run 2026-10-07 against the same single raw dump both question sets were
+written from (`dump-20260929-4h.bin`, sha256 `7ad670e5…`, unmodified since
+2026-09-29; 6103 events ingested). Transcripts are in `.dev-cache/kpi1/`
+(gitignored — they quote real browsing history). **Two corrections to what this
+file previously said:**
+
+1. The transcripts were *not* in `.dev-cache/telemetry-raw/` — only the question
+   files are. The harness writes to `/tmp` by default
+   (`kpi1_eval.rs:56`), and `/tmp` had been cleared, so the 2026-10-04 numbers
+   had nothing behind them until this re-run reproduced them.
+2. **The recorded 48/59 and 10/15 hold only with the 100 ms C3 query deadline
+   lifted.** At the real deadline the scores are 31/59 and 0/15 — see item 3.
+
+| Run | Deadline | Tuned (59) | Held-out (15) |
+| :--- | :--- | :--- | :--- |
+| 2026-10-04 (recorded) | lifted (undocumented) | 48/59 = 81% | 10/15 = 67% |
+| 2026-10-07 re-run | **real 100 ms** | **31/59 = 53%** | **0/15 = 0%** |
+| 2026-10-07 re-run | lifted (30 s, diagnostic) | 48/59 = 81% | 11/15 = 73% |
+
+Answer quality is genuinely ~81%: on the 38 tuned questions that got evidence at
+the real deadline, 31 are correct (82%). Retrieval-only (no deadline, no
+generation) scores 56/59, so 56/59 is the ceiling generation can reach and the
+corpus still matches the questions. **What to grade is the quality, from
+`.dev-cache/kpi1/tuned-59-nodeadline.md` and `heldout-15-nodeadline.md`; the
+deadline failure is a separate engineering defect, not a quality verdict.**
 
 ---
 
 ## 🟠 Open engineering work
 
-### 3. BUG-002: the 20k-item query latency target is still missed
+### 3. BUG-006 is NOT fixed: the first ~21 C3 queries blow the 100 ms deadline
 
-Phase 4's PF target is p50 ≤ 13 ms / p99 ≤ 20 ms at 20,000 items. Two real
-overhead sources were found and fixed (per-call table re-opening; 192-file
-fragmentation), bringing flat scan to ~35–42 ms, but the literal target is still
-missed and that is inherent flat-scan cost. **Why HNSW does not beat flat scan
-at this corpus size remains unexplained** — that is the open question, and the
-real path to the target.
+Reopened 2026-10-07. BUG-006 was closed on the theory that unbounded concurrent
+distillation starved the CPU, and `MAX_CONCURRENT_DISTILLATIONS = 1`
+(`distill.rs:33`) was the fix. The symptom is unchanged in magnitude: BUG-006
+was recorded as "~20/51 questions", and the 2026-10-07 re-run fails **21/59**
+with `storage.sock request failed: read deadline exceeded`.
 
-Phase 4 passed with this as an approved exception. The benchmark
-(`query_latency_at_20k_synthetic_items`) asserts only a 5 s sanity bound, so it
-passes; it does not gate on the target.
+What is new and makes the old root cause doubtful:
+
+- The failures are **contiguous from question 1** through 21 (plus Q23), then
+  stop for the remaining 36 questions. A distillation backlog would build up
+  over the first few questions, not be worst at the very first one; D-19's note
+  explicitly records that "the very first call alone reliably succeeds".
+- Lifting the deadline to 30 s makes **all** of them pass (0 errors, 48/59 and
+  11/15). So it is purely latency, never a hang, an error or a wrong result.
+
+Front-loaded latency that decays suggests a **warm-up cost that amortises** —
+most plausibly LanceDB fragmentation from the 6103-event ingest burst, with the
+background compaction added for BUG-007 (every 256 inserts) only catching up
+around query ~21. That is a hypothesis, not a diagnosis; it has not been
+measured. The competing explanation is still CPU contention from background
+distillation decodes.
+
+**Why it matters beyond KPI-1:** this is a real user-facing defect, not a test
+artifact. After any burst of ingest, roughly the first 20 questions a user asks
+return a degraded "I couldn't retrieve evidence" answer. Needs its own
+systematic-debugging session: instrument real C3 query latency per query index,
+then fix the cause rather than the deadline.
 
 ### 4. M10: the distillation cache is written but never read
 
@@ -107,6 +152,29 @@ now because it re-embeds the whole store and changes retrieval behaviour, and
 KPI-1 is currently awaiting grading against the retrieval quality the f32 model
 produces. Revisit once that grading is done. ADR-0014 also records a second,
 smaller option: dropping the transient load-time copy (peak only, ~95 MiB).
+
+---
+
+## ✅ Closed by owner decision
+
+### BUG-002: the 20k-item query latency target — **accepted 2026-10-07**
+
+Phase 4's PF target is p50 ≤ 13 ms / p99 ≤ 20 ms at 20,000 items. Two real
+overhead sources were found and fixed (per-call table re-opening; 192-file
+fragmentation), bringing flat scan to ~35–42 ms. The literal target is still
+missed, and that is inherent flat-scan cost.
+
+**The owner accepted this permanently on 2026-10-07** rather than spend a
+session on it. Rationale: the target was set before C3 had an embedding model,
+and ~35–42 ms sits comfortably inside C5's own 100 ms query deadline, so nothing
+downstream misses its budget because of it. Why HNSW does not beat flat scan at
+this corpus size stays unexplained and is no longer tracked as open work — it
+would only matter again if the corpus grew far past 20k items or the 100 ms
+deadline tightened.
+
+The benchmark (`query_latency_at_20k_synthetic_items`) asserts only a 5 s sanity
+bound, so it passes; it does not gate on the target. **Reopen if** a real corpus
+exceeds ~20k items and query latency approaches the 100 ms C5 deadline.
 
 ---
 

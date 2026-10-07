@@ -6,9 +6,9 @@
 | Component(s) | `neuroos-storage` |
 | Sprints | 4 (of 3 planned) |
 | Dates | 2026-09-27 → 2026-09-28 |
-| Status | ⚠️ Passed with approved exceptions — every story done, the soak-replay gate passes, but two real PF misses were found and measured this session (query latency at scale, and a severe HNSW-promotion stall) and are not fixed here; recorded as tech debt pending an owner decision |
+| Status | ⚠️ Passed with approved exceptions — every story done, the soak-replay gate passes. Two real PF misses were found and measured (query latency at scale, and a severe HNSW-promotion stall); both were later fixed (2026-09-28), and the residual query-latency gap (**BUG-002**: ~35-42 ms against a 13/20 ms target at 20k items) was **accepted permanently by the owner on 2026-10-07** (memory.md D-25) and is no longer tracked as open work |
 | Author | AI assistant |
-| Sign-off | pending |
+| Sign-off | BUG-002 exception accepted by the owner 2026-10-07 (memory.md D-25); report sign-off otherwise pending |
 
 ---
 
